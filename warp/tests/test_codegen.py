@@ -762,8 +762,7 @@ def test_codegen_return_in_kernel(test, device):
 
     grid_size = 1024
 
-    # On CUDA devices, this becomes a grid-stride loop
-    wp.launch(conditional_return_or_sum, dim=grid_size, inputs=[result], block_dim=256, max_blocks=1, device=device)
+    wp.launch(conditional_return_or_sum, dim=grid_size, inputs=[result], device=device)
 
     test.assertEqual(result.numpy()[0], grid_size - 256)
 

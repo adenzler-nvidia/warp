@@ -4538,34 +4538,29 @@ size_t wp_cuda_launch_kernel(
         block_dim = 256;
     }
 
-    // CUDA specs up to compute capability 9.0 says the max x-dim grid is 2**31-1, so
-    // grid_dim is fine as an int for the near future
-    int grid_dim = (dim + block_dim - 1) / block_dim;
+    // Use a 3D grid so that grid.x * grid.y * grid.z * block_dim >= dim,
+    // giving every thread a unique index without a grid-stride loop.
+    // max_blocks is ignored: without the grid-stride loop, capping blocks
+    // would silently drop work items.
+    size_t total_blocks = (dim + block_dim - 1) / block_dim;
 
-    if (max_blocks <= 0) {
-        max_blocks = 2147483647;
-    }
+    const unsigned int max_grid_x = (1u << 24) / block_dim;
+    unsigned int grid_x = (unsigned int)(total_blocks < max_grid_x ? total_blocks : max_grid_x);
+    if (grid_x == 0)
+        grid_x = 1;
+    size_t remaining = (total_blocks + grid_x - 1) / grid_x;
 
-    if (grid_dim < 0) {
-#if defined(_DEBUG)
-        fprintf(
-            stderr,
-            "Warp warning: Overflow in grid dimensions detected for %zu total elements and 256 threads "
-            "per block.\n    Setting block count to %d.\n",
-            dim, max_blocks
-        );
-#endif
-        grid_dim = max_blocks;
-    } else {
-        if (grid_dim > max_blocks) {
-            grid_dim = max_blocks;
-        }
-    }
+    unsigned int grid_y = (unsigned int)(remaining < 65535u ? remaining : 65535u);
+    if (grid_y == 0)
+        grid_y = 1;
+    unsigned int grid_z = (unsigned int)((remaining + grid_y - 1) / grid_y);
+    if (grid_z > 65535u)
+        grid_z = 65535u;
 
     begin_cuda_range(WP_TIMING_KERNEL, stream, context, get_cuda_kernel_name(kernel));
 
     CUresult res = cuLaunchKernel_f(
-        (CUfunction)kernel, grid_dim, 1, 1, block_dim, 1, 1, shared_memory_bytes, static_cast<CUstream>(stream), args, 0
+        (CUfunction)kernel, grid_x, grid_y, grid_z, block_dim, 1, 1, shared_memory_bytes, static_cast<CUstream>(stream), args, 0
     );
 
     check_cu(res);

@@ -1978,8 +1978,7 @@ class Adjoint:
 
     def add_return(adj, var):
         if var is None or len(var) == 0:
-            # NOTE: If this kernel gets compiled for a CUDA device, then we need
-            # to convert the return; into a continue; in codegen_func_forward()
+            # NOTE: return; is used directly in CUDA kernels (early exit for out-of-bounds threads).
             adj.add_forward("return;", f"goto label{adj.label_count};")
         elif len(var) == 1:
             adj.add_forward(f"return {var[0].emit()};", f"goto label{adj.label_count};")
@@ -4324,15 +4323,12 @@ cuda_kernel_template_forward = """
 {{
 {line_directive}    wp::tile_shared_storage_t tile_mem;
 
-{line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
-{line_directive}         _idx < dim.size;
-{line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
-    {{
+{line_directive}    size_t _idx = static_cast<size_t>(blockIdx.z * gridDim.y + blockIdx.y) * static_cast<size_t>(gridDim.x * blockDim.x) + static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+{line_directive}    if (_idx >= dim.size) return;
             // reset shared memory allocator
-{line_directive}        wp::tile_shared_storage_t::init();
+{line_directive}    wp::tile_shared_storage_t::init();
 
-{forward_body}{line_directive}    }}
-{line_directive}}}
+{forward_body}{line_directive}}}
 
 """
 
@@ -4343,15 +4339,12 @@ cuda_kernel_template_backward = """
 {{
 {line_directive}    wp::tile_shared_storage_t tile_mem;
 
-{line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
-{line_directive}         _idx < dim.size;
-{line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
-    {{
+{line_directive}    size_t _idx = static_cast<size_t>(blockIdx.z * gridDim.y + blockIdx.y) * static_cast<size_t>(gridDim.x * blockDim.x) + static_cast<size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+{line_directive}    if (_idx >= dim.size) return;
             // reset shared memory allocator
-{line_directive}        wp::tile_shared_storage_t::init();
+{line_directive}    wp::tile_shared_storage_t::init();
 
-{reverse_body}{line_directive}    }}
-{line_directive}}}
+{reverse_body}{line_directive}}}
 
 """
 
@@ -4632,11 +4625,7 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["// forward\n"]
 
     for f in adj.blocks[0].body_forward:
-        if func_type == "kernel" and device == "cuda" and f.lstrip().startswith("return;"):
-            # Use of grid-stride loops in CUDA kernels requires that we convert return; to continue;
-            lines += [f.replace("return;", "continue;") + "\n"]
-        else:
-            lines += [f + "\n"]
+        lines += [f + "\n"]
 
     return "".join(l.lstrip() if l.lstrip().startswith("#line") else indent_block + l for l in lines)
 
@@ -4719,11 +4708,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
     for l in reversed(adj.blocks[0].body_reverse):
         lines += [l + "\n"]
 
-    # In grid-stride kernels the reverse body is in a for loop
-    if device == "cuda" and func_type == "kernel":
-        lines += ["continue;\n"]
-    else:
-        lines += ["return;\n"]
+    lines += ["return;\n"]
 
     return "".join(l.lstrip() if l.lstrip().startswith("#line") else indent_block + l for l in lines)
 
