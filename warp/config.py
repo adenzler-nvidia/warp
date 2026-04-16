@@ -49,6 +49,16 @@ Prints information about each kernel launch including:
 Note: Enabling this flag impacts performance.
 """
 
+enable_kernel_specialize: bool = False
+"""Auto-specialize kernels during CUDA graph capture.
+
+When enabled, kernel launches within ``wp.capture_begin()``/``wp.capture_end()``
+automatically bake argument values as compile-time constants in the generated
+CUDA source, enabling stride folding, immediate loop bounds, and single-pass
+kernel execution.  First capture incurs additional JIT compilation time;
+subsequent captures with identical shapes/strides/scalars reuse cached binaries.
+"""
+
 mode: str = "release"
 """Compilation mode for Warp kernels.
 

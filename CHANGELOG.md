@@ -15,6 +15,9 @@
   hardcoded `"generic"` target. Use `warp.config.cpu_compiler_flags` to control
   CPU targeting (e.g. `"-march=native"` for host detection, `""` for generic)
   ([GH-1308](https://github.com/NVIDIA/warp/issues/1308)).
+- Add `wp.config.enable_kernel_specialize` to auto-specialize kernels during CUDA
+  graph capture, baking argument values as compile-time constants for stride
+  folding and single-pass execution.
 
 ### Removed
 

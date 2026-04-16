@@ -1672,6 +1672,17 @@ class Adjoint:
             if adj.used_by_backward_kernel:
                 func.adj.used_by_backward_kernel = True
 
+            # Propagate baked values (arrays AND scalars) to function param
+            # names BEFORE building the function, so nested add_call invocations
+            # inside func.adj.build() can find them in baked_args.
+            if adj.builder is not None:
+                baked_args = adj.builder_options.get("baked_args")
+                if isinstance(baked_args, dict):
+                    for param_name, arg_var in bound_args.items():
+                        if isinstance(arg_var, Var) and arg_var.label in baked_args:
+                            if param_name not in baked_args:
+                                baked_args[param_name] = baked_args[arg_var.label]
+
             if adj.builder is None:
                 func.build(None)
 
@@ -1742,6 +1753,24 @@ class Adjoint:
 
         func_args = tuple(adj.register_var(x) for x in func_args)
         func_name = compute_type_str(func.native_func, template_args)
+
+        # Register a baked variant and rewrite the call name.
+        # Baked param names were already propagated to baked_args above
+        # (before build_function) to enable nested specialization.
+        if not func.is_builtin() and adj.builder is not None:
+            baked_args = adj.builder_options.get("baked_args")
+            if isinstance(baked_args, dict):
+                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+                baked_params = {}
+                for param_name, arg_var in bound_args.items():
+                    if isinstance(arg_var, Var) and arg_var.label in baked_args:
+                        val = baked_args[arg_var.label]
+                        if isinstance(val, (array_t_type, ctypes._SimpleCData)):
+                            baked_params[param_name] = val
+                if baked_params:
+                    func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
+
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
         fwd_args = []
@@ -4323,18 +4352,19 @@ cuda_kernel_template_forward = """
     {forward_args})
 {{
 {line_directive}    wp::tile_shared_storage_t tile_mem;
-
+{baked_decls_outer}
 {line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
 {line_directive}         _idx < dim.size;
 {line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
     {{
             // reset shared memory allocator
 {line_directive}        wp::tile_shared_storage_t::init();
-
+{baked_decls_inner}
 {forward_body}{line_directive}    }}
 {line_directive}}}
 
 """
+
 
 cuda_kernel_template_backward = """
 
@@ -4508,6 +4538,38 @@ def constant_str(value):
         return str(value)
 
 
+def bake_array_metadata(var_name, value, pad="    "):
+    """Generate shape/stride/ndim assignments for an array_t variable."""
+    lines = []
+    for i in range(value.ndim):
+        lines.append(f"{pad}{var_name}.shape.dims[{i}] = {value.shape[i]};\n")
+    for i in range(value.ndim):
+        lines.append(f"{pad}{var_name}.strides[{i}] = {value.strides[i]};\n")
+    lines.append(f"{pad}{var_name}.ndim = {value.ndim};\n")
+    return "".join(lines)
+
+
+def bake_scalar(ctype_str, var_name, value, pad="    "):
+    """Generate a const declaration for a baked scalar or launch_bounds_t."""
+    from warp._src.types import launch_bounds_t  # noqa: PLC0415
+
+    if isinstance(value, launch_bounds_t):
+        lines = [f"{pad}wp::launch_bounds_t {var_name};\n"]
+        for i in range(4):
+            lines.append(f"{pad}{var_name}.shape[{i}] = {value.shape[i]};\n")
+        lines.append(f"{pad}{var_name}.ndim = {value.ndim};\n")
+        lines.append(f"{pad}{var_name}.size = {value.size};\n")
+        return "".join(lines)
+
+    if isinstance(value, ctypes._SimpleCData):
+        raw = value.value
+        if isinstance(raw, builtins.bool):
+            raw = "true" if raw else "false"
+        return f"{pad}const {ctype_str} {var_name} = {raw};\n"
+
+    return f"{pad}const {ctype_str} {var_name} = {constant_str(value)};\n"
+
+
 def indent(args, stops=1):
     sep = ",\n"
     for _i in range(stops):
@@ -4633,7 +4695,6 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
 
     for f in adj.blocks[0].body_forward:
         if func_type == "kernel" and device == "cuda" and f.lstrip().startswith("return;"):
-            # Use of grid-stride loops in CUDA kernels requires that we convert return; to continue;
             lines += [f.replace("return;", "continue;") + "\n"]
         else:
             lines += [f + "\n"]
@@ -4880,6 +4941,57 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     return s
 
 
+def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, baked_params=None):
+    """Generate a specialized function variant with baked array constants.
+
+    Returns (forward_decl, body) — the forward declaration and the full
+    function definition.  The body already has baked call names because
+    add_call rewrote them during adj.build() in the specialized context.
+    """
+    return_type = adj.return_var[0].ctype() if adj.return_var and len(adj.return_var) == 1 else "void"
+
+    forward_args = [arg.ctype() + " var_" + arg.label for arg in adj.args]
+    if adj.return_var and len(adj.return_var) != 1:
+        forward_args += [arg.ctype() + " & ret_" + str(i) for i, arg in enumerate(adj.return_var)]
+
+    forward_decl = f"static CUDA_CALLABLE {return_type} {mangled_name}({indent(forward_args)});\n"
+
+    func_line_directive = ""
+    if line_directive := adj.get_line_directive("", adj.fun_def_lineno - 1):
+        func_line_directive = f"{line_directive}\n"
+
+    forward_body = codegen_func_forward(adj, func_type="function", device=device)
+
+    # Bake array metadata and scalar constants at the top of the function body
+    baked_decls = ""
+    if baked_params:
+        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+        for param_name, value in baked_params.items():
+            var_name = "var_" + param_name
+            if isinstance(value, array_t_type):
+                baked_decls += bake_array_metadata(var_name, value)
+            elif isinstance(value, ctypes._SimpleCData):
+                # Reassign the scalar param to its baked value so the compiler
+                # can constant-fold it even if the function isn't inlined.
+                raw = value.value
+                if isinstance(raw, builtins.bool):
+                    raw = "true" if raw else "false"
+                baked_decls += f"    {var_name} = {raw};\n"
+
+    body = cuda_forward_function_template.format(
+        name=mangled_name,
+        return_type=return_type,
+        forward_args=indent(forward_args),
+        forward_body=baked_decls + forward_body,
+        filename=adj.filename,
+        lineno=adj.fun_lineno,
+        line_directive=func_line_directive,
+    )
+
+    return forward_decl, body
+
+
 def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_only=False, reverse_only=False):
     if adj.return_var is not None and len(adj.return_var) == 1:
         return_type = adj.return_var[0].ctype()
@@ -5005,21 +5117,42 @@ def codegen_kernel(kernel, device, options):
         else:
             raise ValueError(f"launch_bounds must be an int or a tuple/list of 1-2 ints, got {type(launch_bounds)}")
 
-    # build forward signature
-    forward_args = ["wp::launch_bounds_t dim"]
-    if device == "cpu":
-        forward_args.append("size_t task_index")
-    else:
+    baked_args = options.get("baked_args")
+    specialize = bool(isinstance(baked_args, dict) and "dim" in baked_args and device == "cuda")
+    baked_decls_outer = ""
+    baked_decls_inner = ""
+
+    if specialize:
+        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+        baked_decls_outer = bake_scalar("wp::launch_bounds_t", "dim", baked_args["dim"])
+
+        forward_args = []
         for arg in adj.args:
-            forward_args.append(arg.ctype() + " var_" + arg.label)
+            value = baked_args[arg.label]
+            if isinstance(value, array_t_type):
+                forward_args.append(arg.ctype() + " var_" + arg.label)
+                baked_decls_inner += bake_array_metadata("var_" + arg.label, value, pad="        ")
+            else:
+                baked_decls_inner += bake_scalar(arg.ctype(), "var_" + arg.label, value, pad="        ")
+    else:
+        forward_args = ["wp::launch_bounds_t dim"]
+        if device == "cpu":
+            forward_args.append("size_t task_index")
+        else:
+            for arg in adj.args:
+                forward_args.append(arg.ctype() + " var_" + arg.label)
 
     forward_body = codegen_func_forward(adj, func_type="kernel", device=device)
+
     template_fmt_args.update(
         {
             "forward_args": indent(forward_args),
             "forward_body": forward_body,
             "line_directive": func_line_directive,
             "launch_bounds_str": launch_bounds_str,
+            "baked_decls_outer": baked_decls_outer,
+            "baked_decls_inner": baked_decls_inner,
         }
     )
     template += template_forward

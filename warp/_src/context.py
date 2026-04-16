@@ -2083,6 +2083,7 @@ class ModuleBuilder:
         self.options = options
         self.module = module
         self.deferred_functions = []
+        self.specialized_functions = {}  # (func_key, spec_hash) -> (func, mangled_name, baked_params)
         self.fatbins = {}  # map from <some identifier> to fatbins, to add at link time
         self.ltoirs = {}  # map from lto symbol to lto binary
         self.ltoirs_decl = {}  # map from lto symbol to lto forward declaration
@@ -2099,6 +2100,26 @@ class ModuleBuilder:
         # build deferred functions
         for func in self.deferred_functions:
             self.build_function(func)
+
+    def register_specialized_function(self, func, base_func_name, baked_params):
+        """Register a specialized function variant with baked array constants.
+
+        Returns the mangled function name to use at the call site.
+        """
+        h = hashlib.sha256()
+        h.update(base_func_name.encode())
+        for param_name in sorted(baked_params):
+            val = baked_params[param_name]
+            h.update(param_name.encode())
+            h.update(bytes(val))
+        spec_hash = h.hexdigest()[:8]
+        key = (base_func_name, spec_hash)
+
+        if key not in self.specialized_functions:
+            mangled_name = f"{base_func_name}_baked_{spec_hash}"
+            self.specialized_functions[key] = (func, mangled_name, baked_params)
+
+        return self.specialized_functions[key][1]
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []
@@ -2214,6 +2235,16 @@ class ModuleBuilder:
         grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
         non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
 
+        # Emit forward declarations for baked function variants before any
+        # function bodies.  The adjoint build (in __init__) rewrites function
+        # names to baked variants in ALL function bodies within the specialized
+        # module, including generic functions emitted in Pass 1.
+        for (_key, _hash), (func, mangled_name, baked_params) in self.specialized_functions.items():
+            decl, _ = warp._src.codegen.codegen_func_specialized(
+                func.adj, mangled_name, device=device, options=self.options, baked_params=baked_params
+            )
+            source += decl
+
         # Pass 1: Forward functions that don't use grad()
         source += self._codegen_functions(non_grad_functions, device, forward_only=True)
 
@@ -2236,6 +2267,13 @@ class ModuleBuilder:
         # Pass 3: Forward functions that use wp.grad()
         # These must come after pass 2 because they call adjoint functions
         source += self._codegen_functions(grad_functions, device, forward_only=True)
+
+        # Pass 4: Specialized function variant bodies (forward decls already emitted above).
+        for (_key, _hash), (func, mangled_name, baked_params) in self.specialized_functions.items():
+            _, body = warp._src.codegen.codegen_func_specialized(
+                func.adj, mangled_name, device=device, options=self.options, baked_params=baked_params
+            )
+            source += body
 
         for kernel in self.kernels:
             source += warp._src.codegen.codegen_kernel(kernel, device=device, options=self.options)
@@ -7389,6 +7427,27 @@ def launch(
             kernel.adj.skip_build = False
 
         # delay load modules, including new overload if needed
+
+        # Auto-specialize: during graph capture or regular launches.
+        if warp.config.enable_kernel_specialize and device.is_cuda and not adjoint and not record_cmd:
+            if stream is None:
+                stream = device.stream
+            # Detect graph capture context
+            capture_graph = None
+            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+                capture_graph = runtime.captures.get(capture_id)
+            try:
+                all_inputs = list(inputs or []) + list(outputs or [])
+                _launch_specialized(kernel, dim, all_inputs, device, block_dim, stream, max_blocks, capture_graph)
+                if runtime.tape and record_tape and kernel.adj.has_side_effects:
+                    runtime.tape.record_launch(kernel, dim, max_blocks, inputs, outputs, device)
+                return
+            except Exception as e:
+                if warp.config.verbose:
+                    warp._src.utils.warn(
+                        f"Kernel specialization failed for '{kernel.key}': {e}. Falling back to normal launch."
+                    )
         try:
             module_exec = kernel.module.load(device, block_dim)
         except Exception:
@@ -8204,6 +8263,98 @@ def _register_capture(device: Device, stream: Stream, graph: Graph, capture_id: 
 
     # add to lookup table by globally unique capture id
     runtime.captures[capture_id] = graph
+
+
+def _hash_baked_args(baked_args, kernel_args, kernel_module_hash):
+    """Compute a deterministic hash of baked argument values for cache keying.
+
+    For arrays, only shape/stride/ndim are hashed (not data pointers), so
+    different allocations with the same layout share the cached module.
+    """
+    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+    h = hashlib.sha256()
+    h.update(kernel_module_hash)
+    h.update(bytes(baked_args["dim"]))
+    for arg_idx, arg in enumerate(kernel_args):
+        h.update(arg_idx.to_bytes(4, "little"))  # separator prevents cross-arg collisions
+        packed = baked_args[arg.label]
+        if isinstance(packed, array_t_type):
+            # Hash metadata only — exclude data/grad pointers.
+            h.update(packed.ndim.to_bytes(4, "little", signed=True))
+            for i in range(packed.ndim):
+                h.update(packed.shape[i].to_bytes(4, "little", signed=True))
+                h.update(packed.strides[i].to_bytes(4, "little", signed=True))
+        else:
+            h.update(bytes(packed))
+    return h.hexdigest()[:16]
+
+
+def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_blocks, graph=None):
+    """Compile and launch a specialized kernel.
+
+    Works both during graph capture and for regular launches.
+    If ``graph`` is provided, the module exec is retained by the graph.
+    """
+    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+    from warp._src.types import launch_bounds_t  # noqa: PLC0415
+
+    if kernel.is_generic:
+        raise RuntimeError("Graph specialization does not support generic kernels")
+
+    bounds = launch_bounds_t(dim)
+    if bounds.size == 0:
+        return
+
+    if len(inputs) != len(kernel.adj.args):
+        raise RuntimeError(f"Graph specialize expected {len(kernel.adj.args)} inputs, got {len(inputs)}")
+
+    # Build baked args dict.  Note: this dict will be augmented with function
+    # param names during adj.build() to enable nested call propagation.
+    baked_args = {"dim": bounds}
+    for i, value in enumerate(inputs):
+        arg = kernel.adj.args[i]
+        baked_args[arg.label] = pack_arg(kernel, arg.type, arg.label, value, device, adjoint=False)
+
+    baked_hash = _hash_baked_args(baked_args, kernel.adj.args, kernel.module.get_module_hash())
+    module_name = f"{kernel.key}_spec_{baked_hash}"
+    module = get_module(module_name)
+    module.options["baked_args"] = baked_args
+    module.options["enable_backward"] = False
+
+    spec_kernel = Kernel(
+        func=kernel.func,
+        key=kernel.key,
+        module=module,
+        options={"baked_args": baked_args, "enable_backward": False},
+    )
+
+    module_exec = module.load(device, block_dim)
+    if graph is not None:
+        graph.retain_module_exec(module_exec)
+
+    hooks = module_exec.get_kernel_hooks(spec_kernel)
+    if hooks.forward is None:
+        raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
+
+    # Build kernel params: array_t structs only (scalars/dim are baked).
+    params = [baked_args[a.label] for a in kernel.adj.args if isinstance(baked_args[a.label], array_t_type)]
+    if params:
+        kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
+        kernel_params = (ctypes.c_void_p * len(kernel_args))(*kernel_args)
+    else:
+        kernel_params = None
+
+    runtime.core.wp_cuda_launch_kernel(
+        device.context,
+        hooks.forward,
+        bounds.size,
+        max_blocks,
+        block_dim,
+        hooks.forward_smem_bytes,
+        kernel_params,
+        stream.cuda_stream,
+    )
 
 
 def capture_begin(
