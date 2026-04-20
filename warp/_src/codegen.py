@@ -1757,7 +1757,18 @@ class Adjoint:
         # Register a baked variant and rewrite the call name.
         # Baked param names were already propagated to baked_args above
         # (before build_function) to enable nested specialization.
-        if not func.is_builtin() and adj.builder is not None:
+        #
+        # Skip baking for functions with custom replay or custom grad: the
+        # replay/adjoint symbols are codegen'd against the unbaked name, so a
+        # rewritten call site would reference a nonexistent replay_<baked>.
+        baked_call_info = None  # (param_names, baked_params) when call targets a baked variant
+        if (
+            not func.is_builtin()
+            and adj.builder is not None
+            and func.custom_replay_func is None
+            and func.custom_grad_func is None
+            and func.replay_snippet is None
+        ):
             baked_args = adj.builder_options.get("baked_args")
             if isinstance(baked_args, dict):
                 from warp._src.types import array_t as array_t_type  # noqa: PLC0415
@@ -1770,6 +1781,7 @@ class Adjoint:
                             baked_params[param_name] = val
                 if baked_params:
                     func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
+                    baked_call_info = (list(bound_args.keys()), baked_params)
 
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
@@ -1789,18 +1801,44 @@ class Adjoint:
 
             fwd_args.append(strip_reference(func_arg_var))
 
+        # When the forward call targets a baked variant, rewrite the arg
+        # list: baked scalars are dropped (emitted as `const` inside the
+        # callee), and baked arrays are passed as raw data pointers (the
+        # callee reconstructs a const array_t with baked shape/stride/ndim).
+        # Reverse and replay calls keep the unbaked ABI — they invoke the
+        # generic adj_/replay_ symbols which aren't specialized.
+        def _format_fwd_args(args, init_list):
+            if baked_call_info is None:
+                return adj.format_forward_call_args(args, init_list)
+            param_names, _baked_params = baked_call_info
+            from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+            parts = []
+            # Output args (tail of `args`) have no matching param name — keep as-is.
+            n_params = len(param_names)
+            for i, a in enumerate(args):
+                if i < n_params and param_names[i] in _baked_params:
+                    val = _baked_params[param_names[i]]
+                    if isinstance(val, array_t_type):
+                        parts.append(f"var_{a.label}.data")
+                    # scalar: dropped from the call
+                else:
+                    parts.extend(adj.format_args("var", [a]))
+            arg_str = ", ".join(parts)
+            if init_list:
+                arg_str = f"{{{arg_str}}}"
+            return arg_str
+
         if return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
-            forward_call = (
-                f"{func.namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
-            )
+            forward_call = f"{func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
             replay_call = forward_call
             if func.custom_replay_func is not None or func.replay_snippet is not None:
                 replay_call = f"{func.namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
 
         elif not isinstance(return_type, Sequence) or len(return_type) == 1:
             # handle simple function (one output)
-            forward_call = f"var_{output} = {func.namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+            forward_call = f"var_{output} = {func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
             replay_call = forward_call
             if func.custom_replay_func is not None:
                 replay_call = f"var_{output} = {func.namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
@@ -1808,7 +1846,7 @@ class Adjoint:
         else:
             # handle multiple value functions
             forward_call = (
-                f"{func.namespace}{func_name}({adj.format_forward_call_args(fwd_args + output, use_initializer_list)});"
+                f"{func.namespace}{func_name}({_format_fwd_args(fwd_args + output, use_initializer_list)});"
             )
             replay_call = forward_call
 
@@ -4944,13 +4982,60 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
 def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, baked_params=None):
     """Generate a specialized function variant with baked array constants.
 
-    Returns (forward_decl, body) — the forward declaration and the full
-    function definition.  The body already has baked call names because
-    add_call rewrote them during adj.build() in the specialized context.
+    Returns (forward_decl, body).  Baked scalars are dropped from the ABI
+    and emitted as `const` locals.  Baked arrays are dropped too — the
+    callee receives only the raw data pointer and reconstructs the
+    array_t with baked shape/stride/ndim, exposed to the body as a
+    `const array_t<T>&`.  This makes constant propagation robust against
+    NVRTC's inlining heuristics: every use of shape/stride/ndim is a load
+    from a const-qualified local with a unique definition.
     """
     return_type = adj.return_var[0].ctype() if adj.return_var and len(adj.return_var) == 1 else "void"
 
-    forward_args = [arg.ctype() + " var_" + arg.label for arg in adj.args]
+    baked_params = baked_params or {}
+
+    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
+    def _array_elem_ctype(array_ctype_str):
+        """Extract T from an `array_t<T>` / `wp::array_t<T>` ctype string."""
+        lt = array_ctype_str.find("<")
+        gt = array_ctype_str.rfind(">")
+        if lt >= 0 and gt > lt:
+            return array_ctype_str[lt + 1 : gt].strip()
+        return "void"
+
+    forward_args = []
+    baked_decls = ""
+
+    for arg in adj.args:
+        var_name = "var_" + arg.label
+        if arg.label in baked_params:
+            value = baked_params[arg.label]
+            if isinstance(value, array_t_type):
+                array_ctype = arg.ctype()
+                elem_ctype = _array_elem_ctype(array_ctype)
+                data_param = f"_wp_baked_{var_name}_data"
+                tmp_name = f"_wp_baked_{var_name}"
+                forward_args.append(f"{elem_ctype}* {data_param}")
+                baked_decls += f"    {array_ctype} {tmp_name};\n"
+                baked_decls += f"    {tmp_name}.data = {data_param};\n"
+                for i in range(value.ndim):
+                    baked_decls += f"    {tmp_name}.shape.dims[{i}] = {value.shape[i]};\n"
+                for i in range(value.ndim):
+                    baked_decls += f"    {tmp_name}.strides[{i}] = {value.strides[i]};\n"
+                baked_decls += f"    {tmp_name}.ndim = {value.ndim};\n"
+                baked_decls += f"    const {array_ctype}& {var_name} = {tmp_name};\n"
+            elif isinstance(value, ctypes._SimpleCData):
+                raw = value.value
+                if isinstance(raw, builtins.bool):
+                    raw = "true" if raw else "false"
+                baked_decls += f"    const {arg.ctype()} {var_name} = {raw};\n"
+            else:
+                # Unknown baked type — fall back to keeping as an ordinary param.
+                forward_args.append(arg.ctype() + " " + var_name)
+        else:
+            forward_args.append(arg.ctype() + " " + var_name)
+
     if adj.return_var and len(adj.return_var) != 1:
         forward_args += [arg.ctype() + " & ret_" + str(i) for i, arg in enumerate(adj.return_var)]
 
@@ -4961,23 +5046,6 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         func_line_directive = f"{line_directive}\n"
 
     forward_body = codegen_func_forward(adj, func_type="function", device=device)
-
-    # Bake array metadata and scalar constants at the top of the function body
-    baked_decls = ""
-    if baked_params:
-        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
-        for param_name, value in baked_params.items():
-            var_name = "var_" + param_name
-            if isinstance(value, array_t_type):
-                baked_decls += bake_array_metadata(var_name, value)
-            elif isinstance(value, ctypes._SimpleCData):
-                # Reassign the scalar param to its baked value so the compiler
-                # can constant-fold it even if the function isn't inlined.
-                raw = value.value
-                if isinstance(raw, builtins.bool):
-                    raw = "true" if raw else "false"
-                baked_decls += f"    {var_name} = {raw};\n"
 
     body = cuda_forward_function_template.format(
         name=mangled_name,

@@ -2104,14 +2104,25 @@ class ModuleBuilder:
     def register_specialized_function(self, func, base_func_name, baked_params):
         """Register a specialized function variant with baked array constants.
 
-        Returns the mangled function name to use at the call site.
+        Returns the mangled function name to use at the call site.  Array
+        values are hashed by metadata only (shape/stride/ndim) — data and
+        grad pointers are excluded so reallocations with identical layout
+        share a single compiled variant.
         """
+        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+
         h = hashlib.sha256()
         h.update(base_func_name.encode())
         for param_name in sorted(baked_params):
             val = baked_params[param_name]
             h.update(param_name.encode())
-            h.update(bytes(val))
+            if isinstance(val, array_t_type):
+                h.update(val.ndim.to_bytes(4, "little", signed=True))
+                for i in range(val.ndim):
+                    h.update(val.shape[i].to_bytes(4, "little", signed=True))
+                    h.update(val.strides[i].to_bytes(4, "little", signed=True))
+            else:
+                h.update(bytes(val))
         spec_hash = h.hexdigest()[:8]
         key = (base_func_name, spec_hash)
 
