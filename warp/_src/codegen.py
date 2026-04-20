@@ -1672,30 +1672,65 @@ class Adjoint:
             if adj.used_by_backward_kernel:
                 func.adj.used_by_backward_kernel = True
 
-            # Propagate baked values (arrays AND scalars) to function param
-            # names BEFORE building the function, so nested add_call invocations
+            # Propagate baked values (arrays AND scalars) from caller scope to
+            # the callee's parameter names so nested add_call invocations
             # inside func.adj.build() can find them in baked_args.
+            #
+            # baked_args is keyed by Python label, which is not unique across
+            # scopes: a kernel arg `foo: wp.array(...)` and an inner-function
+            # local `foo: SomeStruct` are unrelated but share a label.  Two
+            # safeguards keep this robust:
+            #
+            #  1. Type guard:  only propagate when the caller Var's declared
+            #     type matches the baked value kind (array vs scalar).  This
+            #     blocks an array-typed kernel arg from staining a struct-
+            #     typed callee param that happens to share a name.
+            #
+            #  2. Scope cleanup:  entries added by this call's propagation are
+            #     removed again after build_function returns.  They are only
+            #     needed while this callee is being built — leaving them in
+            #     place poisons sibling calls (e.g. two different callees that
+            #     both declare a param named `s` but receive different baked
+            #     values would otherwise share the first's entry).
+            propagated_keys = []
             if adj.builder is not None:
                 baked_args = adj.builder_options.get("baked_args")
                 if isinstance(baked_args, dict):
+                    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+                    import warp._src.types as _types  # noqa: PLC0415
+
                     for param_name, arg_var in bound_args.items():
-                        if isinstance(arg_var, Var) and arg_var.label in baked_args:
-                            if param_name not in baked_args:
-                                baked_args[param_name] = baked_args[arg_var.label]
+                        if not (isinstance(arg_var, Var) and arg_var.label in baked_args):
+                            continue
+                        caller_val = baked_args[arg_var.label]
+                        if isinstance(caller_val, array_t_type) and not _types.is_array(arg_var.type):
+                            continue
+                        if isinstance(caller_val, ctypes._SimpleCData) and not _types.type_is_value(arg_var.type):
+                            continue
+                        if param_name not in baked_args:
+                            baked_args[param_name] = caller_val
+                            propagated_keys.append(param_name)
 
-            if adj.builder is None:
-                func.build(None)
+            try:
+                if adj.builder is None:
+                    func.build(None)
 
-            elif func not in adj.builder.functions:
-                adj.builder.build_function(func)
-                # add custom grad, replay functions to the list of functions
-                # to be built later (invalid code could be generated if we built them now)
-                # so that they are not missed when only the forward function is imported
-                # from another module
-                if func.custom_grad_func:
-                    adj.builder.deferred_functions.append(func.custom_grad_func)
-                if func.custom_replay_func:
-                    adj.builder.deferred_functions.append(func.custom_replay_func)
+                elif func not in adj.builder.functions:
+                    adj.builder.build_function(func)
+                    # add custom grad, replay functions to the list of functions
+                    # to be built later (invalid code could be generated if we built them now)
+                    # so that they are not missed when only the forward function is imported
+                    # from another module
+                    if func.custom_grad_func:
+                        adj.builder.deferred_functions.append(func.custom_grad_func)
+                    if func.custom_replay_func:
+                        adj.builder.deferred_functions.append(func.custom_replay_func)
+            finally:
+                if propagated_keys:
+                    baked_args = adj.builder_options.get("baked_args") if adj.builder is not None else None
+                    if isinstance(baked_args, dict):
+                        for k in propagated_keys:
+                            baked_args.pop(k, None)
 
         # Resolve the return value based on the types and values of the given arguments.
         bound_arg_types = {k: get_arg_type(v) for k, v in bound_args.items()}
@@ -1772,13 +1807,20 @@ class Adjoint:
             baked_args = adj.builder_options.get("baked_args")
             if isinstance(baked_args, dict):
                 from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+                import warp._src.types as _types  # noqa: PLC0415
 
                 baked_params = {}
                 for param_name, arg_var in bound_args.items():
-                    if isinstance(arg_var, Var) and arg_var.label in baked_args:
-                        val = baked_args[arg_var.label]
-                        if isinstance(val, (array_t_type, ctypes._SimpleCData)):
-                            baked_params[param_name] = val
+                    if not (isinstance(arg_var, Var) and arg_var.label in baked_args):
+                        continue
+                    val = baked_args[arg_var.label]
+                    # Guard against name-collision false aliases (see the
+                    # propagation block above): the baked value kind must
+                    # match the caller-side Var type.
+                    if isinstance(val, array_t_type) and _types.is_array(arg_var.type):
+                        baked_params[param_name] = val
+                    elif isinstance(val, ctypes._SimpleCData) and _types.type_is_value(arg_var.type):
+                        baked_params[param_name] = val
                 if baked_params:
                     func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
                     baked_call_info = (list(bound_args.keys()), baked_params)
@@ -5012,19 +5054,23 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         if arg.label in baked_params:
             value = baked_params[arg.label]
             if isinstance(value, array_t_type):
+                # Drop the array_t from the ABI; caller passes only the data
+                # pointer.  Reconstruct a mutable local so Warp's internal
+                # codegen (which takes `&arr.shape` to feed `wp::load`) still
+                # type-checks.  The local is non-escaping and the only writes
+                # are the baked values below, which NVRTC propagates through
+                # to the use sites — proven at SASS under ptxas -O3 -c.
                 array_ctype = arg.ctype()
                 elem_ctype = _array_elem_ctype(array_ctype)
                 data_param = f"_wp_baked_{var_name}_data"
-                tmp_name = f"_wp_baked_{var_name}"
                 forward_args.append(f"{elem_ctype}* {data_param}")
-                baked_decls += f"    {array_ctype} {tmp_name};\n"
-                baked_decls += f"    {tmp_name}.data = {data_param};\n"
+                baked_decls += f"    {array_ctype} {var_name};\n"
+                baked_decls += f"    {var_name}.data = {data_param};\n"
                 for i in range(value.ndim):
-                    baked_decls += f"    {tmp_name}.shape.dims[{i}] = {value.shape[i]};\n"
+                    baked_decls += f"    {var_name}.shape.dims[{i}] = {value.shape[i]};\n"
                 for i in range(value.ndim):
-                    baked_decls += f"    {tmp_name}.strides[{i}] = {value.strides[i]};\n"
-                baked_decls += f"    {tmp_name}.ndim = {value.ndim};\n"
-                baked_decls += f"    const {array_ctype}& {var_name} = {tmp_name};\n"
+                    baked_decls += f"    {var_name}.strides[{i}] = {value.strides[i]};\n"
+                baked_decls += f"    {var_name}.ndim = {value.ndim};\n"
             elif isinstance(value, ctypes._SimpleCData):
                 raw = value.value
                 if isinstance(raw, builtins.bool):
