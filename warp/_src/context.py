@@ -8340,6 +8340,23 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
         options={"baked_args": baked_args, "enable_backward": False},
     )
 
+    # If `kernel` is a concrete overload of a generic factory (e.g. a kernel
+    # defined inside `create_foo_kernel()` that takes `Any`-typed params),
+    # `kernel.func` still carries the generic annotations.  Kernel.__init__
+    # would re-read those and flag spec_kernel as generic, after which
+    # ModuleHasher hashes only overloads (of which spec_kernel has none) and
+    # `get_mangled_name()` fails with "Missing hash".  Rebuild the spec
+    # kernel's adjoint from the overload's concrete annotations so it enters
+    # the module build as a plain non-generic kernel.
+    if not kernel.is_generic and spec_kernel.is_generic:
+        spec_kernel.adj = warp._src.codegen.Adjoint(
+            kernel.func,
+            overload_annotations=dict(kernel.adj.arg_types),
+            source=kernel.adj.source,
+        )
+        spec_kernel.is_generic = False
+        spec_kernel.arg_indices = {a.label: i for i, a in enumerate(spec_kernel.adj.args)}
+
     module_exec = module.load(device, block_dim)
     if graph is not None:
         graph.retain_module_exec(module_exec)
@@ -8348,8 +8365,16 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     if hooks.forward is None:
         raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
 
-    # Build kernel params: array_t structs only (scalars/dim are baked).
-    params = [baked_args[a.label] for a in kernel.adj.args if isinstance(baked_args[a.label], array_t_type)]
+    # Build kernel params.  Scalars (_SimpleCData) are baked as `const` locals
+    # inside the kernel body and drop from the ABI; everything else (arrays,
+    # structs, textures, vectors/matrices, etc.) is still passed as a kernel
+    # parameter.  Keep this aligned with the matching filter in
+    # `codegen_kernel` when `specialize == True`.
+    params = [
+        baked_args[a.label]
+        for a in kernel.adj.args
+        if not isinstance(baked_args[a.label], ctypes._SimpleCData)
+    ]
     if params:
         kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
         kernel_params = (ctypes.c_void_p * len(kernel_args))(*kernel_args)

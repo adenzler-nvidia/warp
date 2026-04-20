@@ -5247,8 +5247,17 @@ def codegen_kernel(kernel, device, options):
             if isinstance(value, array_t_type):
                 forward_args.append(arg.ctype() + " var_" + arg.label)
                 baked_decls_inner += bake_array_metadata("var_" + arg.label, value, pad="        ")
-            else:
+            elif isinstance(value, ctypes._SimpleCData):
+                # Scalar: drop from ABI, emit as const inside the body.
                 baked_decls_inner += bake_scalar(arg.ctype(), "var_" + arg.label, value, pad="        ")
+            else:
+                # Anything else (structs, vectors, matrices, tuples, textures, ...)
+                # is passed through as a normal kernel param — bake_scalar only
+                # knows how to emit C++ for array_t / _SimpleCData / launch_bounds_t
+                # and would crash on e.g. a ctypes.Structure.  These args are
+                # still forwarded verbatim, so the kernel receives them through
+                # the regular parameter-packing path.
+                forward_args.append(arg.ctype() + " var_" + arg.label)
     else:
         forward_args = ["wp::launch_bounds_t dim"]
         if device == "cpu":
