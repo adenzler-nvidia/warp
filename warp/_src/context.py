@@ -1815,6 +1815,11 @@ def register_api_function(
 # global dictionary of modules
 user_modules: dict[str, Module] = {}
 
+# Cache of specialized Kernel objects keyed by spec-module name.  Populated
+# in `_launch_specialized` so repeated launches with the same baked_hash
+# reuse one Kernel instance (and therefore a stable module hash).
+_spec_kernel_cache: dict[str, "Kernel"] = {}
+
 
 def get_module(name: str) -> Module:
     """Return or create the Warp module associated with a given name.
@@ -1931,6 +1936,16 @@ class ModuleHasher:
 
         # configuration parameters
         for opt in sorted(options.keys()):
+            # `baked_args` is a dict of ctypes instances whose `repr()` encodes
+            # a Python object id / memory address.  Each launch creates fresh
+            # ctypes instances (same semantic values, new allocations), so
+            # hashing its repr would produce a different module hash every
+            # launch → rebuild + driver reload per call.  The semantic
+            # identity of the baked values is already encoded in the spec
+            # module's NAME (`<kernel>_spec_<baked_hash>`), so it's
+            # redundant — and harmful — to hash the dict here.
+            if opt == "baked_args":
+                continue
             s = f"{opt}:{options[opt]}"
             ch.update(bytes(s, "utf-8"))
 
@@ -8330,32 +8345,56 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     baked_hash = _hash_baked_args(baked_args, kernel.adj.args, kernel.module.get_module_hash())
     module_name = f"{kernel.key}_spec_{baked_hash}"
     module = get_module(module_name)
+    # `baked_args` here is a dict of ctypes instances.  It's needed by the
+    # code generator (both the outer kernel and nested wp.func calls read
+    # it from `adj.builder_options`), so it has to live on module.options.
+    # But its values have unstable `repr()` (ctypes objects embed their
+    # memory address), which would poison `ModuleHasher` — that's why the
+    # hasher above explicitly skips the `baked_args` key.  The semantic
+    # identity of the baked values is already captured by `baked_hash`,
+    # which is part of the module NAME.
     module.options["baked_args"] = baked_args
     module.options["enable_backward"] = False
 
-    spec_kernel = Kernel(
-        func=kernel.func,
-        key=kernel.key,
-        module=module,
-        options={"baked_args": baked_args, "enable_backward": False},
-    )
-
-    # If `kernel` is a concrete overload of a generic factory (e.g. a kernel
-    # defined inside `create_foo_kernel()` that takes `Any`-typed params),
-    # `kernel.func` still carries the generic annotations.  Kernel.__init__
-    # would re-read those and flag spec_kernel as generic, after which
-    # ModuleHasher hashes only overloads (of which spec_kernel has none) and
-    # `get_mangled_name()` fails with "Missing hash".  Rebuild the spec
-    # kernel's adjoint from the overload's concrete annotations so it enters
-    # the module build as a plain non-generic kernel.
-    if not kernel.is_generic and spec_kernel.is_generic:
-        spec_kernel.adj = warp._src.codegen.Adjoint(
-            kernel.func,
-            overload_annotations=dict(kernel.adj.arg_types),
-            source=kernel.adj.source,
+    # The spec module holds a single kernel with a stable identity across
+    # all launches that share this baked_hash.  Cache it on the module so
+    # repeated launches don't register a fresh Kernel each time: that used
+    # to churn `_live_kernels`, force `ModuleHasher` to recompute a
+    # different module hash on every call, trigger a rebuild + driver
+    # reload, and serialize against the stream.  Observable effect: ~8
+    # cache dirs per kernel, and per-kernel GPU-time regressions that were
+    # not from codegen (SASS is strictly smaller or equal vs generic).
+    # Cache the spec Kernel so repeated launches with the same baked_hash
+    # reuse it.  A module-level dict avoids `Module.__getattr__`'s
+    # deprecation-shim recursion on missing attributes.
+    spec_kernel = _spec_kernel_cache.get(module_name)
+    if spec_kernel is None:
+        spec_kernel = Kernel(
+            func=kernel.func,
+            key=kernel.key,
+            module=module,
+            options={"baked_args": baked_args, "enable_backward": False},
         )
-        spec_kernel.is_generic = False
-        spec_kernel.arg_indices = {a.label: i for i, a in enumerate(spec_kernel.adj.args)}
+
+        # If `kernel` is a concrete overload of a generic factory (e.g. a
+        # kernel defined inside `create_foo_kernel()` that takes `Any`-typed
+        # params), `kernel.func` still carries the generic annotations.
+        # Kernel.__init__ would re-read those and flag spec_kernel as
+        # generic, after which ModuleHasher hashes only overloads (of
+        # which spec_kernel has none) and `get_mangled_name()` fails with
+        # "Missing hash".  Rebuild the spec kernel's adjoint from the
+        # overload's concrete annotations so it enters the module build
+        # as a plain non-generic kernel.
+        if not kernel.is_generic and spec_kernel.is_generic:
+            spec_kernel.adj = warp._src.codegen.Adjoint(
+                kernel.func,
+                overload_annotations=dict(kernel.adj.arg_types),
+                source=kernel.adj.source,
+            )
+            spec_kernel.is_generic = False
+            spec_kernel.arg_indices = {a.label: i for i, a in enumerate(spec_kernel.adj.args)}
+
+        _spec_kernel_cache[module_name] = spec_kernel
 
     module_exec = module.load(device, block_dim)
     if graph is not None:

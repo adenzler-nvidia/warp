@@ -5245,7 +5245,22 @@ def codegen_kernel(kernel, device, options):
         for arg in adj.args:
             value = baked_args[arg.label]
             if isinstance(value, array_t_type):
-                forward_args.append(arg.ctype() + " var_" + arg.label)
+                # Keep the full array_t as a kernel parameter so the runtime's
+                # parameter-packing path stays unchanged, but route body reads
+                # through a fresh *local* struct with baked metadata rather
+                # than mutating the kernel parameter in place.  Writing to the
+                # parameter's `.shape` / `.strides` / `.ndim` fields forces
+                # NVRTC to materialize the entire struct in per-thread
+                # registers (the fields must live in a mutable storage class).
+                # That blows up the register count — eval_rigid_id went from
+                # 24 regs (generic) to 96 regs (mutated-param spec) with a
+                # corresponding ~50% occupancy loss.  A fresh local lets
+                # NVRTC keep baked fields as immediates and the only
+                # non-baked field (`.data`) as a single uniform-register load.
+                forward_args.append(arg.ctype() + " _raw_var_" + arg.label)
+                baked_decls_inner += f"        {arg.ctype()} var_{arg.label};\n"
+                baked_decls_inner += f"        var_{arg.label}.data = _raw_var_{arg.label}.data;\n"
+                baked_decls_inner += f"        var_{arg.label}.grad = _raw_var_{arg.label}.grad;\n"
                 baked_decls_inner += bake_array_metadata("var_" + arg.label, value, pad="        ")
             elif isinstance(value, ctypes._SimpleCData):
                 # Scalar: drop from ABI, emit as const inside the body.
