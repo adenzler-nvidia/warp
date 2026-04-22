@@ -121,7 +121,9 @@ class TestKernelSpecialize(unittest.TestCase):
     # ---- Codegen verification ----
 
     def test_codegen_bakes_constants(self):
-        """Verify the generated .cu has baked shape/stride/ndim and scalar constants."""
+        """Verify the generated .cu has baked shape/stride/ndim, baked
+        scalar constants, and scheme-B helpers for array access.
+        """
         N = 256
         device = "cuda:0"
         x = wp.array(np.ones(N, dtype=np.float32), device=device)
@@ -130,7 +132,6 @@ class TestKernelSpecialize(unittest.TestCase):
         new_specs = _run_specialized(axpy, dim=N, inputs=[y, x, 2.0], device=device)
         self.assertTrue(len(new_specs) > 0, "No specialized module was created")
 
-        # Find the .cu for the specific module we just created
         spec_name = next(iter(new_specs))
         cu_path = _find_spec_cu(spec_name.replace(".", "_"))
         self.assertIsNotNone(cu_path, f"Specialized .cu not found for {spec_name}")
@@ -138,14 +139,18 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Check baked dim
+        # Baked dim and scalar.
         self.assertIn(f"dim.size = {N}", source)
-        # Check baked scalar
         self.assertIn("var_alpha = 2", source)
-        # Check baked array metadata
+        # Baked array metadata as prologue writes (kept for NVRTC alias
+        # analysis — see codegen_kernel comment).
         self.assertIn(f".shape.dims[0] = {N}", source)
         self.assertIn(".strides[0] = 4", source)
         self.assertIn(".ndim = 1", source)
+        # Scheme-B helpers: array accesses route through per-module baked
+        # helpers that take `.data` directly.
+        self.assertRegex(source, r"wp_address_baked_1d_\w+")
+        self.assertRegex(source, r"wp_array_store_baked_1d_\w+")
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""

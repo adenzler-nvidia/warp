@@ -5321,16 +5321,14 @@ def codegen_kernel(kernel, device, options):
         for arg in adj.args:
             value = baked_args[arg.label]
             if isinstance(value, array_t_type):
-                # Keep the array_t as a kernel parameter and overwrite its
-                # shape/strides/ndim in place.  A shadow-local pattern was
-                # tried but measurement showed it has no register-count
-                # benefit and can hurt CSE across the shadow boundary.
-                # Array-metadata baking produces mixed per-kernel results
-                # (big wins for tile/Cholesky kernels that benefit from
-                # immediate bounds, small regressions for some memory-
-                # bound kernels where ptxas reorganizes traffic less
-                # favourably with immediates), but nets out positive on
-                # both mujoco_warp and FeatherPGS G1.
+                # Keep the `array_t<T>` as a kernel parameter and overwrite
+                # its shape/strides/ndim in place.  These writes appear dead
+                # at the C++ level (scheme B's address/array_store/atomic
+                # helpers use `.data` only, and my measurement showed no
+                # downstream reads of the fields) — but removing them
+                # regressed G1 by ~1.4% end-to-end.  NVRTC's alias / CSE
+                # passes apparently use the definite-write information even
+                # when the value itself is DCE'd at SASS.  Keep the writes.
                 forward_args.append(arg.ctype() + " var_" + arg.label)
                 baked_decls_inner += bake_array_metadata("var_" + arg.label, value, pad="        ")
             elif isinstance(value, ctypes._SimpleCData):
