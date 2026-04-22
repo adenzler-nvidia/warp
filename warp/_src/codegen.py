@@ -5145,22 +5145,39 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         return "void"
 
     # Build the body first so we can inspect which baked-array locals are
-    # actually referenced.  If a baked array only ever appears as
-    # `var_<label>.data` (scheme-B rewrites + nested baked-array pass-through),
-    # we skip reconstructing a local `array_t<T>` entirely and pass the raw
-    # data pointer everywhere.  Shape/stride/ndim come from `Config::*` at
-    # the scheme-B call site, not from a per-thread struct.
+    # actually referenced and rewrite member accesses to `Config::*` where
+    # possible.  Goal: template over every piece of array metadata except
+    # `data`, so the body is entirely free of per-thread struct fields for
+    # the baked array.
+    #
+    # Three cases per baked array:
+    #   (1) `var_X.data`                  → raw pointer param.
+    #   (2) `var_X.shape.dims[K]` / .strides[K] / .ndim (K a literal int)
+    #                                     → `Config::X_shape_K` / etc.
+    #   (3) `&(var_X.shape)` / `&(var_X.strides)` / other whole-aggregate
+    #       uses like passing `var_X` by value — requires the materialised
+    #       struct.  We fall back to the full prologue for these arrays.
     forward_body = codegen_func_forward(adj, func_type="function", device=device)
 
-    def _needs_full_array_struct(label, body):
-        """Does `var_<label>` appear as anything other than `var_<label>.data`?
+    # Templatable access forms we can rewrite without any local struct:
+    #   `.data`, `.shape.dims[K]`, `.strides[K]`, `.ndim`  (K a literal int)
+    # Shape-helper form (rewritable with a tiny shape_t local):
+    #   bare `.shape` (as in `&(var_X.shape)` passed to a generic builtin)
+    # Fallback form (anything else — pass `var_X` by value / use `.grad`):
+    #   forces us to materialise the full `array_t<T>` struct.
+    #
+    # Note: `bool` is shadowed at module scope by `warp._src.types.bool`
+    # whose constructor turns `None` truthy; use `is not None` explicitly.
+    _TEMPLATABLE_SUFFIX = r"(?:\.data\b|\.shape\.dims\[\d+\]|\.strides\[\d+\]|\.ndim\b|\.shape\b)"
 
-        Note: `bool` is shadowed at module scope by `warp._src.types.bool`
-        (a custom warp type whose constructor turns `None` into truthy), so
-        we must not write `bool(match)`.  Use `match is not None`.
-        """
-        var_ref = re.compile(rf"\bvar_{re.escape(label)}\b(?!\.data\b)")
-        return var_ref.search(body) is not None
+    def _classify_accesses(label, body):
+        """Return (uses_whole_shape, has_non_templatable)."""
+        label_esc = re.escape(label)
+        uses_whole_shape = re.search(rf"\bvar_{label_esc}\.shape\b(?!\.dims\[\d+\])", body) is not None
+        has_non_templatable = (
+            re.search(rf"\bvar_{label_esc}\b(?!{_TEMPLATABLE_SUFFIX})", body) is not None
+        )
+        return uses_whole_shape, has_non_templatable
 
     forward_args = []
     baked_decls = ""
@@ -5175,7 +5192,32 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 elem_ctype = _array_elem_ctype(array_ctype)
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
-                if _needs_full_array_struct(arg.label, forward_body):
+                uses_whole_shape, needs_fallback = _classify_accesses(arg.label, forward_body)
+
+                # Always substitute the four templatable member-access forms
+                # — even in the fallback path below — so every `.shape.dims[K]`
+                # / `.strides[K]` / `.ndim` read becomes a real constant
+                # expression at its use site instead of a struct load that
+                # NVRTC has to constant-fold through alias analysis.
+                body_substitutions.append(
+                    (rf"\b{var_name}\.shape\.dims\[(\d+)\]",
+                     rf"Config::{arg.label}_shape_\1")
+                )
+                body_substitutions.append(
+                    (rf"\b{var_name}\.strides\[(\d+)\]",
+                     rf"Config::{arg.label}_stride_\1")
+                )
+                body_substitutions.append(
+                    (rf"\b{var_name}\.ndim\b",
+                     f"Config::{arg.label}_ndim")
+                )
+
+                if needs_fallback:
+                    # Body does something like `.grad` or passes `var_X` by
+                    # value to a generic call — keep the materialised struct
+                    # for those uses.  `.data` stays as a struct read; the
+                    # member substitutions above still apply at the fold-able
+                    # sites (shape.dims / strides / ndim).
                     baked_decls += f"    {array_ctype} {var_name};\n"
                     baked_decls += f"    {var_name}.data = {data_param};\n"
                     for i in range(value.ndim):
@@ -5183,10 +5225,22 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                     for i in range(value.ndim):
                         baked_decls += f"    {var_name}.strides[{i}] = Config::{arg.label}_stride_{i};\n"
                     baked_decls += f"    {var_name}.ndim = Config::{arg.label}_ndim;\n"
-                else:
-                    # Body only reads `var_<label>.data`; rewrite those uses
-                    # to the raw pointer param and omit the struct entirely.
-                    body_substitutions.append((rf"\b{var_name}\.data\b", data_param))
+                    continue
+
+                # Otherwise: the only other reference form is `.data` —
+                # rewrite it to the raw pointer param and emit no struct.
+                body_substitutions.append((rf"\b{var_name}\.data\b", data_param))
+
+                if uses_whole_shape:
+                    # Body uses bare `var_X.shape` (e.g. `&(var_X.shape)`
+                    # passed to a generic builtin).  Emit a tiny shape_t
+                    # local initialised from `Config::*` and redirect the
+                    # reference — no full array_t needed.
+                    shape_local = f"__wp_baked_{var_name}_shape"
+                    baked_decls += f"    wp::shape_t {shape_local};\n"
+                    for i in range(value.ndim):
+                        baked_decls += f"    {shape_local}.dims[{i}] = Config::{arg.label}_shape_{i};\n"
+                    body_substitutions.append((rf"\b{var_name}\.shape\b", shape_local))
             elif isinstance(value, ctypes._SimpleCData):
                 baked_decls += f"    const {arg.ctype()} {var_name} = Config::{arg.label};\n"
             else:
