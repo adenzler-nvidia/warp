@@ -2104,6 +2104,12 @@ class ModuleBuilder:
         self.ltoirs_decl = {}  # map from lto symbol to lto forward declaration
         self.shared_memory_bytes = {}  # map from lto symbol to shared memory requirements
 
+        # Scheme B: helpers for array-access builtins specialized with
+        # baked shape/stride.  Keyed by hash of
+        # (builtin_name, ndim, elem_ctype, shape_tuple, stride_tuple, value_ctype).
+        # Value is the full C++ body for the helper (including signature).
+        self.specialized_builtins = {}  # hash_key -> (helper_name, helper_code)
+
         if hasher is None:
             hasher = ModuleHasher(module._get_live_kernels(), options)
 
@@ -2146,6 +2152,87 @@ class ModuleBuilder:
             self.specialized_functions[key] = (func, mangled_name, baked_params)
 
         return self.specialized_functions[key][1]
+
+    def register_specialized_builtin(self, builtin_name, arr_val, elem_ctype, value_ctype=None):
+        """Register a scheme-B baked helper for an array-access builtin.
+
+        `arr_val` is the `array_t` packed value (has ndim / shape[] / strides[]).
+        `elem_ctype` is the array element C++ type (e.g. "wp::float32" or "wp::vec_t<3, wp::float32>").
+        `value_ctype` is the type of the value argument for array_store / atomic_* (None for address).
+
+        Emits a `static __device__ __forceinline__` helper that:
+          - takes the raw data pointer (+ other args as applicable)
+          - does negative-index fixup with the baked shape
+          - computes the address with baked byte-stride
+          - delegates to the scalar primitive (for atomics) or dereferences directly
+
+        Returns the mangled helper name to use at the call site.
+        """
+        ndim = arr_val.ndim
+        shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
+        strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
+        h = hashlib.sha256()
+        h.update(builtin_name.encode())
+        h.update(ndim.to_bytes(4, "little"))
+        for s in shape:
+            h.update(s.to_bytes(4, "little", signed=True))
+        for s in strides:
+            h.update(s.to_bytes(4, "little", signed=True))
+        h.update(elem_ctype.encode())
+        if value_ctype is not None:
+            h.update(value_ctype.encode())
+        key = (builtin_name, ndim, h.hexdigest()[:12])
+        if key in self.specialized_builtins:
+            return self.specialized_builtins[key][0]
+
+        helper_name = f"wp_{builtin_name}_baked_{ndim}d_{h.hexdigest()[:8]}"
+        index_params = ", ".join(f"int i{k}" for k in range(ndim))
+
+        # Build byte-offset expression: sum of (optionally wrapped index) * stride.
+        offset_parts = []
+        for k in range(ndim):
+            # negative-index wrap is a conditional add of shape[k]
+            # `(i_k < 0 ? i_k + SHAPE : i_k) * STRIDE`
+            offset_parts.append(f"((i{k} < 0 ? i{k} + {shape[k]} : i{k}) * {strides[k]})")
+        offset_expr = " + ".join(offset_parts) if offset_parts else "0"
+
+        # Helper body varies by builtin.  All share the same `addr` computation.
+        addr_stmt = (
+            f"{elem_ctype}* __addr = reinterpret_cast<{elem_ctype}*>("
+            f"reinterpret_cast<char*>(data) + ({offset_expr}));"
+        )
+
+        # Emit the helper inside `namespace wp { ... }` so `wp::<helper_name>`
+        # at the call site resolves without extra plumbing.
+        if builtin_name == "address":
+            body = f"""namespace wp {{
+static __device__ __forceinline__ {elem_ctype}* {helper_name}({elem_ctype}* data, {index_params}) {{
+    {addr_stmt}
+    return __addr;
+}}
+}}
+"""
+        elif builtin_name == "array_store":
+            body = f"""namespace wp {{
+static __device__ __forceinline__ void {helper_name}({elem_ctype}* data, {index_params}, {value_ctype} value) {{
+    {addr_stmt}
+    *__addr = value;
+}}
+}}
+"""
+        elif builtin_name.startswith("atomic_"):
+            body = f"""namespace wp {{
+static __device__ __forceinline__ {value_ctype} {helper_name}({elem_ctype}* data, {index_params}, {value_ctype} value) {{
+    {addr_stmt}
+    return wp::{builtin_name}(__addr, value);
+}}
+}}
+"""
+        else:
+            raise ValueError(f"Scheme-B helper not implemented for builtin '{builtin_name}'")
+
+        self.specialized_builtins[key] = (helper_name, body)
+        return helper_name
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []
@@ -2260,6 +2347,16 @@ class ModuleBuilder:
         # Separate functions into those that use grad() and those that don't
         grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
         non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
+
+        # Emit scheme-B baked builtin helpers (address / array_store / atomic_*
+        # with shape/stride baked as immediates).  Emit before any function body
+        # so that both user wp.func baked variants and kernel bodies can call
+        # them.  These are small `static __device__ __forceinline__` wrappers
+        # that delegate to the scalar primitive or do direct pointer arithmetic.
+        for _key, (_helper_name, helper_code) in self.specialized_builtins.items():
+            source += helper_code
+        if self.specialized_builtins:
+            source += "\n"
 
         # Emit forward declarations for baked function variants before any
         # function bodies.  The adjoint build (in __init__) rewrites function

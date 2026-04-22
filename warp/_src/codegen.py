@@ -1789,6 +1789,69 @@ class Adjoint:
         func_args = tuple(adj.register_var(x) for x in func_args)
         func_name = compute_type_str(func.native_func, template_args)
 
+        # Scheme B: specialize selected array-access builtins when the array
+        # arg is baked.  Emits a `static __device__ __forceinline__` helper
+        # at module scope that takes the raw data pointer and embeds the
+        # baked shape/stride/ndim as immediates.  The call site is rewritten
+        # to invoke the helper with `arr.data` in place of `arr`.
+        #
+        # In scope (matches `array.h` naming):
+        #   address                          — returns T*
+        #   array_store                      — stores T into *addr
+        #   atomic_add/sub/min/max/and/or/xor/cas/exch — returns T
+        #
+        # The helper delegates to the scalar primitive for atomics; for
+        # address/array_store it does the pointer arithmetic directly.
+        BAKED_BUILTINS = {
+            "address", "array_store",
+            "atomic_add", "atomic_sub", "atomic_min", "atomic_max",
+            "atomic_and", "atomic_or", "atomic_xor",
+            "atomic_cas", "atomic_exch",
+        }
+        baked_builtin_arr_idx = None  # index of the array arg in fwd_args to rewrite to `.data`
+        if (
+            func.is_builtin()
+            and adj.builder is not None
+            and func.key in BAKED_BUILTINS
+        ):
+            baked_args_dict = adj.builder_options.get("baked_args") if adj.builder_options else None
+            if isinstance(baked_args_dict, dict):
+                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+                import warp._src.types as _types  # noqa: PLC0415
+
+                # The array arg is always the first positional — named "arr"
+                # in the registrations.  It's either `bound_args["arr"]` or
+                # the first bound arg.
+                arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
+                if (
+                    isinstance(arr_var, Var)
+                    and arr_var.label in baked_args_dict
+                    and _types.is_array(arr_var.type)
+                ):
+                    baked_arr = baked_args_dict[arr_var.label]
+                    if isinstance(baked_arr, array_t_type):
+                        elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
+                        # Count actual provided indices (non-None in bound_args)
+                        idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
+                        # Guard: ndim must match the number of index args we have.
+                        if baked_arr.ndim == len(idx_keys):
+                            value_ctype = None
+                            if func.key == "array_store" or func.key.startswith("atomic_"):
+                                # Value type is the array element's dtype.
+                                value_ctype = elem_ctype
+                            helper_name = adj.builder.register_specialized_builtin(
+                                func.key, baked_arr, elem_ctype, value_ctype=value_ctype,
+                            )
+                            func_name = helper_name
+                            # Find the position of the array arg in func_args
+                            # so we can rewrite it to `arr.data` at the call site.
+                            arr_pos = None
+                            for i, fa in enumerate(func_args):
+                                if isinstance(fa, Var) and fa.label == arr_var.label:
+                                    arr_pos = i
+                                    break
+                            baked_builtin_arr_idx = arr_pos
+
         # Register a baked variant and rewrite the call name.
         # Baked param names were already propagated to baked_args above
         # (before build_function) to enable nested specialization.
@@ -1850,6 +1913,19 @@ class Adjoint:
         # Reverse and replay calls keep the unbaked ABI — they invoke the
         # generic adj_/replay_ symbols which aren't specialized.
         def _format_fwd_args(args, init_list):
+            # Scheme-B baked builtin: rewrite the single array arg to `.data`.
+            if baked_builtin_arr_idx is not None:
+                parts = []
+                for i, a in enumerate(args):
+                    if i == baked_builtin_arr_idx:
+                        parts.append(f"var_{a.label}.data")
+                    else:
+                        parts.extend(adj.format_args("var", [a]))
+                arg_str = ", ".join(parts)
+                if init_list:
+                    arg_str = f"{{{arg_str}}}"
+                return arg_str
+
             if baked_call_info is None:
                 return adj.format_forward_call_args(args, init_list)
             param_names, _baked_params = baked_call_info
