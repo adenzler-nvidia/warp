@@ -5144,8 +5144,27 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
             return array_ctype_str[lt + 1 : gt].strip()
         return "void"
 
+    # Build the body first so we can inspect which baked-array locals are
+    # actually referenced.  If a baked array only ever appears as
+    # `var_<label>.data` (scheme-B rewrites + nested baked-array pass-through),
+    # we skip reconstructing a local `array_t<T>` entirely and pass the raw
+    # data pointer everywhere.  Shape/stride/ndim come from `Config::*` at
+    # the scheme-B call site, not from a per-thread struct.
+    forward_body = codegen_func_forward(adj, func_type="function", device=device)
+
+    def _needs_full_array_struct(label, body):
+        """Does `var_<label>` appear as anything other than `var_<label>.data`?
+
+        Note: `bool` is shadowed at module scope by `warp._src.types.bool`
+        (a custom warp type whose constructor turns `None` into truthy), so
+        we must not write `bool(match)`.  Use `match is not None`.
+        """
+        var_ref = re.compile(rf"\bvar_{re.escape(label)}\b(?!\.data\b)")
+        return var_ref.search(body) is not None
+
     forward_args = []
     baked_decls = ""
+    body_substitutions = []  # (pattern, replacement) applied to forward_body below
 
     for arg in adj.args:
         var_name = "var_" + arg.label
@@ -5156,13 +5175,18 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 elem_ctype = _array_elem_ctype(array_ctype)
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
-                baked_decls += f"    {array_ctype} {var_name};\n"
-                baked_decls += f"    {var_name}.data = {data_param};\n"
-                for i in range(value.ndim):
-                    baked_decls += f"    {var_name}.shape.dims[{i}] = Config::{arg.label}_shape_{i};\n"
-                for i in range(value.ndim):
-                    baked_decls += f"    {var_name}.strides[{i}] = Config::{arg.label}_stride_{i};\n"
-                baked_decls += f"    {var_name}.ndim = Config::{arg.label}_ndim;\n"
+                if _needs_full_array_struct(arg.label, forward_body):
+                    baked_decls += f"    {array_ctype} {var_name};\n"
+                    baked_decls += f"    {var_name}.data = {data_param};\n"
+                    for i in range(value.ndim):
+                        baked_decls += f"    {var_name}.shape.dims[{i}] = Config::{arg.label}_shape_{i};\n"
+                    for i in range(value.ndim):
+                        baked_decls += f"    {var_name}.strides[{i}] = Config::{arg.label}_stride_{i};\n"
+                    baked_decls += f"    {var_name}.ndim = Config::{arg.label}_ndim;\n"
+                else:
+                    # Body only reads `var_<label>.data`; rewrite those uses
+                    # to the raw pointer param and omit the struct entirely.
+                    body_substitutions.append((rf"\b{var_name}\.data\b", data_param))
             elif isinstance(value, ctypes._SimpleCData):
                 baked_decls += f"    const {arg.ctype()} {var_name} = Config::{arg.label};\n"
             else:
@@ -5170,6 +5194,9 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 forward_args.append(arg.ctype() + " " + var_name)
         else:
             forward_args.append(arg.ctype() + " " + var_name)
+
+    for pattern, replacement in body_substitutions:
+        forward_body = re.sub(pattern, replacement, forward_body)
 
     if adj.return_var and len(adj.return_var) != 1:
         forward_args += [arg.ctype() + " & ret_" + str(i) for i, arg in enumerate(adj.return_var)]
@@ -5185,8 +5212,6 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     func_line_directive = ""
     if line_directive := adj.get_line_directive("", adj.fun_def_lineno - 1):
         func_line_directive = f"{line_directive}\n"
-
-    forward_body = codegen_func_forward(adj, func_type="function", device=device)
 
     body_inner = cuda_forward_function_template.format(
         name=mangled_name,
