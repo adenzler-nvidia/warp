@@ -2110,6 +2110,15 @@ class ModuleBuilder:
         # Value is the full C++ body for the helper (including signature).
         self.specialized_builtins = {}  # hash_key -> (helper_name, helper_code)
 
+        # Phase D: traits structs for user wp.func baking.  Each unique
+        # baking produces a `struct BakedConfig_<fn>_<hash>` with
+        # static-constexpr members for every baked value.  The user wp.func
+        # is emitted as `template<typename Config>` and its body references
+        # `Config::<label>_shape_N` / `Config::<label>_stride_N` / `Config::<label>_ndim`
+        # for arrays and `Config::<label>` for scalars, so one template
+        # declaration serves all bakings of the same function.
+        self.specialized_function_configs = {}  # (func_key, spec_hash) -> (config_name, config_body)
+
         if hasher is None:
             hasher = ModuleHasher(module._get_live_kernels(), options)
 
@@ -2123,17 +2132,42 @@ class ModuleBuilder:
             self.build_function(func)
 
     def register_specialized_function(self, func, base_func_name, baked_params):
-        """Register a specialized function variant with baked array constants.
+        """Phase D: register a specialized wp.func as a C++ function template.
 
-        Returns the mangled function name to use at the call site.  Array
-        values are hashed by metadata only (shape/stride/ndim) — data and
-        grad pointers are excluded so reallocations with identical layout
-        share a single compiled variant.
+        Emits a traits struct (one per unique baked-values hash) and a
+        single function template declaration per `base_func_name`.  The
+        template body references `Config::<label>_{shape_k, stride_k, ndim}`
+        for arrays and `Config::<label>` for scalars — see
+        `codegen_func_specialized` which emits it as
+        `template<typename Config> ... <fn>_baked(...)`.
+
+        Returns the call-site instantiation string, e.g.
+        `funcname_baked<wp::BakedConfig_funcname_abc12345>`.
+
+        Array values are hashed by metadata only (shape/stride/ndim);
+        data/grad pointers are excluded so reallocations with identical
+        layout share a single compiled instantiation.
         """
         from warp._src.types import array_t as array_t_type  # noqa: PLC0415
 
+        # Hash baked *label set* separately from baked *values*.  The ABI
+        # (which args are dropped / replaced by a data pointer) is a function
+        # of the label set only — two bakings that share labels can share one
+        # template declaration; their different values live entirely in the
+        # Config traits struct.  Two bakings with *different* label sets must
+        # get different template names because their signatures differ.
+        labels_h = hashlib.sha256()
+        labels_h.update(base_func_name.encode())
+        for param_name in sorted(baked_params):
+            labels_h.update(param_name.encode())
+            val = baked_params[param_name]
+            # Encode the *kind* of baking (array vs scalar) — not the value —
+            # so "q baked as array" and "q baked as scalar" don't collide.
+            labels_h.update(b"A" if isinstance(val, array_t_type) else b"S")
+        labels_hash = labels_h.hexdigest()[:8]
+
         h = hashlib.sha256()
-        h.update(base_func_name.encode())
+        h.update(labels_hash.encode())
         for param_name in sorted(baked_params):
             val = baked_params[param_name]
             h.update(param_name.encode())
@@ -2145,15 +2179,76 @@ class ModuleBuilder:
             else:
                 h.update(bytes(val))
         spec_hash = h.hexdigest()[:8]
-        key = (base_func_name, spec_hash)
+        config_name = f"BakedConfig_{base_func_name}_{spec_hash}"
+        template_name = f"{base_func_name}_baked_{labels_hash}"
 
-        if key not in self.specialized_functions:
-            mangled_name = f"{base_func_name}_baked_{spec_hash}"
-            self.specialized_functions[key] = (func, mangled_name, baked_params)
+        config_key = (base_func_name, spec_hash)
+        if config_key not in self.specialized_function_configs:
+            config_body = self._emit_config_struct(config_name, baked_params, func)
+            self.specialized_function_configs[config_key] = (config_name, config_body)
 
-        return self.specialized_functions[key][1]
+        # The `specialized_functions` dict now keys a per-(func, hash) entry
+        # but all entries for the same `base_func_name` share the same
+        # template_name (no hash in the symbol — shape/stride are in Config).
+        # The entry's third element remains the baked_params for that hash,
+        # used by `codegen_func_specialized` to know which params to emit
+        # prologue code for.
+        if config_key not in self.specialized_functions:
+            self.specialized_functions[config_key] = (func, template_name, baked_params)
 
-    def register_specialized_builtin(self, builtin_name, arr_val, elem_ctype, value_ctype=None):
+        # The template lives in `namespace wp`, so qualify the call site.
+        # User wp.funcs register with `namespace=""`, so we bake the `wp::`
+        # qualifier into the returned symbol.  Callers from inside namespace wp
+        # (other templated bodies) tolerate the explicit qualification.
+        return f"wp::{template_name}<wp::{config_name}>"
+
+    def _emit_config_struct(self, name, baked_params, func):
+        """Generate a `namespace wp { struct Name { static constexpr ... }; }`
+        holding every baked value as a static-constexpr member.  Arrays
+        expand to `<label>_shape_k`, `<label>_stride_k`, `<label>_ndim`;
+        scalars are just `<label>` with the appropriate ctype.
+        """
+        import builtins as _builtins  # noqa: PLC0415
+        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
+        from warp._src.codegen import Var  # noqa: PLC0415
+
+        lines = ["namespace wp {", f"struct {name} {{"]
+        for label in sorted(baked_params):
+            val = baked_params[label]
+            if isinstance(val, array_t_type):
+                for k in range(val.ndim):
+                    lines.append(f"    static constexpr int {label}_shape_{k} = {int(val.shape[k])};")
+                for k in range(val.ndim):
+                    lines.append(f"    static constexpr int {label}_stride_{k} = {int(val.strides[k])};")
+                lines.append(f"    static constexpr int {label}_ndim = {int(val.ndim)};")
+            elif isinstance(val, ctypes._SimpleCData):
+                warp_type = func.input_types.get(label) if getattr(func, "input_types", None) else None
+                ctype_str = Var.type_to_ctype(warp_type) if warp_type is not None else None
+                raw = val.value
+                if isinstance(raw, _builtins.bool):
+                    literal = "true" if raw else "false"
+                    ctype_str = ctype_str or "bool"
+                elif isinstance(raw, int):
+                    literal = str(raw)
+                    ctype_str = ctype_str or "int"
+                elif isinstance(raw, float):
+                    # Always emit with `f` suffix for 32-bit; use plain literal
+                    # for double.  If we don't know the ctype, default to `float`.
+                    if ctype_str is None or ctype_str in ("wp::float32", "float"):
+                        literal = f"{raw!r}f"
+                        ctype_str = ctype_str or "float"
+                    else:
+                        literal = repr(raw)
+                else:
+                    raise ValueError(f"unsupported baked scalar value for '{label}': {type(val).__name__}")
+                lines.append(f"    static constexpr {ctype_str} {label} = {literal};")
+            else:
+                raise ValueError(f"unsupported baked value for '{label}': {type(val).__name__}")
+        lines.append("};")
+        lines.append("}\n")
+        return "\n".join(lines)
+
+    def register_specialized_builtin(self, builtin_name, arr_val, elem_ctype, value_ctype=None, config_label=None):
         """Register a scheme-B baked helper for an array-access builtin.
 
         Shape and stride are expressed as non-type template parameters of
@@ -2241,8 +2336,24 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
             self.specialized_builtins[key] = (helper_name, body)
 
         helper_name = self.specialized_builtins[key][0]
-        # Build the call-site instantiation: `helper_name<S0, S1, ..., St0, St1, ...>`.
-        tparam_values = ", ".join(str(x) for x in (*shape, *strides))
+        # Build the call-site instantiation.
+        #
+        # When emitted from a *kernel* body, the template args are literal
+        # integers read from the baked value:
+        #     wp_address_baked_1d<1212416, 4>(data, i)
+        #
+        # When emitted from a *templated user wp.func* body (Phase D) the
+        # same baked values are available via the function's `Config`
+        # template parameter — we emit `Config::<label>_shape_k` /
+        # `Config::<label>_stride_k` instead, so the body uses no
+        # literals and is reusable across all instantiations of Config.
+        if config_label is None:
+            tparam_values = ", ".join(str(x) for x in (*shape, *strides))
+        else:
+            tparam_values = ", ".join(
+                [f"Config::{config_label}_shape_{k}" for k in range(ndim)]
+                + [f"Config::{config_label}_stride_{k}" for k in range(ndim)]
+            )
         return f"{helper_name}<{tparam_values}>"
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
@@ -2355,9 +2466,35 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
         # Pass 3: Forward functions that use wp.grad() (these call adjoints, so must come after pass 2)
         #         Note: Functions using wp.grad() don't have adjoints generated.
 
+        # Phase D: a wp.func that has been specialized shares its built adj
+        # body with the generic (unbaked) emission, but that body references
+        # `Config::...` at scheme-B builtin call sites — valid only inside the
+        # templated wrapper.  In a spec module, every caller is rewritten to
+        # the baked variant, so the generic forward/adjoint bodies are dead.
+        # Skip them to avoid emitting code that references an undefined
+        # `Config` in the outer (non-templated) scope.
+        _specialized_funcs = {func for (_k, _h), (func, _n, _p) in self.specialized_functions.items()}
+
         # Separate functions into those that use grad() and those that don't
-        grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
-        non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
+        grad_functions = [
+            f for f in self.functions.keys()
+            if f.adj.uses_grad_call and f not in _specialized_funcs
+        ]
+        non_grad_functions = [
+            f for f in self.functions.keys()
+            if not f.adj.uses_grad_call and f not in _specialized_funcs
+        ]
+
+        # Phase D: emit traits structs for every (wp.func, baking) pair.
+        # These must come before the scheme-B builtin helpers and before the
+        # user-wp.func template declarations, because template bodies
+        # reference `Config::<label>_shape_N` etc. at instantiation.  The
+        # structs themselves are just static-constexpr collections, no
+        # forward references.
+        for _key, (_config_name, config_body) in self.specialized_function_configs.items():
+            source += config_body
+        if self.specialized_function_configs:
+            source += "\n"
 
         # Emit scheme-B baked builtin helpers (address / array_store / atomic_*
         # with shape/stride baked as immediates).  Emit before any function body
@@ -2373,7 +2510,16 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
         # function bodies.  The adjoint build (in __init__) rewrites function
         # names to baked variants in ALL function bodies within the specialized
         # module, including generic functions emitted in Pass 1.
+        #
+        # Under Phase D, multiple `specialized_functions` entries for the same
+        # user wp.func share one `mangled_name` (= `<fn>_baked`, a single
+        # template declaration).  Dedup by name so the template is emitted
+        # exactly once.
+        _emitted_template_names = set()
         for (_key, _hash), (func, mangled_name, baked_params) in self.specialized_functions.items():
+            if mangled_name in _emitted_template_names:
+                continue
+            _emitted_template_names.add(mangled_name)
             decl, _ = warp._src.codegen.codegen_func_specialized(
                 func.adj, mangled_name, device=device, options=self.options, baked_params=baked_params
             )
@@ -2402,8 +2548,14 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
         # These must come after pass 2 because they call adjoint functions
         source += self._codegen_functions(grad_functions, device, forward_only=True)
 
-        # Pass 4: Specialized function variant bodies (forward decls already emitted above).
+        # Pass 4: Specialized function variant bodies (forward decls already
+        # emitted above).  Same dedup as the forward-decl pass — one
+        # template body per `mangled_name`.
+        _emitted_template_bodies = set()
         for (_key, _hash), (func, mangled_name, baked_params) in self.specialized_functions.items():
+            if mangled_name in _emitted_template_bodies:
+                continue
+            _emitted_template_bodies.add(mangled_name)
             _, body = warp._src.codegen.codegen_func_specialized(
                 func.adj, mangled_name, device=device, options=self.options, baked_params=baked_params
             )

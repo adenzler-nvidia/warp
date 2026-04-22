@@ -1839,8 +1839,13 @@ class Adjoint:
                             if func.key == "array_store" or func.key.startswith("atomic_"):
                                 # Value type is the array element's dtype.
                                 value_ctype = elem_ctype
+                            # Phase D: inside a templated wp.func body, template
+                            # args come from `Config::<label>_shape_k` so the
+                            # body is reusable across Config instantiations.
+                            config_label = arr_var.label if adj.is_user_function else None
                             helper_name = adj.builder.register_specialized_builtin(
                                 func.key, baked_arr, elem_ctype, value_ctype=value_ctype,
+                                config_label=config_label,
                             )
                             func_name = helper_name
                             # Find the position of the array arg in func_args
@@ -5098,15 +5103,32 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
 
 
 def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, baked_params=None):
-    """Generate a specialized function variant with baked array constants.
+    """Phase D: emit a specialized wp.func as a C++ function template.
 
-    Returns (forward_decl, body).  Baked scalars are dropped from the ABI
-    and emitted as `const` locals.  Baked arrays are dropped too — the
-    callee receives only the raw data pointer and reconstructs the
-    array_t with baked shape/stride/ndim, exposed to the body as a
-    `const array_t<T>&`.  This makes constant propagation robust against
-    NVRTC's inlining heuristics: every use of shape/stride/ndim is a load
-    from a const-qualified local with a unique definition.
+    Returns (forward_decl, body).  The function is declared as
+
+        namespace wp {
+        template<typename Config>
+        static CUDA_CALLABLE <ret> <fn>_baked(pointer args, non-baked args) {
+            // prologue reads baked values off `Config::*`
+            // body (already built) references `Config::*` in scheme-B
+            // template args for nested builtin calls
+        }
+        }
+
+    Baked scalars drop from the ABI and become `const` locals initialised
+    to `Config::<label>`.  Baked arrays drop from the ABI too — the
+    callee receives only the raw data pointer and reconstructs a mutable
+    local `array_t<T>` whose shape/stride/ndim come from `Config::*`
+    members.  (Mutable, not `const array_t<T>&` — Warp's own codegen
+    takes `&arr.shape` in some builtins, which doesn't bind to a
+    const-member pointer.  The local is non-escaping; NVRTC folds the
+    writes through to the use sites — proven at SASS under ptxas -O3 -c.)
+
+    Multiple kernel bakings of the same wp.func share one template
+    declaration.  Per-baking differences are captured entirely in the
+    traits struct `wp::BakedConfig_<fn>_<hash>` — see
+    `ModuleBuilder._emit_config_struct`.
     """
     return_type = adj.return_var[0].ctype() if adj.return_var and len(adj.return_var) == 1 else "void"
 
@@ -5130,12 +5152,6 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         if arg.label in baked_params:
             value = baked_params[arg.label]
             if isinstance(value, array_t_type):
-                # Drop the array_t from the ABI; caller passes only the data
-                # pointer.  Reconstruct a mutable local so Warp's internal
-                # codegen (which takes `&arr.shape` to feed `wp::load`) still
-                # type-checks.  The local is non-escaping and the only writes
-                # are the baked values below, which NVRTC propagates through
-                # to the use sites — proven at SASS under ptxas -O3 -c.
                 array_ctype = arg.ctype()
                 elem_ctype = _array_elem_ctype(array_ctype)
                 data_param = f"_wp_baked_{var_name}_data"
@@ -5143,15 +5159,12 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 baked_decls += f"    {array_ctype} {var_name};\n"
                 baked_decls += f"    {var_name}.data = {data_param};\n"
                 for i in range(value.ndim):
-                    baked_decls += f"    {var_name}.shape.dims[{i}] = {value.shape[i]};\n"
+                    baked_decls += f"    {var_name}.shape.dims[{i}] = Config::{arg.label}_shape_{i};\n"
                 for i in range(value.ndim):
-                    baked_decls += f"    {var_name}.strides[{i}] = {value.strides[i]};\n"
-                baked_decls += f"    {var_name}.ndim = {value.ndim};\n"
+                    baked_decls += f"    {var_name}.strides[{i}] = Config::{arg.label}_stride_{i};\n"
+                baked_decls += f"    {var_name}.ndim = Config::{arg.label}_ndim;\n"
             elif isinstance(value, ctypes._SimpleCData):
-                raw = value.value
-                if isinstance(raw, builtins.bool):
-                    raw = "true" if raw else "false"
-                baked_decls += f"    const {arg.ctype()} {var_name} = {raw};\n"
+                baked_decls += f"    const {arg.ctype()} {var_name} = Config::{arg.label};\n"
             else:
                 # Unknown baked type — fall back to keeping as an ordinary param.
                 forward_args.append(arg.ctype() + " " + var_name)
@@ -5161,7 +5174,13 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     if adj.return_var and len(adj.return_var) != 1:
         forward_args += [arg.ctype() + " & ret_" + str(i) for i, arg in enumerate(adj.return_var)]
 
-    forward_decl = f"static CUDA_CALLABLE {return_type} {mangled_name}({indent(forward_args)});\n"
+    # Wrap the declaration and definition in `namespace wp { template<typename Config> ... }`.
+    forward_decl = (
+        f"namespace wp {{\n"
+        f"template<typename Config>\n"
+        f"static CUDA_CALLABLE {return_type} {mangled_name}({indent(forward_args)});\n"
+        f"}}\n"
+    )
 
     func_line_directive = ""
     if line_directive := adj.get_line_directive("", adj.fun_def_lineno - 1):
@@ -5169,7 +5188,7 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
 
     forward_body = codegen_func_forward(adj, func_type="function", device=device)
 
-    body = cuda_forward_function_template.format(
+    body_inner = cuda_forward_function_template.format(
         name=mangled_name,
         return_type=return_type,
         forward_args=indent(forward_args),
@@ -5178,6 +5197,8 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         lineno=adj.fun_lineno,
         line_directive=func_line_directive,
     )
+
+    body = f"namespace wp {{\ntemplate<typename Config>\n{body_inner}}}\n"
 
     return forward_decl, body
 
