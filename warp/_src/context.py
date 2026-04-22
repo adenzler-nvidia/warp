@@ -2156,83 +2156,94 @@ class ModuleBuilder:
     def register_specialized_builtin(self, builtin_name, arr_val, elem_ctype, value_ctype=None):
         """Register a scheme-B baked helper for an array-access builtin.
 
-        `arr_val` is the `array_t` packed value (has ndim / shape[] / strides[]).
-        `elem_ctype` is the array element C++ type (e.g. "wp::float32" or "wp::vec_t<3, wp::float32>").
-        `value_ctype` is the type of the value argument for array_store / atomic_* (None for address).
+        Shape and stride are expressed as non-type template parameters of
+        a single function template per (builtin_name, ndim).  One template
+        declaration serves every instantiation — so a module that bakes
+        many kernels with different shapes only gets one `wp_address_baked_1d`
+        template declaration and multiple compile-time instantiations.
 
-        Emits a `static __device__ __forceinline__` helper that:
-          - takes the raw data pointer (+ other args as applicable)
-          - does negative-index fixup with the baked shape
-          - computes the address with baked byte-stride
-          - delegates to the scalar primitive (for atomics) or dereferences directly
+        The call site passes the template args inline:
 
-        Returns the mangled helper name to use at the call site.
+            wp::wp_address_baked_1d<1212416, 12>(arr.data, i)
+
+        with `T` deduced from the `data` argument.  Non-type params come
+        first so explicit `<S, St>` works without spelling `T` at the
+        call site.
+
+        This is Phase A of the template transition — same IR as literal
+        baking, but enables later `if constexpr` additions inside the
+        helper body (Phase B).
         """
         ndim = arr_val.ndim
         shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
         strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
-        h = hashlib.sha256()
-        h.update(builtin_name.encode())
-        h.update(ndim.to_bytes(4, "little"))
-        for s in shape:
-            h.update(s.to_bytes(4, "little", signed=True))
-        for s in strides:
-            h.update(s.to_bytes(4, "little", signed=True))
-        h.update(elem_ctype.encode())
-        if value_ctype is not None:
-            h.update(value_ctype.encode())
-        key = (builtin_name, ndim, h.hexdigest()[:12])
-        if key in self.specialized_builtins:
-            return self.specialized_builtins[key][0]
 
-        helper_name = f"wp_{builtin_name}_baked_{ndim}d_{h.hexdigest()[:8]}"
-        index_params = ", ".join(f"int i{k}" for k in range(ndim))
+        # One template declaration per (builtin_name, ndim).  The template
+        # has `T` deduced from the data pointer and non-type params for
+        # shape / stride (/ value param layout where it differs, e.g.
+        # atomic_cas).  value_ctype is encoded into the key because cas
+        # has a distinct signature (two value params) from add/sub/...; the
+        # template body differs.
+        key_sig = "cas" if builtin_name == "atomic_cas" else ("value" if value_ctype is not None else "none")
+        key = (builtin_name, ndim, key_sig)
+        if key not in self.specialized_builtins:
+            helper_name = f"wp_{builtin_name}_baked_{ndim}d"
 
-        # Build byte-offset expression: sum of (optionally wrapped index) * stride.
-        offset_parts = []
-        for k in range(ndim):
-            # negative-index wrap is a conditional add of shape[k]
-            # `(i_k < 0 ? i_k + SHAPE : i_k) * STRIDE`
-            offset_parts.append(f"((i{k} < 0 ? i{k} + {shape[k]} : i{k}) * {strides[k]})")
-        offset_expr = " + ".join(offset_parts) if offset_parts else "0"
+            # Template params:  int S0..S{ndim-1}, int St0..St{ndim-1}, typename T.
+            shape_tparams = ", ".join(f"int S{k}" for k in range(ndim))
+            stride_tparams = ", ".join(f"int St{k}" for k in range(ndim))
+            tparams = f"template<{shape_tparams}, {stride_tparams}, typename T>"
 
-        # Helper body varies by builtin.  All share the same `addr` computation.
-        addr_stmt = (
-            f"{elem_ctype}* __addr = reinterpret_cast<{elem_ctype}*>("
-            f"reinterpret_cast<char*>(data) + ({offset_expr}));"
-        )
+            index_params = ", ".join(f"int i{k}" for k in range(ndim))
+            offset_parts = [f"((i{k} < 0 ? i{k} + S{k} : i{k}) * St{k})" for k in range(ndim)]
+            offset_expr = " + ".join(offset_parts)
+            addr_stmt = f"T* __addr = reinterpret_cast<T*>(reinterpret_cast<char*>(data) + ({offset_expr}));"
 
-        # Emit the helper inside `namespace wp { ... }` so `wp::<helper_name>`
-        # at the call site resolves without extra plumbing.
-        if builtin_name == "address":
-            body = f"""namespace wp {{
-static __device__ __forceinline__ {elem_ctype}* {helper_name}({elem_ctype}* data, {index_params}) {{
+            if builtin_name == "address":
+                body = f"""namespace wp {{
+{tparams}
+static __device__ __forceinline__ T* {helper_name}(T* data, {index_params}) {{
     {addr_stmt}
     return __addr;
 }}
 }}
 """
-        elif builtin_name == "array_store":
-            body = f"""namespace wp {{
-static __device__ __forceinline__ void {helper_name}({elem_ctype}* data, {index_params}, {value_ctype} value) {{
+            elif builtin_name == "array_store":
+                body = f"""namespace wp {{
+{tparams}
+static __device__ __forceinline__ void {helper_name}(T* data, {index_params}, T value) {{
     {addr_stmt}
     *__addr = value;
 }}
 }}
 """
-        elif builtin_name.startswith("atomic_"):
-            body = f"""namespace wp {{
-static __device__ __forceinline__ {value_ctype} {helper_name}({elem_ctype}* data, {index_params}, {value_ctype} value) {{
+            elif builtin_name == "atomic_cas":
+                body = f"""namespace wp {{
+{tparams}
+static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T compare, T value) {{
+    {addr_stmt}
+    return wp::{builtin_name}(__addr, compare, value);
+}}
+}}
+"""
+            elif builtin_name.startswith("atomic_"):
+                body = f"""namespace wp {{
+{tparams}
+static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T value) {{
     {addr_stmt}
     return wp::{builtin_name}(__addr, value);
 }}
 }}
 """
-        else:
-            raise ValueError(f"Scheme-B helper not implemented for builtin '{builtin_name}'")
+            else:
+                raise ValueError(f"Scheme-B helper not implemented for builtin '{builtin_name}'")
 
-        self.specialized_builtins[key] = (helper_name, body)
-        return helper_name
+            self.specialized_builtins[key] = (helper_name, body)
+
+        helper_name = self.specialized_builtins[key][0]
+        # Build the call-site instantiation: `helper_name<S0, S1, ..., St0, St1, ...>`.
+        tparam_values = ", ".join(str(x) for x in (*shape, *strides))
+        return f"{helper_name}<{tparam_values}>"
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []

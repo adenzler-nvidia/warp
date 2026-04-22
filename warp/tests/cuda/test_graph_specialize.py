@@ -148,9 +148,13 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertIn(".strides[0] = 4", source)
         self.assertIn(".ndim = 1", source)
         # Scheme-B helpers: array accesses route through per-module baked
-        # helpers that take `.data` directly.
-        self.assertRegex(source, r"wp_address_baked_1d_\w+")
-        self.assertRegex(source, r"wp_array_store_baked_1d_\w+")
+        # helpers that take `.data` directly.  In the template form
+        # (Phase A), shape + stride are non-type template params, so the
+        # helper itself has no hash suffix — one template per (builtin,
+        # ndim) with many instantiations per module.
+        self.assertIn("template<int S0, int St0, typename T>", source)
+        self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(")
+        self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(")
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""
