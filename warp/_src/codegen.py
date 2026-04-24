@@ -5295,13 +5295,14 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
                 if arg.label in used_by_value:
-                    baked_decls += f"    {array_ctype} {var_name};\n"
-                    baked_decls += f"    {var_name}.data = {data_param};\n"
-                    for i in range(value.ndim):
-                        baked_decls += f"    {var_name}.shape.dims[{i}] = Config::{arg.label}_shape_{i};\n"
-                    for i in range(value.ndim):
-                        baked_decls += f"    {var_name}.strides[{i}] = Config::{arg.label}_stride_{i};\n"
-                    baked_decls += f"    {var_name}.ndim = Config::{arg.label}_ndim;\n"
+                    shape_args = [f"Config::{arg.label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
+                    stride_args = [f"Config::{arg.label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
+                    baked_decls += (
+                        f"    wp::baked_array_t<{elem_ctype}, Config::{arg.label}_ndim, "
+                        f"{', '.join(shape_args)}, "
+                        f"{', '.join(stride_args)}> "
+                        f"{var_name}{{{data_param}}};\n"
+                    )
             elif isinstance(value, ctypes._SimpleCData):
                 baked_decls += f"    const {arg.ctype()} {var_name} = Config::{arg.label};\n"
             else:
@@ -5528,13 +5529,14 @@ def codegen_kernel(kernel, device, options):
                 used_by_value = getattr(adj, "_baked_arrays_used_by_value", set())
                 if arg.label in used_by_value:
                     var_name = "var_" + arg.label
-                    baked_decls_inner += f"        {arg.ctype()} {var_name};\n"
-                    baked_decls_inner += f"        {var_name}.data = var_{arg.label}_data;\n"
-                    for i in range(value.ndim):
-                        baked_decls_inner += f"        {var_name}.shape.dims[{i}] = {int(value.shape[i])};\n"
-                    for i in range(value.ndim):
-                        baked_decls_inner += f"        {var_name}.strides[{i}] = {int(value.strides[i])};\n"
-                    baked_decls_inner += f"        {var_name}.ndim = {int(value.ndim)};\n"
+                    shape_args = [str(int(value.shape[i])) if i < value.ndim else "0" for i in range(4)]
+                    stride_args = [str(int(value.strides[i])) if i < value.ndim else "0" for i in range(4)]
+                    baked_decls_inner += (
+                        f"        wp::baked_array_t<{elem_ctype}, {int(value.ndim)}, "
+                        f"{', '.join(shape_args)}, "
+                        f"{', '.join(stride_args)}> "
+                        f"{var_name}{{var_{arg.label}_data}};\n"
+                    )
             elif isinstance(value, ctypes._SimpleCData):
                 # Scalar: drop from ABI, emit as const inside the body.
                 baked_decls_inner += bake_scalar(arg.ctype(), "var_" + arg.label, value, pad="        ")

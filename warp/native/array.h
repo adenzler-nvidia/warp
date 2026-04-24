@@ -298,6 +298,70 @@ template <typename T> struct array_t {
 };
 
 
+// Compile-time array proxy used by the kernel-specialize codegen for
+// the "baked array passed by value" pattern (`wp::view(arr, ...)`,
+// `wp::where(arr, a, b)`, `if (arr)`).  Carries only the runtime data
+// pointer; shape / strides / ndim / flags live in template arguments
+// so every read folds to a constant at ptxas.  Mirrors `array_t<T>`'s
+// member surface via `static constexpr` fields so generic codegen
+// (e.g. `arr.shape.dims[K]`, `arr.strides[K]`, `arr.ndim`) still
+// compiles against a baked_array_t unchanged, with folds.
+//
+// Templated overloads of `view` and `where` below fire on this type
+// first (better match than the generic `array_t<T>&` versions), which
+// lets the consumer read shape / stride directly from template args
+// rather than through an opaque reference.  For consumers we don't
+// template (variadic slice view, indexedarray, others), the implicit
+// `operator array_t<T>()` materialises a full struct with the same
+// constexpr values — NVRTC already elides those writes, matching
+// today's T*-ABI reconstruction path byte-for-byte.
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+struct baked_array_t {
+    T* data;
+
+    // Static mirrors of array_t<T>'s instance fields.  C++17 inline
+    // semantics for `static constexpr` members means no out-of-line
+    // definitions are required.  Accessed via instance syntax
+    // (`arr.shape.dims[K]`, `arr.strides[K]`, ...) the reads short-
+    // circuit to the template args at compile time.
+    static constexpr baked_shape_t<S0, S1, S2, S3> shape {};
+    static constexpr int strides[ARRAY_MAX_DIMS] = { St0, St1, St2, St3 };
+    static constexpr uint16_t ndim = Ndim;
+    static constexpr uint16_t flags = 0;
+    // `grad` is always nullptr under the T*-ABI (spec default
+    // `enable_backward=False`).  Exposed as a static field so generic
+    // reads (`arr.grad`) compile.
+    static constexpr T* grad = nullptr;
+
+    // Mirrors `array_t<T>::operator T*()` — covers the `if (arr)`
+    // truthiness check and the pointer-extraction callsites.
+    CUDA_CALLABLE constexpr operator T*() const { return data; }
+
+    // Fallback conversion for consumers that take `array_t<T>&` and
+    // that we haven't templated directly.  The returned struct is
+    // initialised from the template args so NVRTC retains full
+    // constant-propagation; this is only reached through implicit
+    // conversion, never stamped into the generated kernel body.
+    CUDA_CALLABLE operator array_t<T>() const
+    {
+        array_t<T> out;
+        out.data = data;
+        out.grad = nullptr;
+        out.shape.dims[0] = S0;
+        out.shape.dims[1] = S1;
+        out.shape.dims[2] = S2;
+        out.shape.dims[3] = S3;
+        out.strides[0] = St0;
+        out.strides[1] = St1;
+        out.strides[2] = St2;
+        out.strides[3] = St3;
+        out.ndim = Ndim;
+        out.flags = 0;
+        return out;
+    }
+};
+
+
 // Required when compiling adjoints.
 template <typename T> inline CUDA_CALLABLE array_t<T> add(const array_t<T>& a, const array_t<T>& b)
 {
@@ -835,6 +899,111 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int 
 }
 
 
+// view() overloads for baked_array_t.  Each mirrors the corresponding
+// array_t<T> version above but reads shape / stride values directly
+// from the template args; the whole return struct is populated from
+// literal ints, which NVRTC collapses to the final byte offset at the
+// callsite.  The returned type is a plain array_t<T>: the view's
+// extent/stride depend on runtime indices, so the result cannot be
+// template-encoded the way the source was.  Generic consumers
+// (`tile_load`, etc.) reading from the returned array_t still fold
+// through the constexpr-initialised fields as they do today.
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline array_t<T> view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i)
+{
+    static_assert(Ndim > 1, "view(arr, int) requires ndim > 1");
+    assert(i >= -S0 && i < S0);
+
+    if (i < 0) {
+        i += S0;
+    }
+
+    array_t<T> a;
+    a.data = (T*)((char*)src.data + (size_t)i * St0);
+    a.grad = nullptr;
+    a.shape.dims[0] = S1;
+    a.shape.dims[1] = S2;
+    a.shape.dims[2] = S3;
+    a.shape.dims[3] = 0;
+    a.strides[0] = St1;
+    a.strides[1] = St2;
+    a.strides[2] = St3;
+    a.strides[3] = 0;
+    a.ndim = Ndim - 1;
+    a.flags = 0;
+
+    return a;
+}
+
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline array_t<T>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j)
+{
+    static_assert(Ndim > 2, "view(arr, int, int) requires ndim > 2");
+    assert(i >= -S0 && i < S0);
+    assert(j >= -S1 && j < S1);
+
+    if (i < 0) {
+        i += S0;
+    }
+    if (j < 0) {
+        j += S1;
+    }
+
+    array_t<T> a;
+    a.data = (T*)((char*)src.data + (size_t)i * St0 + (size_t)j * St1);
+    a.grad = nullptr;
+    a.shape.dims[0] = S2;
+    a.shape.dims[1] = S3;
+    a.shape.dims[2] = 0;
+    a.shape.dims[3] = 0;
+    a.strides[0] = St2;
+    a.strides[1] = St3;
+    a.strides[2] = 0;
+    a.strides[3] = 0;
+    a.ndim = Ndim - 2;
+    a.flags = 0;
+
+    return a;
+}
+
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline array_t<T>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j, int k)
+{
+    static_assert(Ndim > 3, "view(arr, int, int, int) requires ndim > 3");
+    assert(i >= -S0 && i < S0);
+    assert(j >= -S1 && j < S1);
+    assert(k >= -S2 && k < S2);
+
+    if (i < 0) {
+        i += S0;
+    }
+    if (j < 0) {
+        j += S1;
+    }
+    if (k < 0) {
+        k += S2;
+    }
+
+    array_t<T> a;
+    a.data = (T*)((char*)src.data + (size_t)i * St0 + (size_t)j * St1 + (size_t)k * St2);
+    a.grad = nullptr;
+    a.shape.dims[0] = S3;
+    a.shape.dims[1] = 0;
+    a.shape.dims[2] = 0;
+    a.shape.dims[3] = 0;
+    a.strides[0] = St3;
+    a.strides[1] = 0;
+    a.strides[2] = 0;
+    a.strides[3] = 0;
+    a.ndim = Ndim - 3;
+    a.flags = 0;
+
+    return a;
+}
+
+
 template <typename T, size_t... Idxs>
 size_t byte_offset_helper(array_t<T>& src, const slice_t (&slices)[sizeof...(Idxs)], index_sequence<Idxs...>)
 {
@@ -892,6 +1061,34 @@ CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, const Slices&... slice_arg
 
     out.ndim = src.ndim + slice_count - N;
     return out;
+}
+
+// Variadic-slice view overload for baked_array_t — materialises a
+// local array_t<T> inline (rather than via `operator array_t<T>()`)
+// and forwards to the generic version.  Going through the conversion
+// operator adds an extra function-call layer that NVRTC sometimes
+// declines to inline in hot kernels, measurably regressing end-to-
+// end (~0.8 pp on mjwarp humanoid in one bisection).  Writing the
+// fields directly here produces the same IR sequence as the pre-
+// Phase-2 reconstruction pattern, which was known to fold cleanly.
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, typename... Slices>
+CUDA_CALLABLE inline array_t<T>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, const Slices&... slice_args)
+{
+    array_t<T> tmp;
+    tmp.data = src.data;
+    tmp.grad = nullptr;
+    tmp.shape.dims[0] = S0;
+    tmp.shape.dims[1] = S1;
+    tmp.shape.dims[2] = S2;
+    tmp.shape.dims[3] = S3;
+    tmp.strides[0] = St0;
+    tmp.strides[1] = St1;
+    tmp.strides[2] = St2;
+    tmp.strides[3] = St3;
+    tmp.ndim = Ndim;
+    tmp.flags = 0;
+    return view(tmp, slice_args...);
 }
 
 template <typename T> CUDA_CALLABLE inline indexedarray_t<T> view(indexedarray_t<T>& src, int i)
@@ -1288,6 +1485,17 @@ template <typename T> inline CUDA_CALLABLE T load(T* address)
 
 // where() overload for array condition - returns a if array.data is non-null, otherwise returns b
 template <typename T1, typename T2> CUDA_CALLABLE inline T2 where(const array_t<T1>& arr, const T2& a, const T2& b)
+{
+    return arr.data ? a : b;
+}
+
+// where() overload for a baked array condition — mirrors the array_t<T>
+// version above.  Without this, `where(baked_arr, a, b)` would either
+// be ambiguous or fall through the implicit array_t<T> conversion,
+// materialising the full struct just to read `.data`.
+template <typename T1, typename T2, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline T2
+where(const baked_array_t<T1, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& arr, const T2& a, const T2& b)
 {
     return arr.data ? a : b;
 }

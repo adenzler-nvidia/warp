@@ -91,6 +91,19 @@ def reads_shape(a: wp.array(dtype=float), out: wp.array(dtype=int)):
         out[0] = a.shape[0]
 
 
+@wp.kernel
+def views_2d(arr: wp.array2d(dtype=float), out: wp.array(dtype=float)):
+    tid = wp.tid()
+    row = arr[tid]
+    out[tid] = row[0]
+
+
+@wp.kernel
+def where_on_array(maybe: wp.array(dtype=float), out: wp.array(dtype=float)):
+    tid = wp.tid()
+    out[tid] = wp.where(maybe, 1.0, 2.0)
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -191,6 +204,62 @@ class TestKernelSpecialize(unittest.TestCase):
         # End-to-end: the kernel reads back N correctly.
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), N)
+
+    def test_codegen_baked_array_for_view(self):
+        """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.
+        Verify the emit uses `wp::baked_array_t<...>` with template-
+        encoded shape/strides/ndim, and that the result is correct.
+        """
+        N = 32
+        M = 4
+        device = "cuda:0"
+        arr = wp.array(np.arange(N * M, dtype=np.float32).reshape(N, M), device=device)
+        out = wp.zeros(N, dtype=float, device=device)
+
+        new_specs = _run_specialized(views_2d, dim=N, inputs=[arr, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # New emit pattern: one-line baked_array_t with template-arg
+        # shape/strides/ndim.  No reconstructed array_t writes.
+        self.assertRegex(
+            source,
+            rf"wp::baked_array_t<wp::float32, 2, {N}, {M}, 0, 0, \d+, \d+, 0, 0>",
+        )
+        self.assertNotIn(f"var_arr.shape.dims[0] = {N};", source)
+        self.assertIn("wp::view(var_arr,", source)
+
+        # End-to-end correctness.
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M)
+
+    def test_codegen_baked_array_for_where(self):
+        """`wp.where(arr, a, b)` forces baked_array_t reconstruction —
+        the where overload is templated on baked_array_t so shape /
+        stride / ndim flow through as compile-time template args.
+        """
+        N = 16
+        device = "cuda:0"
+        maybe = wp.array(np.arange(N, dtype=np.float32), device=device)
+        out = wp.zeros(N, dtype=float, device=device)
+
+        new_specs = _run_specialized(where_on_array, dim=N, inputs=[maybe, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        self.assertRegex(source, rf"wp::baked_array_t<wp::float32, 1, {N}, 0, 0, 0,")
+        self.assertIn("wp::where(var_maybe,", source)
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(out.numpy(), np.ones(N, dtype=np.float32))
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""
