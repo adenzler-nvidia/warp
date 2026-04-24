@@ -9668,6 +9668,7 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
         hooks.forward_smem_bytes,
         kernel_params,
         stream.cuda_stream,
+        None,  # APICLaunchInfo* — spec path never records into APIC
     )
 
 
