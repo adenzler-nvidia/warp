@@ -6,12 +6,13 @@ import importlib
 import io
 import runpy
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
 
 import warp as wp
-from warp._src.context import _get_caller_module_name
+from warp._src.context import _get_caller_module_name, _get_cpu_isa_hash
 from warp.tests.unittest_utils import *
 
 
@@ -157,6 +158,40 @@ def test_options_cpu_compiler_flags_native(test, device):
         wp.set_module_options({"cpu_compiler_flags": None})
 
 
+def test_options_opt_level_hash(test, device):
+    """Changing warp.config.optimization_level must change the module hash."""
+    module = wp.get_module(__name__)
+
+    # Ensure module option is None so the config value is used
+    old_opt = module.options["optimization_level"]
+    module.options["optimization_level"] = None
+    module.hashers.clear()
+
+    old_config = wp.config.optimization_level
+    try:
+        wp.config.optimization_level = None
+        module.hashers.clear()
+        hash_default = module.get_module_hash()
+
+        wp.config.optimization_level = 2
+        module.hashers.clear()
+        hash_o2 = module.get_module_hash()
+
+        wp.config.optimization_level = 3
+        module.hashers.clear()
+        hash_o3 = module.get_module_hash()
+
+        # None is a distinct sentinel meaning "use target-specific default"
+        # (O2 for CPU, O3 for CUDA), so it must differ from both explicit values.
+        test.assertNotEqual(hash_default, hash_o2, "Hash must differ between None and explicit 2")
+        test.assertNotEqual(hash_default, hash_o3, "Hash must differ between None and explicit 3")
+        test.assertNotEqual(hash_o2, hash_o3, "Hash must differ between optimization levels 2 and 3")
+    finally:
+        wp.config.optimization_level = old_config
+        module.options["optimization_level"] = old_opt
+        module.hashers.clear()
+
+
 devices = get_test_devices()
 
 
@@ -193,6 +228,54 @@ class TestOptions(unittest.TestCase):
         main_module = wp.get_module("__main__")
         self.assertFalse(main_module.options["enable_backward"])
 
+    def test_cpu_isa_output_name_differentiation(self):
+        """CPU output filename must include ISA hash when using -march=native."""
+        module = wp.get_module(__name__)
+        device = wp.get_device("cpu")
+
+        old_flags = module.options["cpu_compiler_flags"]
+        try:
+            module.options["cpu_compiler_flags"] = "-march=native"
+            name_native = module._get_compile_output_name(device)
+
+            module.options["cpu_compiler_flags"] = ""
+            name_generic = module._get_compile_output_name(device)
+
+            if _get_cpu_isa_hash():
+                # On platforms where features are detected, filenames must differ
+                self.assertNotEqual(name_native, name_generic)
+                self.assertIn(".cpu", name_native)
+            # Generic build never has the ISA suffix
+            self.assertNotIn(".cpu", name_generic)
+        finally:
+            module.options["cpu_compiler_flags"] = old_flags
+
+    def test_cpu_isa_aot_warning(self):
+        """compile_aot_module for CPU with -march=native must emit a portability warning."""
+        module = wp.get_module(__name__)
+        old_flags = wp.config.cpu_compiler_flags
+
+        # Clear once-per-session warning dedup so the warning fires in this test
+        saved_warnings = wp._src.utils.warnings_seen.copy()
+        wp._src.utils.warnings_seen.clear()
+
+        try:
+            wp.config.cpu_compiler_flags = None  # resolves to -march=native
+            module.hashers.clear()
+
+            stdout_capture = io.StringIO()
+            with contextlib.redirect_stdout(stdout_capture):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    wp.compile_aot_module(module, device="cpu", module_dir=tmpdir)
+
+            output = stdout_capture.getvalue()
+            self.assertIn("-march=native", output)
+            self.assertIn("cpu_compiler_flags=''", output)
+        finally:
+            wp.config.cpu_compiler_flags = old_flags
+            module.hashers.clear()
+            wp._src.utils.warnings_seen.update(saved_warnings)
+
     def test_get_caller_module_name_error_message(self):
         """_get_caller_module_name should raise RuntimeError with a helpful message when all fallbacks fail."""
         # Build a fake frame where all fallback steps fail:
@@ -226,6 +309,7 @@ add_function_test(
 add_function_test(
     TestOptions, "test_options_cpu_compiler_flags_native", test_options_cpu_compiler_flags_native, devices=devices
 )
+add_function_test(TestOptions, "test_options_opt_level_hash", test_options_opt_level_hash, devices=devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

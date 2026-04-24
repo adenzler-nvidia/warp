@@ -7,7 +7,8 @@ import hashlib
 import pickle
 import re
 import weakref
-from typing import Any, Callable, ClassVar, Optional, Union
+from collections.abc import Callable
+from typing import Any, ClassVar, Optional
 
 import warp as wp
 from warp._src.codegen import Struct, StructInstance, get_annotations
@@ -25,7 +26,7 @@ _func_cache = {}
 _key_re = re.compile("[^0-9a-zA-Z_]+")
 
 
-def _make_key(obj, suffix: Any, options: Optional[dict[str, Any]] = None):
+def _make_key(obj, suffix: Any, options: dict[str, Any] | None = None):
     sorted_opts = tuple(sorted(options.items())) if options is not None else ()
     key = (
         obj.__module__,
@@ -140,7 +141,7 @@ def get_kernel(
     return _kernel_cache[cache_key]
 
 
-def dynamic_kernel(suffix: Any, kernel_options: Optional[dict[str, Any]] = None, allow_overloads=False):
+def dynamic_kernel(suffix: Any, kernel_options: dict[str, Any] | None = None, allow_overloads=False):
     """Return a decorator that caches a specialized :class:`warp.Kernel`.
 
     Args:
@@ -203,7 +204,7 @@ def get_argument_struct(arg_types: dict[str, type]):
     return get_struct(Args, suffix=suffix)
 
 
-def populate_argument_struct(value_struct: StructInstance, values: Optional[dict[str, Any]], func_name: str):
+def populate_argument_struct(value_struct: StructInstance, values: dict[str, Any] | None, func_name: str):
     if values is None:
         values = {}
 
@@ -291,8 +292,8 @@ def get_integrand_function(
 def get_integrand_kernel(
     integrand: Integrand,
     suffix: str,
-    kernel_fn: Optional[Callable] = None,
-    kernel_options: Optional[dict[str, Any]] = None,
+    kernel_fn: Callable | None = None,
+    kernel_options: dict[str, Any] | None = None,
     code_transformers=None,
     FieldStruct=None,
     ValueStruct=None,
@@ -366,9 +367,9 @@ def cached_arg_value(func: Callable):
 
 def setup_dynamic_attributes(
     obj,
-    cls: Optional[type] = None,
-    constructors: Optional[dict[str, Callable]] = None,
-    key: Optional[str] = None,
+    cls: type | None = None,
+    constructors: dict[str, Callable] | None = None,
+    key: str | None = None,
 ):
     if cls is None:
         cls = type(obj)
@@ -464,10 +465,9 @@ class TemporaryStore:
 
             self._pool: list[int] = []  # Currently available buffers for borrowing, ordered by size
             self._pool_capacities: list[int] = []  # Sizes of available arrays for borrowing, ascending
-            self._allocs: dict[int, int] = {}  # All allocated capacities, including borrowed ones
+            self._allocs: dict[int, tuple[int, object]] = {}  # ptr -> (capacity, deallocate)
 
             self._dtype_size = type_size_in_bytes(dtype)
-            self._allocator = device.get_allocator(pinned=self.pinned)
             self._deleter = TemporaryStore.Pool.Deleter(self)
 
             # self._held_temporaries = set()  # Temporaries that are prevented from going out of scope
@@ -505,8 +505,10 @@ class TemporaryStore:
                         grow_factor = 1.5
                         capacity = max(int(self._pool_capacities[-1] * grow_factor), capacity)
 
-                    ptr = self._allocator.alloc(capacity)
-                    self._allocs[ptr] = capacity
+                    allocator = self.device.get_allocator(pinned=self.pinned)
+                    with self.device.context_guard:
+                        ptr = allocator.allocate(capacity)
+                    self._allocs[ptr] = (capacity, allocator.deallocate)
                 deleter = self._deleter
 
             temporary = Temporary(
@@ -522,7 +524,7 @@ class TemporaryStore:
             return temporary
 
         def redeem(self, ptr: int):
-            capacity = self._allocs[ptr]
+            capacity, _ = self._allocs[ptr]
             # Insert back array into available pool
             index = bisect.bisect_left(
                 a=self._pool_capacities,
@@ -532,12 +534,17 @@ class TemporaryStore:
             self._pool_capacities.insert(index, capacity)
 
         def detach(self, array: Temporary):
-            del self._allocs[array.ptr]
-            array.deleter = self._allocator.deleter
+            _, deallocate = self._allocs.pop(array.ptr)
+            array.deleter = deallocate
 
         def __del__(self):
-            for ptr, capacity in self._allocs.items():
-                self._allocator.free(ptr, capacity)
+            for ptr, (capacity, deallocate) in self._allocs.items():
+                try:
+                    with self.device.context_guard:
+                        deallocate(ptr, capacity)
+                except (TypeError, AttributeError):
+                    # Suppress TypeError and AttributeError when callables become None during shutdown
+                    pass
 
     def __init__(self):
         self.clear()
@@ -617,7 +624,7 @@ class TemporaryStore:
             temporary.deleter = None
 
 
-def set_default_temporary_store(temporary_store: Optional[TemporaryStore]):
+def set_default_temporary_store(temporary_store: TemporaryStore | None):
     """Globally sets the default :class:`TemporaryStore` instance to use for temporary allocations in ``warp.fem`` functions.
 
     If the default temporary store is set to ``None``, temporary allocations are not persisted unless a :class:`TemporaryStore` is provided at a per-function granularity.
@@ -627,8 +634,8 @@ def set_default_temporary_store(temporary_store: Optional[TemporaryStore]):
 
 
 def borrow_temporary(
-    temporary_store: Optional[TemporaryStore],
-    shape: Union[int, tuple[int]],
+    temporary_store: TemporaryStore | None,
+    shape: int | tuple[int],
     dtype: type,
     pinned: bool = False,
     requires_grad: bool = False,
@@ -659,8 +666,8 @@ def borrow_temporary(
 
 
 def borrow_temporary_like(
-    array: Union[wp.array, Temporary],
-    temporary_store: Optional[TemporaryStore],
+    array: wp.array | Temporary,
+    temporary_store: TemporaryStore | None,
 ) -> Temporary:
     """Borrow and return a temporary array with the same attributes as another array or temporary.
 
@@ -707,7 +714,7 @@ def capture_event(device=None):
         return wp.record_event(device_events.pop())
 
 
-def synchronize_event(event: Union[wp.Event, None]):
+def synchronize_event(event: wp.Event | None):
     """
     Synchronize an event created with :func:`capture_event` and returns it to the
     per-device event pool.

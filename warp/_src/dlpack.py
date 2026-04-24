@@ -5,7 +5,6 @@
 # https://dmlc.github.io/dlpack/latest/python_spec.html
 
 import ctypes
-from typing import Union
 
 import warp
 from warp._src.thirdparty.dlpack import (
@@ -140,6 +139,8 @@ def dtype_to_dlpack(wp_dtype) -> DLDataType:
         return (DLDataTypeCode.kDLUInt, 64, 1)
     elif wp_dtype == warp.float16:
         return (DLDataTypeCode.kDLFloat, 16, 1)
+    elif wp_dtype == warp.bfloat16:
+        return (DLDataTypeCode.kDLBfloat, 16, 1)
     elif wp_dtype == warp.float32:
         return (DLDataTypeCode.kDLFloat, 32, 1)
     elif wp_dtype == warp.float64:
@@ -172,6 +173,8 @@ def dtype_from_dlpack(dl_dtype):
         return warp._src.types.uint64
     elif dl_dtype == (DLDataTypeCode.kDLFloat, 16):
         return warp._src.types.float16
+    elif dl_dtype == (DLDataTypeCode.kDLBfloat, 16):
+        return warp._src.types.bfloat16
     elif dl_dtype == (DLDataTypeCode.kDLFloat, 32):
         return warp._src.types.float32
     elif dl_dtype == (DLDataTypeCode.kDLFloat, 64):
@@ -326,7 +329,9 @@ def dtype_is_compatible(dl_dtype, wp_dtype):
         elif dl_dtype.bits == 64:
             return wp_dtype == warp.int64 or wp_dtype == warp.uint64
     elif dl_dtype.type_code.value == DLDataTypeCode.kDLBfloat:
-        raise RuntimeError("Bfloat data type is not supported")
+        if dl_dtype.bits == 16:
+            return wp_dtype == warp.bfloat16
+        return False
     elif dl_dtype.type_code.value == DLDataTypeCode.kDLComplex:
         raise RuntimeError("Complex data types are not supported")
     else:
@@ -398,7 +403,7 @@ def _unpack_texture(dlt: DLTensor, TextureClass: type):
     return TextureClass(cuda_array=dlt.data, device=device)
 
 
-def _from_dlpack(capsule, dtype=None, hint=None) -> Union[warp.array, warp.Texture]:
+def _from_dlpack(capsule, dtype=None, hint=None) -> warp.array | warp.Texture:
     """Convert a DLPack capsule into a Warp array without copying.
 
     Args:
@@ -438,7 +443,7 @@ def _from_dlpack(capsule, dtype=None, hint=None) -> Union[warp.array, warp.Textu
     return obj
 
 
-def from_dlpack(source, dtype=None, hint=None) -> Union[warp.array, warp.Texture]:
+def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
     """Convert a source array or DLPack capsule into a Warp array without copying.
 
     Args:

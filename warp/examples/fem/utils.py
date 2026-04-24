@@ -6,12 +6,13 @@ import gc
 import os
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
 import warp as wp
 import warp.fem as fem
+from warp._src.utils import warn
 from warp.optim.linear import LinearOperator, aslinearoperator, bicgstab, cg, cr, gmres, preconditioner
 from warp.render import UsdRenderer
 from warp.sparse import BsrMatrix, bsr_get_diag, bsr_mv, bsr_transposed
@@ -87,7 +88,7 @@ wp.set_module_options({"max_unroll": 6})
 #
 
 
-def gen_trimesh(res, bounds_lo: Optional[wp.vec2] = None, bounds_hi: Optional[wp.vec2] = None):
+def gen_trimesh(res, bounds_lo: wp.vec2 | None = None, bounds_hi: wp.vec2 | None = None):
     """Construct a triangular mesh by diving each cell of a dense 2D grid into two triangles.
 
     Args:
@@ -118,7 +119,7 @@ def gen_trimesh(res, bounds_lo: Optional[wp.vec2] = None, bounds_hi: Optional[wp
     return wp.array(positions, dtype=wp.vec2), wp.array(vidx, dtype=int)
 
 
-def gen_tetmesh(res, bounds_lo: Optional[wp.vec3] = None, bounds_hi: Optional[wp.vec3] = None):
+def gen_tetmesh(res, bounds_lo: wp.vec3 | None = None, bounds_hi: wp.vec3 | None = None):
     """Construct a tetrahedral mesh by diving each cell of a dense 3D grid into five tetrahedrons.
 
     Args:
@@ -151,7 +152,7 @@ def gen_tetmesh(res, bounds_lo: Optional[wp.vec3] = None, bounds_hi: Optional[wp
     return wp.array(positions, dtype=wp.vec3), wp.array(vidx, dtype=int)
 
 
-def gen_quadmesh(res, bounds_lo: Optional[wp.vec2] = None, bounds_hi: Optional[wp.vec2] = None):
+def gen_quadmesh(res, bounds_lo: wp.vec2 | None = None, bounds_hi: wp.vec2 | None = None):
     """Construct a quadrilateral mesh from a dense 2D grid.
 
     Args:
@@ -181,7 +182,7 @@ def gen_quadmesh(res, bounds_lo: Optional[wp.vec2] = None, bounds_hi: Optional[w
     return wp.array(positions, dtype=wp.vec2), wp.array(vidx, dtype=int)
 
 
-def gen_hexmesh(res, bounds_lo: Optional[wp.vec3] = None, bounds_hi: Optional[wp.vec3] = None):
+def gen_hexmesh(res, bounds_lo: wp.vec3 | None = None, bounds_hi: wp.vec3 | None = None):
     """Construct a quadrilateral mesh from a dense 2D grid.
 
     Args:
@@ -214,7 +215,7 @@ def gen_hexmesh(res, bounds_lo: Optional[wp.vec3] = None, bounds_hi: Optional[wp
     return wp.array(positions, dtype=wp.vec3), wp.array(vidx, dtype=int)
 
 
-def gen_volume(res, bounds_lo: Optional[wp.vec3] = None, bounds_hi: Optional[wp.vec3] = None, device=None) -> wp.Volume:
+def gen_volume(res, bounds_lo: wp.vec3 | None = None, bounds_hi: wp.vec3 | None = None, device=None) -> wp.Volume:
     """Construct a wp.Volume from a dense 3D grid.
 
     Args:
@@ -382,7 +383,7 @@ class SaddleSystem(LinearOperator):
         self,
         A: BsrMatrix,
         B: BsrMatrix,
-        Bt: Optional[BsrMatrix] = None,
+        Bt: BsrMatrix | None = None,
         use_diag_precond: bool = True,
     ):
         if Bt is None:
@@ -681,7 +682,7 @@ class Plot:
                 color_only.add(name)
         return color_only
 
-    def plot(self, options: Optional[dict[str, Any]] = None, backend: str = "auto", save: Optional[str] = None):
+    def plot(self, options: dict[str, Any] | None = None, backend: str = "auto", save: str | None = None):
         """Display or export the accumulated field snapshots.
 
         Args:
@@ -715,9 +716,9 @@ class Plot:
             try:
                 return self._plot_matplotlib(options, save=save)
             except ModuleNotFoundError:
-                wp.utils.warn("pyvista or matplotlib must be installed to visualize solution results")
+                warn("pyvista or matplotlib must be installed to visualize solution results")
 
-    def _plot_pyvista(self, options: dict[str, Any], save: Optional[str] = None):
+    def _plot_pyvista(self, options: dict[str, Any], save: str | None = None):
         import pyvista  # noqa: PLC0415
 
         save_mode = _classify_save_path(save)
@@ -738,7 +739,7 @@ class Plot:
                 offsets = np.cumsum(counts)
                 ranges = np.array([offsets - counts, offsets]).T
                 faces = np.concatenate(
-                    [[count, *list(indices[beg:end])] for (count, (beg, end)) in zip(counts, ranges)]
+                    [[count, *list(indices[beg:end])] for (count, (beg, end)) in zip(counts, ranges, strict=True)]
                 )
                 ref_geom = pyvista.PolyData(vertices, faces)
             else:
@@ -947,7 +948,7 @@ class Plot:
                 set_frame_data(frame)
                 plotter.update()
 
-    def _plot_matplotlib(self, options: dict[str, Any], save: Optional[str] = None):
+    def _plot_matplotlib(self, options: dict[str, Any], save: str | None = None):
         import matplotlib.animation as animation  # noqa: PLC0415
         import matplotlib.pyplot as plt  # noqa: PLC0415
         from matplotlib import cm  # noqa: PLC0415

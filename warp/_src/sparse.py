@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import weakref
-from typing import Any, Generic, TypeVar, Union
+from typing import Any, Generic, TypeVar
 
 from numpy import eye
 
@@ -69,7 +69,7 @@ class _ScalarBlockType(Generic[Scalar]):
     pass
 
 
-BlockType = Union[_MatrixBlockType[Rows, Cols, Scalar], _ScalarBlockType[Scalar]]
+BlockType = _MatrixBlockType[Rows, Cols, Scalar] | _ScalarBlockType[Scalar]
 
 _struct_cache = {}
 _transfer_buffer_cache = {}
@@ -430,6 +430,7 @@ def _optional_ctypes_event(event: wp.Event | None):
 
 _zero_value_masks = {
     wp.float16: 0x7FFF,
+    wp.bfloat16: 0x7FFF,
     wp.float32: 0x7FFFFFFF,
     wp.float64: 0x7FFFFFFFFFFFFFFF,
     wp.int8: 0xFF,
@@ -745,7 +746,7 @@ class _BsrScalingExpression(_BsrExpression):
         return _BsrScalingExpression(self.mat.transpose(), self.scale)
 
 
-BsrMatrixOrExpression = Union[BsrMatrix[_BlockType], _BsrExpression[_BlockType]]
+BsrMatrixOrExpression = BsrMatrix[_BlockType] | _BsrExpression[_BlockType]
 
 
 def _extract_matrix_and_scale(bsr: BsrMatrixOrExpression):

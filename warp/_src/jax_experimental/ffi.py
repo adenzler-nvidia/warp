@@ -8,8 +8,8 @@ import ctypes
 import inspect
 import threading
 import traceback
+from collections.abc import Callable
 from enum import IntEnum
-from typing import Callable
 
 import jax
 
@@ -25,6 +25,7 @@ from warp._src.types import (
     type_size_in_bytes,
     type_to_warp,
 )
+from warp._src.utils import warn
 
 from .xla_ffi import *
 
@@ -440,6 +441,7 @@ class FfiKernel:
                     hooks.forward_smem_bytes,
                     kernel_params,
                     stream,
+                    None,  # apic_info
                 )
 
         except Exception as e:
@@ -1301,7 +1303,7 @@ def jax_kernel(
                 try:
                     gi.zero_()
                 except Exception as e:
-                    wp.utils.warn(f"Failed to zero gradient array: {e}", stacklevel=2)
+                    warn(f"Failed to zero gradient array: {e}", stacklevel=2)
                     raise e
 
         # NOTE: We cannot use a passed launch_dims here, the backward rule doesn't receive it (and it could be wrong under pmap/vmap).
@@ -1387,7 +1389,7 @@ def jax_kernel(
         non_static_inputs, output_vals_tuple = residuals
 
         input_vals = list(non_static_inputs)
-        for i, v in zip(static_args, nondiff_vals):
+        for i, v in zip(static_args, nondiff_vals, strict=True):
             input_vals.insert(i, v)
 
         # Normalize grad outputs and handle nested containers (e.g., single tuple for multi-output)
@@ -1403,7 +1405,7 @@ def jax_kernel(
 
         out_dims_map = {}
         param_ann = {p.name: p.annotation for p in parameters[:num_inputs]}
-        for name, val in zip(differentiable_input_names, non_static_inputs):
+        for name, val in zip(differentiable_input_names, non_static_inputs, strict=True):
             ann = param_ann.get(name)
             if ann is None:
                 continue

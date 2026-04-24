@@ -125,14 +125,17 @@ def test_vector(test, device, dtype):
     test.assertSequenceEqual(v, make_vec(1, -2, -3, 4))
 
     v = vec3_cls(2, 4, 6)
-    test.assertSequenceEqual(+v, make_vec(2, 4, 6))
-    test.assertSequenceEqual(-v, make_vec(-2, -4, -6))
-    test.assertSequenceEqual(v + vec3_cls(1, 1, 1), make_vec(3, 5, 7))
-    test.assertSequenceEqual(v - vec3_cls(1, 1, 1), make_vec(1, 3, 5))
-    test.assertSequenceEqual(v * dtype(2), make_vec(4, 8, 12))
-    test.assertSequenceEqual(dtype(2) * v, make_vec(4, 8, 12))
-    test.assertSequenceEqual(v / dtype(2), make_vec(1, 2, 3))
-    test.assertSequenceEqual(dtype(12) / v, make_vec(6, 3, 2))
+    # bfloat16 does not have named vector/matrix types yet, so Python-side
+    # operator dispatch (pos, neg, add, etc.) is not available.
+    if dtype is not wp.bfloat16:
+        test.assertSequenceEqual(+v, make_vec(2, 4, 6))
+        test.assertSequenceEqual(-v, make_vec(-2, -4, -6))
+        test.assertSequenceEqual(v + vec3_cls(1, 1, 1), make_vec(3, 5, 7))
+        test.assertSequenceEqual(v - vec3_cls(1, 1, 1), make_vec(1, 3, 5))
+        test.assertSequenceEqual(v * dtype(2), make_vec(4, 8, 12))
+        test.assertSequenceEqual(dtype(2) * v, make_vec(4, 8, 12))
+        test.assertSequenceEqual(v / dtype(2), make_vec(1, 2, 3))
+        test.assertSequenceEqual(dtype(12) / v, make_vec(6, 3, 2))
 
     test.assertTrue(v != vec3_cls(1, 2, 3))
     test.assertEqual(str(v), "[{}]".format(", ".join(str(x) for x in v)))
@@ -546,19 +549,23 @@ class TestTypes(unittest.TestCase):
             self.assertSequenceEqual(m, make_mat((1, 2, 3), (-4, 5, 6), (-7, 8, -9)))
 
             m = mat22_cls(2, 4, 6, 8)
-            self.assertSequenceEqual(+m, make_mat((2, 4), (6, 8)))
-            self.assertSequenceEqual(-m, make_mat((-2, -4), (-6, -8)))
-            self.assertSequenceEqual(m + mat22_cls(1, 1, 1, 1), make_mat((3, 5), (7, 9)))
-            self.assertSequenceEqual(m - mat22_cls(1, 1, 1, 1), make_mat((1, 3), (5, 7)))
-            self.assertSequenceEqual(m * dtype(2), make_mat((4, 8), (12, 16)))
-            self.assertSequenceEqual(dtype(2) * m, make_mat((4, 8), (12, 16)))
-            self.assertSequenceEqual(m / dtype(2), make_mat((1, 2), (3, 4)))
-            self.assertSequenceEqual(dtype(24) / m, make_mat((12, 6), (4, 3)))
+            # bfloat16 does not have named vector/matrix types yet, so
+            # Python-side operator dispatch (pos, neg, add, etc.) is not available.
+            if dtype is not wp.bfloat16:
+                self.assertSequenceEqual(+m, make_mat((2, 4), (6, 8)))
+                self.assertSequenceEqual(-m, make_mat((-2, -4), (-6, -8)))
+                self.assertSequenceEqual(m + mat22_cls(1, 1, 1, 1), make_mat((3, 5), (7, 9)))
+                self.assertSequenceEqual(m - mat22_cls(1, 1, 1, 1), make_mat((1, 3), (5, 7)))
+                self.assertSequenceEqual(m * dtype(2), make_mat((4, 8), (12, 16)))
+                self.assertSequenceEqual(dtype(2) * m, make_mat((4, 8), (12, 16)))
+                self.assertSequenceEqual(m / dtype(2), make_mat((1, 2), (3, 4)))
+                self.assertSequenceEqual(dtype(24) / m, make_mat((12, 6), (4, 3)))
 
-            self.assertSequenceEqual(m * vec2_cls(1, 2), make_vec(10, 22))
-            self.assertSequenceEqual(m @ vec2_cls(1, 2), make_vec(10, 22))
-            self.assertSequenceEqual(vec2_cls(1, 2) * m, make_vec(14, 20))
-            self.assertSequenceEqual(vec2_cls(1, 2) @ m, make_vec(14, 20))
+            if dtype is not wp.bfloat16:
+                self.assertSequenceEqual(m * vec2_cls(1, 2), make_vec(10, 22))
+                self.assertSequenceEqual(m @ vec2_cls(1, 2), make_vec(10, 22))
+                self.assertSequenceEqual(vec2_cls(1, 2) * m, make_vec(14, 20))
+                self.assertSequenceEqual(vec2_cls(1, 2) @ m, make_vec(14, 20))
 
             self.assertTrue(m != mat22_cls(1, 2, 3, 4))
             self.assertEqual(
@@ -703,11 +710,11 @@ class TestTypes(unittest.TestCase):
         result = wp._src.types.get_type_code(tuple_multi_warp)
         self.assertEqual(result, "tpl3v3f4m33f4qf4", "tuple[vec3f, mat33f, quatf] should generate 'tpl3v3f4m33f4qf4'")
 
-        # Verify the fix works on Python 3.9-3.10 specifically
+        # Verify the fix works on Python 3.10 specifically
         if sys.version_info < (3, 11) and hasattr(types, "GenericAlias"):
-            # On Python 3.9-3.10, tuple[...] creates types.GenericAlias
+            # On Python 3.10, tuple[...] creates types.GenericAlias
             self.assertIsInstance(
-                tuple_mixed, types.GenericAlias, "On Python 3.9-3.10, tuple[...] should create types.GenericAlias"
+                tuple_mixed, types.GenericAlias, "On Python 3.10, tuple[...] should create types.GenericAlias"
             )
             self.assertIs(tuple_mixed.__origin__, tuple, "GenericAlias origin should be tuple")
 
