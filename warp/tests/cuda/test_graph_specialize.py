@@ -142,8 +142,9 @@ class TestKernelSpecialize(unittest.TestCase):
         # Baked dim and scalar.
         self.assertIn(f"dim.size = {N}", source)
         self.assertIn("var_alpha = 2", source)
-        # Baked array metadata as prologue writes (kept for NVRTC alias
-        # analysis — see codegen_kernel comment).
+        # Baked array-metadata writes in the kernel body (see
+        # `codegen_kernel` comment — they're NVRTC-alias-analysis
+        # load-bearing even though semantically dead).
         self.assertIn(f".shape.dims[0] = {N}", source)
         self.assertIn(".strides[0] = 4", source)
         self.assertIn(".ndim = 1", source)
