@@ -88,7 +88,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.cuda.test_async import TestAsync
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
     from warp.tests.cuda.test_cuda_arch_suffix import TestCudaArchSuffix
-    from warp.tests.cuda.test_graph_specialize import TestGraphSpecialize
+    from warp.tests.cuda.test_graph_specialize import TestKernelSpecialize
     from warp.tests.cuda.test_mempool import TestMempool
     from warp.tests.cuda.test_multigpu import TestMultiGPU
     from warp.tests.cuda.test_occupancy import TestOccupancy
@@ -241,7 +241,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestArray,
         TestArrayReduce,
         TestAsync,
-        TestGraphSpecialize,
+        TestKernelSpecialize,
         TestAtomic,
         TestAtomicBitwise,
         TestAtomicCAS,
