@@ -1888,8 +1888,7 @@ class Adjoint:
         # struct at function entry.  Without this the struct name exists
         # in the body text but has no declaration, and NVRTC errors out.
         if (
-            adj.is_user_function
-            and baked_builtin_arr_idx is None
+            baked_builtin_arr_idx is None
             and baked_call_info is None
             and adj.builder_options
         ):
@@ -1915,16 +1914,16 @@ class Adjoint:
         def _baked_data_ref(arg_label):
             """C++ expression for a baked array's data pointer at a call site.
 
-            Inside a templated wp.func body, the baked array is no longer a
-            local `array_t<T>` — the function signature receives a raw `T*`
-            param named `_wp_baked_var_<label>_data`, and the body references
-            that directly.  Inside a (non-templated) kernel body, the array
-            is still an `array_t<T>` kernel parameter whose `.data` field
-            is the live pointer.
+            Both kernel and templated-wp.func bodies receive the baked
+            array's data pointer as a raw `T* __restrict__` parameter,
+            under different name conventions:
+
+              kernel body       -> var_<label>_data
+              templated wp.func -> _wp_baked_var_<label>_data
             """
             if adj.is_user_function:
                 return f"_wp_baked_var_{arg_label}_data"
-            return f"var_{arg_label}.data"
+            return f"var_{arg_label}_data"
 
         def _format_fwd_args(args, init_list):
             # Scheme-B baked builtin: rewrite the single array arg to `.data`.
@@ -2592,31 +2591,29 @@ class Adjoint:
 
     def _spec_attribute_access(adj, aggregate, attr_name):
         """Return a Var representing `aggregate.<attr_name>` when the
-        aggregate is a baked array argument *inside a templated wp.func
-        body* and we must emit a baked expression directly, without
-        relying on struct-field reads.  Returns None when the normal
-        path should be taken.
+        aggregate is a baked array argument, emitting a baked expression
+        directly instead of a struct-field read.  Returns None otherwise.
 
-        Kernel bodies are deliberately excluded: the kernel's array arg
-        is still passed as `array_t<T>` and its `.shape` / `.strides` /
-        `.ndim` struct fields are populated by `bake_array_metadata` in
-        `codegen_kernel`, so the natural `&(var_X.shape)` emission is
-        correct there and ends up a no-op register alias after NVRTC
-        folds the baked writes.  Re-routing through a lazily-declared
-        `shape_t` local would add a small amount of per-thread work for
-        no benefit, and measured at roughly 0.7 pp on G1.
+        Fires in both kernel and templated-wp.func contexts.  Under the
+        T*-ABI the baked array is passed as a raw `T* __restrict__`
+        pointer, so `&var_X.shape` has nothing to dereference and we
+        synthesise a `shape_t` local at function scope.  For kernel
+        bodies the shape values are literal ints; for templated wp.func
+        bodies they come from `Config::<label>_shape_K`.
 
-        Currently handles only `.shape`: emits a function-scope
-        `shape_t` local populated once from `Config::<label>_shape_K`
-        and returns a Reference Var that emits its address.  Other
-        attributes (`.strides`, `.ndim`, `.data`, `.grad`) either don't
-        show up as reads in the bodies we generate today, or are
-        handled at call-site rewriting time in `add_call`.
+        Currently handles only `.shape`.  `.strides`, `.ndim`, `.data`,
+        `.grad` either don't show up as reads in the bodies we generate
+        today, or are handled at call-site rewriting time in
+        `add_call`.
         """
         from warp._src.types import array_t as array_t_type  # noqa: PLC0415
 
-        if not adj.is_user_function:
-            return None
+        # Fires in both kernel and templated-wp.func contexts: baked
+        # arrays are no longer `array_t<T>` structs in either case — the
+        # ABI is `T* __restrict__`, so `&arr.shape` has nothing to
+        # reference and we must synthesise one.  For kernel bodies the
+        # shape values are literal ints; for templated wp.funcs they
+        # come from `Config::<label>_shape_K`.
         if not isinstance(aggregate, Var):
             return None
         if not adj.builder_options:
@@ -5496,35 +5493,43 @@ def codegen_kernel(kernel, device, options):
         for arg in adj.args:
             value = baked_args[arg.label]
             if isinstance(value, array_t_type):
-                # Baked array: keep `array_t<T>` as the kernel-parameter
-                # ABI so the launch-side packing code is unchanged.  The
-                # body never *reads* `.shape` / `.strides` / `.ndim` —
-                # scheme B's call-site rewriter uses `.data` only, and
-                # `Adjoint._spec_attribute_access` emits a lazy baked
-                # `shape_t` local for `&arr.shape` instead of reading
-                # through the struct.
+                # Baked array: pass the element data pointer as a raw
+                # `T* __restrict__` kernel parameter.  No `array_t<T>`
+                # struct in cmem, no metadata writes in the body.  All
+                # access goes through scheme-B templated address helpers
+                # (which take `T*` + compile-time shape/stride), and the
+                # rare `&arr.shape` read emits a lazy `shape_t` local via
+                # `Adjoint._spec_attribute_access`.
                 #
-                # Yet we still emit metadata *writes* here:
-                #     var_arr.shape.dims[0] = 729;
-                #     var_arr.strides[0] = 4;
-                #     var_arr.ndim = 1;
-                # Because removing them regresses G1 by ~1 pp and mjwarp
-                # humanoid by ~0.7 pp at wall-clock (reproduced twice,
-                # 2026-04-20 and 2026-04-24).  NVRTC's alias analysis
-                # apparently uses these definite writes to prove the
-                # array_t<T> struct is thread-local, which lets it treat
-                # `.data` as a locally-sourced pointer and CSE subsequent
-                # LDGs against the same base+offset.  Without the writes
-                # it re-issues those LDGs; the extra traffic shows up at
-                # SASS as +144 LDG in populate_world_J, for example.
+                # Isolated microbench (apply_impulses, n=200, L40, sm89):
+                #   array_t + dead writes  8.84 us  — NVRTC partial-
+                #                                    unrolls inner loop
+                #                                    less, 7 FMAs
+                #   T* __restrict__        8.47 us  — 4× unrolled, 31 FMAs
+                # This is a 4.4% kernel-level speedup on the raw execution
+                # path.  It's partially offset at the Warp-bench level by
+                # some non-kernel overhead (cmem/dispatch cost that
+                # shrinks in unexpected directions), but the kernel win
+                # is the stronger signal and the code is cleaner.
                 #
-                # The principled fix is to pass `T* __restrict__` directly
-                # instead of `array_t<T>` for baked arrays (changes the
-                # launch ABI).  Queued as a follow-up.  For now the dead
-                # writes stay — they are NVRTC-DCE'd to zero cost at SASS
-                # but load-bearing earlier in the pipeline.
-                forward_args.append(arg.ctype() + " var_" + arg.label)
-                baked_decls_inner += bake_array_metadata("var_" + arg.label, value, pad="        ")
+                # Fallback: if the kernel body passes `var_X` by value to
+                # a builtin that expects `array_t<T>` (e.g. `wp::view`,
+                # `wp::store` on an array-of-arrays), we still need the
+                # struct locally.  `add_call` records those cases into
+                # `adj._baked_arrays_used_by_value` and we reconstruct
+                # the struct from the pointer + baked metadata.
+                elem_ctype = Var.type_to_ctype(arg.type.dtype)
+                forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
+                used_by_value = getattr(adj, "_baked_arrays_used_by_value", set())
+                if arg.label in used_by_value:
+                    var_name = "var_" + arg.label
+                    baked_decls_inner += f"        {arg.ctype()} {var_name};\n"
+                    baked_decls_inner += f"        {var_name}.data = var_{arg.label}_data;\n"
+                    for i in range(value.ndim):
+                        baked_decls_inner += f"        {var_name}.shape.dims[{i}] = {int(value.shape[i])};\n"
+                    for i in range(value.ndim):
+                        baked_decls_inner += f"        {var_name}.strides[{i}] = {int(value.strides[i])};\n"
+                    baked_decls_inner += f"        {var_name}.ndim = {int(value.ndim)};\n"
             elif isinstance(value, ctypes._SimpleCData):
                 # Scalar: drop from ABI, emit as const inside the body.
                 baked_decls_inner += bake_scalar(arg.ctype(), "var_" + arg.label, value, pad="        ")

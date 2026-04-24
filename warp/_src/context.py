@@ -9643,18 +9643,27 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     if hooks.forward is None:
         raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
 
-    # Build kernel params.  Scalars (_SimpleCData) are baked as `const` locals
-    # inside the kernel body and drop from the ABI; everything else (arrays,
-    # structs, textures, vectors/matrices, etc.) is still passed as a kernel
-    # parameter.  Keep this aligned with the matching filter in
-    # `codegen_kernel` when `specialize == True`.
-    params = [
-        baked_args[a.label]
-        for a in kernel.adj.args
-        if not isinstance(baked_args[a.label], ctypes._SimpleCData)
-    ]
-    if params:
-        kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
+    # Build kernel params.  Matches `codegen_kernel`'s specialize branch:
+    #   scalars (_SimpleCData) -> dropped from ABI (baked as const)
+    #   arrays   (array_t)     -> pass only `.data` as a raw `T*`
+    #   otherwise              -> pass unchanged (struct by value)
+    # For arrays we can't take `addressof(array_t_struct)` anymore because
+    # the kernel expects an 8-byte pointer in cmem, not the 56-byte struct.
+    # Stash the `.data` pointer value in a `c_uint64` holder and pass the
+    # holder's address to cudaLaunchKernel.
+    kernel_args = []
+    _baked_ptr_holders = []  # keep alive for the launch
+    for a in kernel.adj.args:
+        baked = baked_args[a.label]
+        if isinstance(baked, ctypes._SimpleCData):
+            continue
+        if isinstance(baked, array_t_type):
+            holder = ctypes.c_uint64(int(baked.data))
+            _baked_ptr_holders.append(holder)
+            kernel_args.append(ctypes.c_void_p(ctypes.addressof(holder)))
+        else:
+            kernel_args.append(ctypes.c_void_p(ctypes.addressof(baked)))
+    if kernel_args:
         kernel_params = (ctypes.c_void_p * len(kernel_args))(*kernel_args)
     else:
         kernel_params = None

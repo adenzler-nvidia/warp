@@ -142,20 +142,20 @@ class TestKernelSpecialize(unittest.TestCase):
         # Baked dim and scalar.
         self.assertIn(f"dim.size = {N}", source)
         self.assertIn("var_alpha = 2", source)
-        # Baked array-metadata writes in the kernel body (see
-        # `codegen_kernel` comment — they're NVRTC-alias-analysis
-        # load-bearing even though semantically dead).
-        self.assertIn(f".shape.dims[0] = {N}", source)
-        self.assertIn(".strides[0] = 4", source)
-        self.assertIn(".ndim = 1", source)
+        # Baked array ABI: kernel receives `T* __restrict__` directly,
+        # no `array_t<T>` struct on the stack, no metadata writes.
+        self.assertRegex(source, r"wp::float32\* __restrict__ var_y_data")
+        self.assertRegex(source, r"wp::float32\* __restrict__ var_x_data")
+        self.assertNotIn(f"var_y.shape.dims[0] = {N}", source)
+        self.assertNotIn(f"var_x.shape.dims[0] = {N}", source)
         # Scheme-B helpers: array accesses route through per-module baked
-        # helpers that take `.data` directly.  In the template form
-        # (Phase A), shape + stride are non-type template params, so the
-        # helper itself has no hash suffix — one template per (builtin,
-        # ndim) with many instantiations per module.
+        # helpers that take the raw pointer directly.  In the template
+        # form (Phase A), shape + stride are non-type template params,
+        # so the helper itself has no hash suffix — one template per
+        # (builtin, ndim) with many instantiations per module.
         self.assertIn("template<int S0, int St0, typename T>", source)
-        self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(")
-        self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(")
+        self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(var_x_data,")
+        self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(var_y_data,")
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""
