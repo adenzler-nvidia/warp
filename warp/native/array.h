@@ -128,8 +128,8 @@ constexpr uint16_t ARRAY_FLAG_RETAIN_GRAD = 1 << 0;
 struct shape_t {
     int dims[ARRAY_MAX_DIMS];
 
-    CUDA_CALLABLE inline shape_t()
-        : dims()
+    CUDA_CALLABLE constexpr shape_t(int d0 = 0, int d1 = 0, int d2 = 0, int d3 = 0)
+        : dims { d0, d1, d2, d3 }
     {
     }
 
@@ -146,7 +146,36 @@ struct shape_t {
     }
 };
 
+// Compile-time shape type used by the kernel-specialize codegen for the
+// `&arr.shape` read pattern on baked arrays.  Inherits from `shape_t` so
+// generic `shape_t`-taking builtins (`load`, `extract`, etc.) accept a
+// `baked_shape_t<...>*` via implicit upcast.  Declared as a plain local
+// (`wp::baked_shape_t<S0,...> __wp_baked_var_X_shape;`) so `&local` has
+// non-const `shape_t*` type matching the existing attr emit path; the
+// constexpr ctor still inits the dims array from the template args at
+// compile time, and NVRTC folds downstream reads to constants against
+// the known values.  When the static type is preserved to the use site,
+// the templated `extract` overload below short-circuits the generic
+// dims[K] read to a direct template-arg constant.
+template <int S0, int S1 = 0, int S2 = 0, int S3 = 0> struct baked_shape_t : shape_t {
+    CUDA_CALLABLE constexpr baked_shape_t()
+        : shape_t(S0, S1, S2, S3)
+    {
+    }
+};
+
 CUDA_CALLABLE inline int extract(const shape_t& s, int i) { return s.dims[i]; }
+
+// Templated extract for the compile-time baked shape.  If the code path
+// keeps the full `baked_shape_t<S0,...>&` type visible at the call site,
+// this overload fires and the ternary collapses to the matching template
+// arg at ptxas.  Upcasted paths (via shape_t&) go through the non-templated
+// version above and fold through the constexpr dims initialisation instead.
+template <int S0, int S1, int S2, int S3>
+CUDA_CALLABLE constexpr int extract(const baked_shape_t<S0, S1, S2, S3>& /*s*/, int i)
+{
+    return (i == 0) ? S0 : (i == 1) ? S1 : (i == 2) ? S2 : S3;
+}
 
 CUDA_CALLABLE inline void adj_extract(const shape_t& s, int i, const shape_t& adj_s, int adj_i, int adj_ret) { }
 

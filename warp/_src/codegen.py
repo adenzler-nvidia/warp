@@ -1665,8 +1665,8 @@ class Adjoint:
             if adj.builder is not None:
                 baked_args = adj.builder_options.get("baked_args")
                 if isinstance(baked_args, dict):
-                    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
                     import warp._src.types as _types  # noqa: PLC0415
+                    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
 
                     for param_name, arg_var in bound_args.items():
                         if not (isinstance(arg_var, Var) and arg_var.label in baked_args):
@@ -1772,31 +1772,30 @@ class Adjoint:
         # The helper delegates to the scalar primitive for atomics; for
         # address/array_store it does the pointer arithmetic directly.
         BAKED_BUILTINS = {
-            "address", "array_store",
-            "atomic_add", "atomic_sub", "atomic_min", "atomic_max",
-            "atomic_and", "atomic_or", "atomic_xor",
-            "atomic_cas", "atomic_exch",
+            "address",
+            "array_store",
+            "atomic_add",
+            "atomic_sub",
+            "atomic_min",
+            "atomic_max",
+            "atomic_and",
+            "atomic_or",
+            "atomic_xor",
+            "atomic_cas",
+            "atomic_exch",
         }
         baked_builtin_arr_idx = None  # index of the array arg in fwd_args to rewrite to `.data`
-        if (
-            func.is_builtin()
-            and adj.builder is not None
-            and func.key in BAKED_BUILTINS
-        ):
+        if func.is_builtin() and adj.builder is not None and func.key in BAKED_BUILTINS:
             baked_args_dict = adj.builder_options.get("baked_args") if adj.builder_options else None
             if isinstance(baked_args_dict, dict):
-                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
                 import warp._src.types as _types  # noqa: PLC0415
+                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
 
                 # The array arg is always the first positional — named "arr"
                 # in the registrations.  It's either `bound_args["arr"]` or
                 # the first bound arg.
                 arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
-                if (
-                    isinstance(arr_var, Var)
-                    and arr_var.label in baked_args_dict
-                    and _types.is_array(arr_var.type)
-                ):
+                if isinstance(arr_var, Var) and arr_var.label in baked_args_dict and _types.is_array(arr_var.type):
                     baked_arr = baked_args_dict[arr_var.label]
                     if isinstance(baked_arr, array_t_type):
                         elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
@@ -1813,7 +1812,10 @@ class Adjoint:
                             # body is reusable across Config instantiations.
                             config_label = arr_var.label if adj.is_user_function else None
                             helper_name = adj.builder.register_specialized_builtin(
-                                func.key, baked_arr, elem_ctype, value_ctype=value_ctype,
+                                func.key,
+                                baked_arr,
+                                elem_ctype,
+                                value_ctype=value_ctype,
                                 config_label=config_label,
                             )
                             func_name = helper_name
@@ -1843,8 +1845,8 @@ class Adjoint:
         ):
             baked_args = adj.builder_options.get("baked_args")
             if isinstance(baked_args, dict):
-                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
                 import warp._src.types as _types  # noqa: PLC0415
+                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
 
                 baked_params = {}
                 for param_name, arg_var in bound_args.items():
@@ -1887,15 +1889,11 @@ class Adjoint:
         # Mark the arg so `codegen_func_specialized` materializes the
         # struct at function entry.  Without this the struct name exists
         # in the body text but has no declaration, and NVRTC errors out.
-        if (
-            baked_builtin_arr_idx is None
-            and baked_call_info is None
-            and adj.builder_options
-        ):
+        if baked_builtin_arr_idx is None and baked_call_info is None and adj.builder_options:
             _baked_args_dict = adj.builder_options.get("baked_args")
             if isinstance(_baked_args_dict, dict):
-                from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
                 import warp._src.types as _types2  # noqa: PLC0415
+                from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
 
                 if not hasattr(adj, "_baked_arrays_used_by_value"):
                     adj._baked_arrays_used_by_value = set()
@@ -1969,16 +1967,16 @@ class Adjoint:
 
         elif not isinstance(return_type, Sequence) or len(return_type) == 1:
             # handle simple function (one output)
-            forward_call = f"var_{output} = {func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
+            forward_call = (
+                f"var_{output} = {func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
+            )
             replay_call = forward_call
             if func.custom_replay_func is not None:
                 replay_call = f"var_{output} = {func.namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
 
         else:
             # handle multiple value functions
-            forward_call = (
-                f"{func.namespace}{func_name}({_format_fwd_args(fwd_args + output, use_initializer_list)});"
-            )
+            forward_call = f"{func.namespace}{func_name}({_format_fwd_args(fwd_args + output, use_initializer_list)});"
             replay_call = forward_call
 
         if func.skip_replay:
@@ -2645,21 +2643,28 @@ class Adjoint:
             local_name = f"__wp_baked_var_{aggregate.label}_shape"
             adj._baked_shape_locals[aggregate.label] = local_name
             use_config = adj.is_user_function
-            decl_lines = [f"wp::shape_t {local_name};"]
-            for k in range(baked.ndim):
-                val = (
-                    f"Config::{aggregate.label}_shape_{k}"
-                    if use_config
-                    else str(int(baked.shape[k]))
-                )
-                decl_lines.append(f"{local_name}.dims[{k}] = {val};")
-            # Prepend in reverse so the final order matches `decl_lines`.
-            for line in reversed(decl_lines):
-                adj.blocks[0].body_forward.insert(0, adj.indentation + line)
+            # Emit a `wp::baked_shape_t<S0,...>` local, template args either
+            # literal ints (kernel body) or `Config::<label>_shape_K`
+            # (templated wp.func body).  The ctor is constexpr and inits
+            # `dims{S0, S1, S2, S3}` directly from the template args, so
+            # NVRTC folds downstream `extract(shape, i)` reads at compile
+            # time.  Declared without `static constexpr` because the
+            # existing `_spec_attribute_access` caller expects `shape_t*`
+            # (non-const) semantics — `baked_shape_t<...>*` implicitly
+            # upcasts.
+            template_args = [
+                f"Config::{aggregate.label}_shape_{k}" if use_config else str(int(baked.shape[k]))
+                for k in range(baked.ndim)
+            ]
+            decl = f"wp::baked_shape_t<{', '.join(template_args)}> {local_name};"
+            # Prepend at the outermost block so the local is visible from
+            # every nested scope that takes `&arr.shape`.
+            adj.blocks[0].body_forward.insert(0, adj.indentation + decl)
 
         # shape_t is the field type for array_t.shape in both warp arrays
         # and the baked-array proxy here; import from its canonical location.
         from warp._src.types import shape_t as _shape_t  # noqa: PLC0415
+
         attr_type = Reference(_shape_t)
         attr = adj.add_var(attr_type)
         adj.add_forward(f"{attr.emit()} = &{local_name};")

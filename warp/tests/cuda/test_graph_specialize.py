@@ -84,6 +84,13 @@ def scalar_through_func(a: wp.array(dtype=float), out: wp.array(dtype=float), s:
     out[i] = scale_func(a[i], s)
 
 
+@wp.kernel
+def reads_shape(a: wp.array(dtype=float), out: wp.array(dtype=int)):
+    tid = wp.tid()
+    if tid == 0:
+        out[0] = a.shape[0]
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -156,6 +163,34 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertIn("template<int S0, int St0, typename T>", source)
         self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(var_x_data,")
         self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(var_y_data,")
+
+    def test_codegen_baked_shape_local(self):
+        """Verify `.shape` access on a baked array emits a
+        `wp::baked_shape_t<N>` local whose dims are encoded as template
+        args, so NVRTC can fold downstream `extract`/dims reads to
+        compile-time constants.
+        """
+        N = 123
+        device = "cuda:0"
+        a = wp.zeros(N, dtype=float, device=device)
+        out = wp.zeros(1, dtype=int, device=device)
+
+        new_specs = _run_specialized(reads_shape, dim=N, inputs=[a, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path, f"Specialized .cu not found for {spec_name}")
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # New baked-shape pattern: template-arg-encoded local, no
+        # runtime dims[k] writes.
+        self.assertRegex(source, rf"wp::baked_shape_t<{N}> __wp_baked_var_a_shape;")
+        self.assertNotIn("__wp_baked_var_a_shape.dims[0] = ", source)
+
+        # End-to-end: the kernel reads back N correctly.
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), N)
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""
