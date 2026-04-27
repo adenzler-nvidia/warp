@@ -104,6 +104,14 @@ def where_on_array(maybe: wp.array(dtype=float), out: wp.array(dtype=float)):
     out[tid] = wp.where(maybe, 1.0, 2.0)
 
 
+@wp.kernel
+def nested_view(arr: wp.array3d(dtype=float), out: wp.array(dtype=float)):
+    tid = wp.tid()
+    row = arr[tid]
+    inner = row[0]
+    out[tid] = inner[0]
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -266,6 +274,43 @@ class TestKernelSpecialize(unittest.TestCase):
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(out.numpy(), np.ones(N, dtype=np.float32))
+
+    def test_codegen_nested_view_propagates_scheme_b(self):
+        """`arr[i][j][k]` on a baked 3D kernel arg goes through two
+        `wp::view(baked_array_t, int)` calls returning shape-shifted
+        baked_array_t sub-arrays, then a final element access.  Verify
+        the codegen tracks the sub-array shape/stride at each hop and
+        emits scheme-B (`wp_address_baked_1d<S, St>(sub.data, ...)`)
+        for the terminal access — i.e. static info flows end-to-end
+        across nested views, not just from the kernel arg.
+        """
+        N, M, K = 8, 4, 5
+        device = "cuda:0"
+        arr = wp.array(np.arange(N * M * K, dtype=np.float32).reshape(N, M, K), device=device)
+        out = wp.zeros(N, dtype=float, device=device)
+
+        new_specs = _run_specialized(nested_view, dim=N, inputs=[arr, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # Two int-indexed views chained off the kernel arg.
+        self.assertRegex(
+            source,
+            rf"wp::baked_array_t<wp::float32, 3, {N}, {M}, {K}, 0, \d+, \d+, \d+, 0> var_arr",
+        )
+        self.assertRegex(source, r"wp::view\(var_arr, var_\d+\);")
+        self.assertRegex(source, r"wp::view\(var_\d+, var_\d+\);")
+        # Terminal access on the (sub-array of sub-array) uses scheme-B
+        # with the innermost shape (K) and stride (sizeof(float)=4),
+        # routed through `.data` of the outer sub-array local.
+        self.assertRegex(source, rf"wp_address_baked_1d<{K}, 4>\(var_\d+\.data,")
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M * K)
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""

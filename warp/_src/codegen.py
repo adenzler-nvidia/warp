@@ -1188,6 +1188,16 @@ class Adjoint:
         # fresh build, leaving references to undeclared locals.
         adj._baked_shape_locals = {}
         adj._baked_arrays_used_by_value = set()
+        # `_baked_view_results` maps a Var label produced by an
+        # int-indexed `wp::view(arr, i, ...)` on a baked array (kernel
+        # arg or already-tracked sub-array) to an `array_t`-shaped
+        # sub-array value carrying the post-view shape / strides /
+        # ndim.  This propagates the static metadata one extra hop:
+        # later builtin calls (`address`, `array_store`, atomics) on
+        # the view result will see the sub-array's compile-time
+        # shape/stride and emit scheme-B helpers that bake those into
+        # template args, just like for direct kernel-arg access.
+        adj._baked_view_results = {}
 
         # holds current indent level
         adj.indentation = ""
@@ -1758,6 +1768,56 @@ class Adjoint:
         func_args = tuple(adj.register_var(x) for x in func_args)
         func_name = compute_type_str(func.native_func, template_args)
 
+        # If this call is a `wp::view(arr, i, ...)` on a baked source
+        # (kernel arg or already-tracked sub-array) with all-int
+        # indices, the result is itself a baked sub-array — its
+        # shape/strides/ndim are pure shifts of the source's
+        # compile-time values.  Track the result Var's label so the
+        # scheme-B path above fires on subsequent
+        # `address`/`array_store`/`atomic_*` calls applied to it.
+        if (
+            func.is_builtin()
+            and func.key == "view"
+            and adj.builder is not None
+            and adj.builder_options
+            and isinstance(output, Var)
+        ):
+            from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
+            from warp._src.types import is_array as _is_array  # noqa: PLC0415
+
+            _baked_args_dict = adj.builder_options.get("baked_args")
+            if isinstance(_baked_args_dict, dict):
+                _src_arr = bound_args.get("arr")
+                if _src_arr is None:
+                    _src_arr = next(iter(bound_args.values()), None)
+                _src_baked = None
+                if isinstance(_src_arr, Var) and _is_array(_src_arr.type):
+                    if _src_arr.label in _baked_args_dict:
+                        _cand = _baked_args_dict[_src_arr.label]
+                        if isinstance(_cand, _array_t_type):
+                            _src_baked = _cand
+                    if _src_baked is None:
+                        _cand = adj._baked_view_results.get(_src_arr.label)
+                        if isinstance(_cand, _array_t_type):
+                            _src_baked = _cand
+                if _src_baked is not None:
+                    _idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
+                    _consumed = len(_idx_keys)
+                    if 0 < _consumed < _src_baked.ndim:
+                        _src_shape = [int(_src_baked.shape[i]) for i in range(_src_baked.ndim)]
+                        _src_strides = [int(_src_baked.strides[i]) for i in range(_src_baked.ndim)]
+                        _new_ndim = _src_baked.ndim - _consumed
+                        _new_shape = _src_shape[_consumed:]
+                        _new_strides = _src_strides[_consumed:]
+                        _sub = _array_t_type(
+                            data=0,
+                            grad=0,
+                            ndim=_new_ndim,
+                            shape=tuple(_new_shape),
+                            strides=tuple(_new_strides),
+                        )
+                        adj._baked_view_results[output.label] = _sub
+
         # Scheme B: specialize selected array-access builtins when the array
         # arg is baked.  Emits a `static __device__ __forceinline__` helper
         # at module scope that takes the raw data pointer and embeds the
@@ -1785,6 +1845,13 @@ class Adjoint:
             "atomic_exch",
         }
         baked_builtin_arr_idx = None  # index of the array arg in fwd_args to rewrite to `.data`
+        # `baked_builtin_arr_is_subarray` tracks whether the array arg
+        # is a tracked view-result sub-array (stored as a baked_array_t
+        # local with `.data` member) rather than a kernel-arg baked
+        # array (raw `T*` parameter named `var_<label>_data`).  The
+        # call-site rewrite below uses this to choose between
+        # `var_<label>.data` and `var_<label>_data`.
+        baked_builtin_arr_is_subarray = False
         if func.is_builtin() and adj.builder is not None and func.key in BAKED_BUILTINS:
             baked_args_dict = adj.builder_options.get("baked_args") if adj.builder_options else None
             if isinstance(baked_args_dict, dict):
@@ -1795,38 +1862,60 @@ class Adjoint:
                 # in the registrations.  It's either `bound_args["arr"]` or
                 # the first bound arg.
                 arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
-                if isinstance(arr_var, Var) and arr_var.label in baked_args_dict and _types.is_array(arr_var.type):
-                    baked_arr = baked_args_dict[arr_var.label]
-                    if isinstance(baked_arr, array_t_type):
-                        elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
-                        # Count actual provided indices (non-None in bound_args)
-                        idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
-                        # Guard: ndim must match the number of index args we have.
-                        if baked_arr.ndim == len(idx_keys):
-                            value_ctype = None
-                            if func.key == "array_store" or func.key.startswith("atomic_"):
-                                # Value type is the array element's dtype.
-                                value_ctype = elem_ctype
-                            # Phase D: inside a templated wp.func body, template
-                            # args come from `Config::<label>_shape_k` so the
-                            # body is reusable across Config instantiations.
-                            config_label = arr_var.label if adj.is_user_function else None
-                            helper_name = adj.builder.register_specialized_builtin(
-                                func.key,
-                                baked_arr,
-                                elem_ctype,
-                                value_ctype=value_ctype,
-                                config_label=config_label,
-                            )
-                            func_name = helper_name
-                            # Find the position of the array arg in func_args
-                            # so we can rewrite it to `arr.data` at the call site.
-                            arr_pos = None
-                            for i, fa in enumerate(func_args):
-                                if isinstance(fa, Var) and fa.label == arr_var.label:
-                                    arr_pos = i
-                                    break
-                            baked_builtin_arr_idx = arr_pos
+                # Resolve the baked metadata for this arg.  Two sources:
+                # (1) kernel-arg baked array (`baked_args_dict`),
+                # (2) view-result sub-array (`adj._baked_view_results`,
+                #     populated below for prior `wp::view` calls on a
+                #     baked source).
+                baked_arr = None
+                arg_is_subarray = False
+                if isinstance(arr_var, Var) and _types.is_array(arr_var.type):
+                    if arr_var.label in baked_args_dict:
+                        candidate = baked_args_dict[arr_var.label]
+                        if isinstance(candidate, array_t_type):
+                            baked_arr = candidate
+                    if baked_arr is None:
+                        view_results = getattr(adj, "_baked_view_results", {})
+                        candidate = view_results.get(arr_var.label)
+                        if isinstance(candidate, array_t_type):
+                            baked_arr = candidate
+                            arg_is_subarray = True
+                if baked_arr is not None:
+                    elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
+                    # Count actual provided indices (non-None in bound_args)
+                    idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
+                    # Guard: ndim must match the number of index args we have.
+                    if baked_arr.ndim == len(idx_keys):
+                        value_ctype = None
+                        if func.key == "array_store" or func.key.startswith("atomic_"):
+                            # Value type is the array element's dtype.
+                            value_ctype = elem_ctype
+                        # Phase D: inside a templated wp.func body, template
+                        # args come from `Config::<label>_shape_k` so the
+                        # body is reusable across Config instantiations.
+                        # Sub-array shape/stride values aren't carried in
+                        # the per-Config traits struct — they were derived
+                        # at the view callsite from compile-time constants
+                        # — so always emit literals when the source is a
+                        # tracked view result.
+                        config_label = arr_var.label if adj.is_user_function and not arg_is_subarray else None
+                        helper_name = adj.builder.register_specialized_builtin(
+                            func.key,
+                            baked_arr,
+                            elem_ctype,
+                            value_ctype=value_ctype,
+                            config_label=config_label,
+                        )
+                        func_name = helper_name
+                        # Find the position of the array arg in func_args
+                        # so we can rewrite it to `arr.data` at the call site.
+                        arr_pos = None
+                        for i, fa in enumerate(func_args):
+                            if isinstance(fa, Var) and fa.label == arr_var.label:
+                                arr_pos = i
+                                break
+                        baked_builtin_arr_idx = arr_pos
+                        baked_builtin_arr_is_subarray = arg_is_subarray
 
         # Register a baked variant and rewrite the call name.
         # Baked param names were already propagated to baked_args above
@@ -1909,16 +1998,23 @@ class Adjoint:
         # callee reconstructs a const array_t with baked shape/stride/ndim).
         # Reverse and replay calls keep the unbaked ABI — they invoke the
         # generic adj_/replay_ symbols which aren't specialized.
-        def _baked_data_ref(arg_label):
+        def _baked_data_ref(arg_label, is_subarray=False):
             """C++ expression for a baked array's data pointer at a call site.
 
-            Both kernel and templated-wp.func bodies receive the baked
-            array's data pointer as a raw `T* __restrict__` parameter,
-            under different name conventions:
+            Three sources, three name conventions:
 
-              kernel body       -> var_<label>_data
-              templated wp.func -> _wp_baked_var_<label>_data
+              kernel arg, kernel body       -> var_<label>_data
+              kernel arg, templated wp.func -> _wp_baked_var_<label>_data
+              view-result sub-array         -> var_<label>.data
+
+            The view-result form references the `data` field of the
+            baked_array_t local emitted by the prior `wp::view` call —
+            the local is alive in scope, the field has the correct
+            (offset-adjusted) pointer, and the access is constexpr-
+            foldable to a register-resident value.
             """
+            if is_subarray:
+                return f"var_{arg_label}.data"
             if adj.is_user_function:
                 return f"_wp_baked_var_{arg_label}_data"
             return f"var_{arg_label}_data"
@@ -1929,7 +2025,7 @@ class Adjoint:
                 parts = []
                 for i, a in enumerate(args):
                     if i == baked_builtin_arr_idx:
-                        parts.append(_baked_data_ref(a.label))
+                        parts.append(_baked_data_ref(a.label, baked_builtin_arr_is_subarray))
                     else:
                         parts.extend(adj.format_args("var", [a]))
                 arg_str = ", ".join(parts)
