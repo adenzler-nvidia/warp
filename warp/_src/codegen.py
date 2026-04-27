@@ -2776,10 +2776,16 @@ class Adjoint:
         # and the baked-array proxy here; import from its canonical location.
         from warp._src.types import shape_t as _shape_t  # noqa: PLC0415
 
-        attr_type = Reference(_shape_t)
-        attr = adj.add_var(attr_type)
-        adj.add_forward(f"{attr.emit()} = &{local_name};")
-        return attr
+        # Return an unregistered Var that emits as the baked_shape_t
+        # local's name directly — no intermediate `wp::shape_t*`
+        # pointer, no `*var_X` dereference at the use site.  This
+        # preserves the local's static `wp::baked_shape_t<S0,...>` type
+        # at the `wp::extract(s, K)` call site, so the templated
+        # `extract(baked_shape_t<...>&, int)` overload fires (collapsing
+        # to the matching template arg constant) instead of the generic
+        # `extract(shape_t&, int)` which reads `s.dims[i]` and depends
+        # on NVRTC dataflow analysis to fold the constexpr-init values.
+        return Var(local_name, _shape_t, prefix=False)
 
     def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):

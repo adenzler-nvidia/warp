@@ -323,6 +323,18 @@ template <typename T> struct array_t {
 // view path.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 struct baked_array_t : array_t<T> {
+    // Static accessors exposing the template args as constexpr
+    // values so generic templated consumers (e.g. `tile_global_t`,
+    // `is_baked_array_t` traits) can route shape / stride reads
+    // through compile-time constants without an SFINAE/specialisation
+    // dance.  Reads of `Src::baked_strides[i]` with a constexpr `i`
+    // (after WP_PRAGMA_UNROLL) collapse to immediates at ptxas, so
+    // tile_global_t::index() no longer depends on NVRTC dataflow
+    // analysis to fold the inherited `data.strides[i]` field reads.
+    static constexpr int baked_ndim = Ndim;
+    static constexpr int baked_shape[ARRAY_MAX_DIMS] = { S0, S1, S2, S3 };
+    static constexpr int baked_strides[ARRAY_MAX_DIMS] = { St0, St1, St2, St3 };
+
     // Default ctor: leaves inherited array_t<T> default-initialized
     // (data=nullptr, fields zero).  Used when codegen declares a
     // view-result local as `baked_array_t<...> var_X;` and assigns
@@ -354,6 +366,32 @@ struct baked_array_t : array_t<T> {
         this->flags = 0;
     }
 };
+
+
+// Compile-time stride / shape lookup for a `baked_array_t<...>`.  The
+// ternary chain returns one of the template-arg values selected by a
+// runtime `i`; when called from inside a `WP_PRAGMA_UNROLL`'d loop the
+// `i` becomes a literal at each unrolled iteration and the ternary
+// collapses to the matching constant — no memory load, no dataflow-
+// analysis dependency.  Used by `tile_global_t::index` to drive its
+// offset math from the source's static template args when Src is
+// baked.  The generic `array_t<T>&` fallback below is selected when
+// the source isn't baked.
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline int tile_strides_at(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&, int i)
+{
+    return (i == 0) ? St0 : (i == 1) ? St1 : (i == 2) ? St2 : St3;
+}
+
+template <typename T> CUDA_CALLABLE inline int tile_strides_at(const array_t<T>& src, int i) { return src.strides[i]; }
+
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+CUDA_CALLABLE inline int tile_shape_at(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&, int i)
+{
+    return (i == 0) ? S0 : (i == 1) ? S1 : (i == 2) ? S2 : S3;
+}
+
+template <typename T> CUDA_CALLABLE inline int tile_shape_at(const array_t<T>& src, int i) { return src.shape[i]; }
 
 
 // Required when compiling adjoints.

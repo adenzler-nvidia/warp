@@ -689,7 +689,14 @@ struct tile_global_t {
         for (int i = 0; i < Shape::N; ++i) {
             // global = offset + coord
             int c = offset[i] + coord[i];
-            index += data.strides[i] * c;
+            // `tile_strides_at(data, i)` dispatches per source type:
+            // for `Src = baked_array_t<...>` the ternary collapses to
+            // a template-arg constant after WP_PRAGMA_UNROLL substitutes
+            // a literal `i`; for `Src = array_t<T>` it reads the
+            // runtime field (NVRTC fold via constexpr-init still
+            // applies for spec kernels, this path is unchanged for
+            // non-baked sources).
+            index += tile_strides_at(data, i) * c;
         }
 
         return index / sizeof(T);
@@ -707,10 +714,10 @@ struct tile_global_t {
                 int c = offset[i] + coord[i];
 
                 // handle out of bounds case
-                if (c >= data.shape[i])
+                if (c >= tile_shape_at(data, i))
                     return false;
                 else
-                    index += data.strides[i] * c;
+                    index += tile_strides_at(data, i) * c;
             }
 
             // array strides are in bytes so we convert to elements
