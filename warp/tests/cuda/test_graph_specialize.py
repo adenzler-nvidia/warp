@@ -208,7 +208,8 @@ class TestKernelSpecialize(unittest.TestCase):
     def test_codegen_baked_array_for_view(self):
         """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.
         Verify the emit uses `wp::baked_array_t<...>` with template-
-        encoded shape/strides/ndim, and that the result is correct.
+        encoded shape/strides/ndim, the int-indexed view fires (no
+        slice_t wrapping), and the result is correct.
         """
         N = 32
         M = 4
@@ -231,7 +232,12 @@ class TestKernelSpecialize(unittest.TestCase):
             rf"wp::baked_array_t<wp::float32, 2, {N}, {M}, 0, 0, \d+, \d+, 0, 0>",
         )
         self.assertNotIn(f"var_arr.shape.dims[0] = {N};", source)
-        self.assertIn("wp::view(var_arr,", source)
+        # Codegen passes the bare int index through to view (rather than
+        # wrapping in slice_t(i, i, 0)), which dispatches to the templated
+        # baked_array_t int overload that returns a baked_array_t with
+        # shifted template args.
+        self.assertRegex(source, r"wp::view\(var_arr, var_\d+\);")
+        self.assertNotIn("wp::slice_t(var_", source)
 
         # End-to-end correctness.
         wp.synchronize_device(device)

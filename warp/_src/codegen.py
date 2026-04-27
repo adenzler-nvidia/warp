@@ -3401,19 +3401,27 @@ class Adjoint:
 
             else:
                 if warp._src.types.matches_array_class(target_type, warp._src.types.array):
-                    # In order to reduce the number of overloads needed in the C
-                    # implementation to support combinations of int/slice indices,
-                    # we convert all integer indices into slices, and set their
-                    # step to 0 if they are representing an integer index.
-                    new_indices = []
-                    for idx in indices:
-                        if not warp._src.types.is_slice(strip_reference(idx.type)):
-                            new_idx = adj.add_builtin_call("slice", (idx, idx, 0))
-                            new_indices.append(new_idx)
-                        else:
-                            new_indices.append(idx)
-
-                    indices = new_indices
+                    # If at least one index is a real slice, convert any
+                    # bare ints in the index list to step-0 slices so the
+                    # variadic `view(array_t<T>&, Slices...)` overload
+                    # accepts the mixed call uniformly.  When every index
+                    # is an int, leave them alone so the int-arity view
+                    # overloads (`view(arr, int)` / `view(arr, int, int)`
+                    # / `view(arr, int, int, int)`) fire instead — those
+                    # have a baked_array_t form that returns
+                    # `baked_array_t<...>` with shifted template args,
+                    # keeping the static shape/stride info flowing
+                    # without materialising an `array_t<T>`.
+                    has_slice = any(warp._src.types.is_slice(strip_reference(idx.type)) for idx in indices)
+                    if has_slice:
+                        new_indices = []
+                        for idx in indices:
+                            if not warp._src.types.is_slice(strip_reference(idx.type)):
+                                new_idx = adj.add_builtin_call("slice", (idx, idx, 0))
+                                new_indices.append(new_idx)
+                            else:
+                                new_indices.append(idx)
+                        indices = new_indices
 
                 # handles array views (fewer indices than dimensions)
                 out = adj.add_builtin_call("view", [target, *indices])
