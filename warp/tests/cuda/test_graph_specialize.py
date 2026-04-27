@@ -112,6 +112,14 @@ def nested_view(arr: wp.array3d(dtype=float), out: wp.array(dtype=float)):
     out[tid] = inner[0]
 
 
+@wp.kernel
+def view_then_shape(arr: wp.array2d(dtype=float), out: wp.array(dtype=int)):
+    tid = wp.tid()
+    if tid == 0:
+        slice = arr[0]
+        out[0] = slice.shape[0]
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -311,6 +319,37 @@ class TestKernelSpecialize(unittest.TestCase):
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M * K)
+
+    def test_codegen_view_result_shape_baked(self):
+        """`slice = arr[i]; slice.shape[0]` on a baked source emits a
+        `wp::baked_shape_t<...>` local for the sub-array, matching the
+        kernel-arg `.shape` path.  Without this, the `.shape[K]` read
+        would fall through to the inherited `shape_t.dims[K]` field of
+        the baked_array_t local — values are constexpr-init by the
+        ctor and NVRTC folds, but that's a fold, not a template-arg
+        encoding.  Hooking it gives type-level static info for view-
+        result `.shape` accesses too.
+        """
+        N = 8
+        M = 5
+        device = "cuda:0"
+        arr = wp.zeros((N, M), dtype=float, device=device)
+        out = wp.zeros(1, dtype=int, device=device)
+
+        new_specs = _run_specialized(view_then_shape, dim=N, inputs=[arr, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # The sub-array gets a baked_shape_t local with the post-view
+        # shape (here: 1D shape of M after viewing the 0th row).
+        self.assertRegex(source, rf"wp::baked_shape_t<{M}> __wp_baked_var_\d+_shape;")
+
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), M)
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""

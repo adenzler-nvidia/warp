@@ -2707,7 +2707,13 @@ class Adjoint:
         # ABI is `T* __restrict__`, so `&arr.shape` has nothing to
         # reference and we must synthesise one.  For kernel bodies the
         # shape values are literal ints; for templated wp.funcs they
-        # come from `Config::<label>_shape_K`.
+        # come from `Config::<label>_shape_K`.  Also fires for view-result
+        # sub-arrays tracked in `_baked_view_results` — those have a
+        # local baked_array_t struct whose `.shape` IS readable through
+        # inheritance, but routing through the same baked_shape_t local
+        # mechanism keeps the type-level view consistent (template-arg
+        # encoded shape) instead of relying on NVRTC to fold the
+        # inherited shape_t.dims[K] reads.
         if not isinstance(aggregate, Var):
             return None
         if not adj.builder_options:
@@ -2715,9 +2721,22 @@ class Adjoint:
         baked_args = adj.builder_options.get("baked_args")
         if not isinstance(baked_args, dict):
             return None
+
+        # Resolve baked metadata: kernel-arg first, then view-result
+        # sub-array.  `is_subarray` distinguishes the two so we know
+        # whether to use Config:: template params (kernel arg in
+        # templated wp.func) or pure literal ints (sub-array, always
+        # has constant shape from compile-time index shifts).
         baked = baked_args.get(aggregate.label)
+        is_subarray = False
         if not isinstance(baked, array_t_type):
-            return None
+            view_results = getattr(adj, "_baked_view_results", {})
+            cand = view_results.get(aggregate.label)
+            if isinstance(cand, array_t_type):
+                baked = cand
+                is_subarray = True
+            else:
+                return None
 
         if attr_name != "shape":
             # `.strides`, `.ndim`, `.data`, `.grad` don't hit this path in
@@ -2738,16 +2757,12 @@ class Adjoint:
         if local_name is None:
             local_name = f"__wp_baked_var_{aggregate.label}_shape"
             adj._baked_shape_locals[aggregate.label] = local_name
-            use_config = adj.is_user_function
-            # Emit a `wp::baked_shape_t<S0,...>` local, template args either
-            # literal ints (kernel body) or `Config::<label>_shape_K`
-            # (templated wp.func body).  The ctor is constexpr and inits
-            # `dims{S0, S1, S2, S3}` directly from the template args, so
-            # NVRTC folds downstream `extract(shape, i)` reads at compile
-            # time.  Declared without `static constexpr` because the
-            # existing `_spec_attribute_access` caller expects `shape_t*`
-            # (non-const) semantics — `baked_shape_t<...>*` implicitly
-            # upcasts.
+            # Use Config:: template params only for kernel-arg baked
+            # arrays inside a templated wp.func body.  Sub-arrays from
+            # view results aren't carried in the per-Config traits
+            # struct (they're derived inside the body from compile-time
+            # shifts), so always emit literal ints for them.
+            use_config = adj.is_user_function and not is_subarray
             template_args = [
                 f"Config::{aggregate.label}_shape_{k}" if use_config else str(int(baked.shape[k]))
                 for k in range(baked.ndim)
