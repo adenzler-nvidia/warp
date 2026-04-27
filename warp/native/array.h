@@ -323,6 +323,16 @@ template <typename T> struct array_t {
 // view path.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 struct baked_array_t : array_t<T> {
+    // Default ctor: leaves inherited array_t<T> default-initialized
+    // (data=nullptr, fields zero).  Used when codegen declares a
+    // view-result local as `baked_array_t<...> var_X;` and assigns
+    // the return value of `wp::view(...)` later — the write-once
+    // assignment overwrites all fields, NVRTC eliminates the dead
+    // zero-init writes.  Lets the local carry its static type
+    // through downstream consumers (tile_load, etc.) instead of
+    // being slice-assigned to a plain `array_t<T>`.
+    CUDA_CALLABLE baked_array_t() = default;
+
     // Single-arg ctor: take the runtime data pointer; populate the
     // inherited array_t<T> fields from the compile-time template args.
     // The writes are constexpr-known values, so NVRTC folds them

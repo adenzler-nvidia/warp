@@ -5070,13 +5070,38 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
 
+    # View-result baked sub-arrays declared as `wp::baked_array_t<...>`
+    # carry their static shape/stride template args through the kernel
+    # body — without this, the assignment from `wp::view(baked, ...)`
+    # would slice the templated return type to plain `array_t<T>` and
+    # downstream consumers (`wp::tile_load`, `wp::tile_store`, ...)
+    # would only see the inherited fields (read OK via NVRTC fold of
+    # the constexpr-init values, but no longer type-encoded).  Looked
+    # up from `adj._baked_view_results`, which `add_call` populates
+    # when a view fires on a baked source.
+    view_baked = getattr(adj, "_baked_view_results", {})
+
+    def _baked_view_ctype(var):
+        sub = view_baked.get(var.label)
+        if sub is None:
+            return None
+        if not is_array(strip_reference(var.type)):
+            return None
+        ndim = int(sub.ndim)
+        elem = Var.type_to_ctype(strip_reference(var.type).dtype)
+        shape = [str(int(sub.shape[i])) if i < ndim else "0" for i in range(4)]
+        strides = [str(int(sub.strides[i])) if i < ndim else "0" for i in range(4)]
+        return f"wp::baked_array_t<{elem}, {ndim}, {', '.join(shape)}, {', '.join(strides)}>"
+
     for var in adj.variables:
         if is_tile(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
         elif is_tile_stack(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
         elif var.constant is None:
-            lines += [f"{var.ctype()} {var.emit()};\n"]
+            override = _baked_view_ctype(var) if view_baked else None
+            ctype = override if override is not None else var.ctype()
+            lines += [f"{ctype} {var.emit()};\n"]
         else:
             lines += [f"const {var.ctype()} {var.emit()} = {constant_str(var.constant)};\n"]
 
