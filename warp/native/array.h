@@ -1439,6 +1439,22 @@ template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
     *address = value;
 }
 
+// Specific overload for storing a baked_array_t value into an
+// `array_t<T>*` slot (e.g. `geom1.vert = mesh_vert` where the
+// struct field is `array_t<vec3>` and the kernel arg `mesh_vert` is
+// declared as `baked_array_t<vec3, ...>` after Phase J).  Without
+// this, `wp::store(T*, T)` fails template deduction because the two
+// args' Ts (`array_t<vec3>` vs `baked_array_t<vec3, ...>`) don't
+// match — the implicit-conversion path can't be used during
+// deduction.  The slicing assignment to the base subobject is what
+// the array_t<T> case did before Phase J.
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+inline CUDA_CALLABLE void
+store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& value)
+{
+    *address = value;
+}
+
 template <typename T> inline CUDA_CALLABLE T load(T* address)
 {
     T value = *address;

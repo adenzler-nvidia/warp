@@ -2293,7 +2293,7 @@ class Adjoint:
     # define an if statement
     def begin_if(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if ({cond.emit()}) {{")
+        adj.add_forward(f"if ({adj._spec_cond_emit(cond)}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2307,7 +2307,7 @@ class Adjoint:
 
     def begin_else(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if (!{cond.emit()}) {{")
+        adj.add_forward(f"if (!{adj._spec_cond_emit(cond)}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2398,7 +2398,7 @@ class Adjoint:
         c = adj.eval(cond)
         c = adj.load(c)
 
-        cond_block.body_forward.append(f"if (({c.emit()}) == false) goto end_{cond_block.label};")
+        cond_block.body_forward.append(f"if (({adj._spec_cond_emit(c)}) == false) goto end_{cond_block.label};")
 
         # being block around loop
         adj.begin_block()
@@ -2584,10 +2584,14 @@ class Adjoint:
 
         # Short-circuit evaluation: only evaluate subsequent operands
         # if the result so far permits it (true for 'and', false for 'or').
+        # Each operand contributes through `_spec_cond_emit` so a baked-
+        # array operand becomes `var_X_data` (raw pointer truthiness)
+        # instead of `var_X` (which doesn't exist under the T*-ABI for
+        # kernel-arg arrays).
         output = adj.add_var(builtins.bool)
         first = adj.eval(node.values[0])
         first = adj.load(first)
-        adj.add_forward(f"{output.emit()} = {first.emit()};")
+        adj.add_forward(f"{output.emit()} = {adj._spec_cond_emit(first)};")
 
         for expr in node.values[1:]:
             # Guard: only evaluate next operand if short-circuit condition holds
@@ -2602,7 +2606,7 @@ class Adjoint:
             val = adj.eval(expr)
             val = adj.load(val)
             op_str = "&&" if is_and else "||"
-            adj.add_forward(f"{output.emit()} = {output.emit()} {op_str} {val.emit()};")
+            adj.add_forward(f"{output.emit()} = {output.emit()} {op_str} {adj._spec_cond_emit(val)};")
 
             adj.dedent()
             adj.add_forward("}")
@@ -2682,6 +2686,40 @@ class Adjoint:
         # checks that the argument type is a value type (i.e, not an array)
         # possibly holding differentiable values (for which gradients must be accumulated)
         return type_scalar_type(var_type) in float_types or isinstance(var_type, Struct)
+
+    def _spec_cond_emit(adj, cond_var):
+        """Return the C++ expression for a boolean-context condition.
+
+        For baked-array args under the T*-ABI, rewrite `if (var_X)`
+        (which would require the full array_t struct to compile) to
+        `if (var_X_data)` — a raw pointer-truthiness check on the
+        array's data pointer kernel param.  Without this rewrite, the
+        spec compile fails with "identifier var_X is undefined" for
+        every kernel that uses Python `if arr:` on a baked array
+        (mjwarp's `verify_narrow_phase_buffers`, newton's
+        `narrow_phase_primitive_kernel`, etc.) and the silent-fallback
+        path runs the unspec'd version instead.
+
+        For non-baked-array conditions, fall through to the usual
+        `cond.emit()`.  Inside templated wp.func bodies the array's
+        raw data pointer is `_wp_baked_var_<label>_data` (Phase D
+        param naming); inside kernel bodies it's `var_<label>_data`.
+        """
+        if not isinstance(cond_var, Var):
+            return cond_var.emit()
+        if not adj.builder_options:
+            return cond_var.emit()
+        baked_args = adj.builder_options.get("baked_args")
+        if not isinstance(baked_args, dict):
+            return cond_var.emit()
+        from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
+
+        baked = baked_args.get(cond_var.label)
+        if isinstance(baked, _array_t_type):
+            if adj.is_user_function:
+                return f"_wp_baked_var_{cond_var.label}_data"
+            return f"var_{cond_var.label}_data"
+        return cond_var.emit()
 
     def _spec_attribute_access(adj, aggregate, attr_name):
         """Return a Var representing `aggregate.<attr_name>` when the
