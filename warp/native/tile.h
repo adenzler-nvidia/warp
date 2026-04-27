@@ -653,17 +653,28 @@ template <typename Shape> struct tile_coord_iter_t {
 // Aligned: when true, the caller guarantees: (1) base address at tile offset is 16-byte aligned,
 //   (2) array is contiguous (dense row-major strides), (3) outer-dimension strides are multiples of
 //   16 bytes, and (4) tile fits entirely within array bounds. Skips runtime checks in tile_can_vectorize().
-template <typename T, typename Shape_, bool BoundsCheck = true, bool Aligned = false> struct tile_global_t {
+// Source-array type defaults to `array_t<T>` so existing instantiations
+// (`tile_global_t<T, Shape, BoundsCheck, Aligned>`) continue to work.
+// When a baked source is passed in (e.g. a `baked_array_t<...>` view-
+// result local), the corresponding `tile_load` overload below picks
+// `Src = baked_array_t<...>` so the static shape/stride template args
+// flow into `tile_global_t::data` rather than being slice-copied to a
+// plain `array_t<T>`.  Subsequent reads (`data.shape[i]`,
+// `data.strides[i]`) go through the inherited fields which are
+// constexpr-initialised, so NVRTC folds them to immediates either way
+// — but the C++ type signature remains template-encoded end-to-end.
+template <typename T, typename Shape_, bool BoundsCheck = true, bool Aligned = false, typename Src = array_t<T>>
+struct tile_global_t {
     using Type = T;
     using Shape = Shape_;
     using Coord = tile_coord_t<Shape::N>;
     static constexpr bool bounds_check = BoundsCheck;
     static constexpr bool is_aligned = Aligned;
 
-    array_t<T> data;
+    Src data;
     Coord offset;
 
-    tile_global_t(array_t<T>& a, const Coord& c)
+    tile_global_t(Src& a, const Coord& c)
         : data(a)
         , offset(c)
     {
@@ -851,8 +862,8 @@ template <typename T, typename L> struct tile_register_t {
         *this = t.copy_to_register();
     }
 
-    template <bool BoundsCheck, bool Aligned>
-    inline CUDA_CALLABLE auto& operator=(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned>& t)
+    template <bool BoundsCheck, bool Aligned, typename Src>
+    inline CUDA_CALLABLE auto& operator=(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned, Src>& t)
     {
         copy_from_global(t);
         return *this;
@@ -965,7 +976,9 @@ template <typename T, typename L> struct tile_register_t {
             data[i] += tile.data[i];
     }
 
-    inline CUDA_CALLABLE void grad_add(const tile_global_t<T, typename Layout::Shape>& global)
+    template <bool BoundsCheck = true, bool Aligned = false, typename Src = array_t<T>>
+    inline CUDA_CALLABLE void
+    grad_add(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned, Src>& global)
     {
         apply([&](int reg, auto c) { data[reg] += global.load_grad(c); });
     }
@@ -1417,10 +1430,10 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
 
     // assign from a global tile (load)
 
-    template <bool BoundsCheck, bool Aligned>
-    inline CUDA_CALLABLE auto& operator=(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned>& t)
+    template <bool BoundsCheck, bool Aligned, typename Src>
+    inline CUDA_CALLABLE auto& operator=(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned, Src>& t)
     {
-        copy_from_global<tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned>>(t);
+        copy_from_global<tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned, Src>>(t);
         return *this;
     }
 
@@ -1634,7 +1647,9 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
     }
 
     // accumulate gradient onto this tile from a global array
-    inline CUDA_CALLABLE void grad_add(const tile_global_t<T, typename Layout::Shape>& global)
+    template <bool BoundsCheck = true, bool Aligned = false, typename Src = array_t<T>>
+    inline CUDA_CALLABLE void
+    grad_add(const tile_global_t<T, typename Layout::Shape, BoundsCheck, Aligned, Src>& global)
     {
         WP_PRAGMA_UNROLL
         for (int i = WP_TILE_THREAD_IDX; i < Layout::Size; i += WP_TILE_BLOCK_DIM) {
@@ -2612,6 +2627,32 @@ inline CUDA_CALLABLE auto tile_load(array_t<T>& src, Offset... offset)
     return tile_global_t<T, tile_shape_t<Shape...>, BoundsCheck, Aligned>(src, tile_coord(offset...));
 }
 
+// `tile_load` overload for the kernel-specialize codegen's baked_array_t
+// view-result locals.  Constructs a `tile_global_t` whose `Src` template
+// arg is the baked subtype, so the static shape/strides flow into the
+// global accessor's data field via its inherited (constexpr-init)
+// fields rather than being slice-copied to a plain `array_t<T>`.
+template <
+    typename T,
+    bool BoundsCheck,
+    bool Aligned,
+    unsigned... Shape,
+    int Ndim,
+    int S0,
+    int S1,
+    int S2,
+    int S3,
+    int St0,
+    int St1,
+    int St2,
+    int St3,
+    typename... Offset>
+inline CUDA_CALLABLE auto tile_load(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, Offset... offset)
+{
+    using Src = baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>;
+    return tile_global_t<T, tile_shape_t<Shape...>, BoundsCheck, Aligned, Src>(src, tile_coord(offset...));
+}
+
 // used for indexed loads and stores
 template <typename T, typename IndicesTile, typename Coord>
 inline CUDA_CALLABLE bool
@@ -2687,6 +2728,95 @@ inline CUDA_CALLABLE void tile_store(array_t<T>& dest, int x, int y, int z, int 
 {
     src.copy_to_global(
         tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, Aligned>(dest, tile_coord(x, y, z, w))
+    );
+}
+
+// `tile_store` overloads for baked_array_t — symmetric to the
+// `tile_load` baked overload above.  Construct a `tile_global_t` whose
+// `Src` is the baked subtype so the static shape/strides flow through.
+template <
+    typename T,
+    bool BoundsCheck,
+    bool Aligned,
+    typename Tile,
+    int Ndim,
+    int S0,
+    int S1,
+    int S2,
+    int S3,
+    int St0,
+    int St1,
+    int St2,
+    int St3>
+inline CUDA_CALLABLE void tile_store(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& dest, int x, Tile& src)
+{
+    using Src = baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>;
+    src.copy_to_global(tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, Aligned, Src>(dest, tile_coord(x)));
+}
+template <
+    typename T,
+    bool BoundsCheck,
+    bool Aligned,
+    typename Tile,
+    int Ndim,
+    int S0,
+    int S1,
+    int S2,
+    int S3,
+    int St0,
+    int St1,
+    int St2,
+    int St3>
+inline CUDA_CALLABLE void
+tile_store(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& dest, int x, int y, Tile& src)
+{
+    using Src = baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>;
+    src.copy_to_global(
+        tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, Aligned, Src>(dest, tile_coord(x, y))
+    );
+}
+template <
+    typename T,
+    bool BoundsCheck,
+    bool Aligned,
+    typename Tile,
+    int Ndim,
+    int S0,
+    int S1,
+    int S2,
+    int S3,
+    int St0,
+    int St1,
+    int St2,
+    int St3>
+inline CUDA_CALLABLE void
+tile_store(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& dest, int x, int y, int z, Tile& src)
+{
+    using Src = baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>;
+    src.copy_to_global(
+        tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, Aligned, Src>(dest, tile_coord(x, y, z))
+    );
+}
+template <
+    typename T,
+    bool BoundsCheck,
+    bool Aligned,
+    typename Tile,
+    int Ndim,
+    int S0,
+    int S1,
+    int S2,
+    int S3,
+    int St0,
+    int St1,
+    int St2,
+    int St3>
+inline CUDA_CALLABLE void
+tile_store(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& dest, int x, int y, int z, int w, Tile& src)
+{
+    using Src = baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>;
+    src.copy_to_global(
+        tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, Aligned, Src>(dest, tile_coord(x, y, z, w))
     );
 }
 
