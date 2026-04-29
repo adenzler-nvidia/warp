@@ -729,12 +729,17 @@ class Var:
         # and `codegen_func_specialized` for the materialization fallback.
         # The two `_baked_*` context flags determine which of the three
         # data-pointer naming conventions `baked_data_name()` emits.
-        # `_baked_shape_local_name` memoizes the synthesized shape_t local
-        # name used by `emit_for_attribute('shape', ...)`.
+        # `_baked_shape_of` points back to the array Var when this Var is
+        # a marker for `arr.shape` (returned by `emit_for_attribute`); the
+        # subscript site reads through to the array's `baked_value` to
+        # constant-propagate `arr.shape[K]` into a literal at codegen time
+        # (or to emit `Config::<label>_shape_K` inside templated wp.funcs).
+        # `_baked_shape_local_name` memoizes a runtime-K materialization.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_is_view_result: builtins.bool = False
         self._baked_in_templated_func: builtins.bool = False
+        self._baked_shape_of: "Var | None" = None
         self._baked_shape_local_name: str | None = None
 
     def emit_for_truthiness(self) -> str:
@@ -774,37 +779,61 @@ class Var:
         otherwise (caller falls through to the generic struct-field
         path).
 
-        Currently only ``.shape`` is recognized — synthesizes a
-        ``wp::baked_shape_t<S0,...>`` local at the outermost block,
-        memoized via ``self._baked_shape_local_name`` so repeated
-        accesses share one declaration.  Template args use
-        ``Config::<label>_shape_K`` for kernel-arg arrays inside a
-        templated wp.func body, and pure literal ints in every other
-        context (kernel bodies, view-result subarrays whose shape was
-        derived at compile time from index shifts).
+        Currently only ``.shape`` is recognized.  Returns a *marker*
+        Var with ``_baked_shape_of`` pointing back to ``self`` —
+        subsequent ``arr.shape[K]`` lowering in ``emit_indexing``
+        recognises the marker and:
+
+          - For literal ``K`` in a kernel body or view-result subarray:
+            substitutes ``arr.baked_value.shape[K]`` as a Python
+            constant Var, which flows through Warp's loop unroller and
+            NVRTC's basic constant propagation reliably.
+
+          - For literal ``K`` inside a templated wp.func body: emits
+            ``const wp::int32 var_X = Config::<label>_shape_K;`` so
+            the body remains shared across Config instantiations.
+
+          - For runtime ``K`` (rare): lazily materialises a
+            ``wp::shape_t`` local with literal/Config-init writes via
+            ``materialize_baked_shape_local`` and dispatches to the
+            generic ``extract(shape_t&, int)`` builtin.
         """
         if not isinstance(self.baked_value, array_t) or attr != "shape":
             return None
+        marker = Var("", shape_t, prefix=False)
+        marker._baked_shape_of = self
+        return marker
 
+    def materialize_baked_shape_local(self, adj: "Adjoint") -> str:
+        """Declare a ``wp::shape_t`` local at the outermost block,
+        populated from this baked-array Var's metadata, and return its
+        identifier.  Memoised on ``_baked_shape_local_name`` so
+        repeated runtime-K subscripts share one declaration.
+
+        The dims values are Python literals in kernel bodies (and
+        view-result subarrays whose shape was derived from compile-time
+        index shifts) and ``Config::<label>_shape_K`` in templated
+        wp.func bodies.  Either form gives NVRTC a const-init shape_t
+        that the generic ``extract(shape_t&, int)`` builtin can read
+        from per-instantiation.
+        """
+        assert isinstance(self.baked_value, array_t)
         if self._baked_shape_local_name is None:
-            self._baked_shape_local_name = f"__wp_baked_var_{self.label}_shape"
-            # Use ``Config::`` template params only for kernel-arg baked
-            # arrays inside a templated wp.func body — the values come
-            # through the per-Config traits struct.  Sub-arrays from
-            # view results aren't carried in the per-Config struct
-            # (their shape is derived at the call site from compile-
-            # time shifts), so always emit literal ints for them.
+            local = f"__wp_baked_var_{self.label}_shape"
+            self._baked_shape_local_name = local
             use_config = adj.is_user_function and not self._baked_is_view_result
-            template_args = [
-                f"Config::{self.label}_shape_{k}" if use_config else str(int(self.baked_value.shape[k]))
-                for k in range(self.baked_value.ndim)
-            ]
-            decl = f"wp::baked_shape_t<{', '.join(template_args)}> {self._baked_shape_local_name};"
+            lines = [f"wp::shape_t {local};"]
+            for k in range(int(self.baked_value.ndim)):
+                rhs = f"Config::{self.label}_shape_{k}" if use_config else str(int(self.baked_value.shape[k]))
+                lines.append(f"{local}.dims[{k}] = {rhs};")
+            ndim_rhs = f"Config::{self.label}_ndim" if use_config else str(int(self.baked_value.ndim))
+            lines.append(f"{local}.ndim = {ndim_rhs};")
             # Prepend at the outermost block so the local is visible
-            # from every nested scope that takes ``&arr.shape``.
-            adj.blocks[0].body_forward.insert(0, adj.indentation + decl)
-
-        return Var(self._baked_shape_local_name, shape_t, prefix=False)
+            # from every nested scope.  Insert in reverse so the lines
+            # land in declaration order.
+            for line in reversed(lines):
+                adj.blocks[0].body_forward.insert(0, adj.indentation + line)
+        return self._baked_shape_local_name
 
     def __str__(self):
         return self.label
@@ -2677,6 +2706,53 @@ class Adjoint:
         # possibly holding differentiable values (for which gradients must be accumulated)
         return type_scalar_type(var_type) in float_types or isinstance(var_type, Struct)
 
+    def _emit_baked_shape_subscript(adj, arr_var, idx_var):
+        """Lower ``arr.shape[K]`` on a baked array.
+
+        Three cases:
+
+          1. ``K`` is a Python literal **and** we're in a kernel body
+             or view-result subarray (the literal value is the actual
+             value): return ``Var(int32, constant=literal)`` so Warp's
+             constant Var emission produces ``const wp::int32 var_X = 17;``.
+             The constant is also visible to Warp's loop unroller, so
+             ``for k in range(arr.shape[0]):`` unrolls at the Python
+             level.
+
+          2. ``K`` is a Python literal **and** we're inside a templated
+             wp.func body (the body is shared across Config
+             instantiations): emit ``const wp::int32 var_X =
+             Config::<label>_shape_K;`` so the same body resolves to a
+             different literal per instantiation.
+
+          3. ``K`` is runtime: lazily materialise a ``wp::shape_t``
+             local (literal/Config-init writes) and return None to let
+             the generic ``extract(shape_t&, int)`` path fire.  Rare —
+             happens only when ``arr.shape[k]`` is reached with a
+             non-literal ``k`` (e.g. inside a non-unrollable loop).
+        """
+        idx_const = idx_var.constant if isinstance(idx_var, Var) else None
+        if idx_const is None:
+            # Runtime K: materialise the shape_t local and dispatch
+            # through the generic ``extract`` builtin.  Build a local-
+            # name Var with the right identifier so format_args emits
+            # the materialised local at the call site.
+            local_name = arr_var.materialize_baked_shape_local(adj)
+            local_var = Var(local_name, shape_t, prefix=False)
+            return adj.add_builtin_call("extract", [local_var, idx_var])
+        K = int(idx_const)
+        use_config = adj.is_user_function and not arr_var._baked_is_view_result
+        if use_config:
+            rhs = f"Config::{arr_var.label}_shape_{K}"
+            out = adj.add_var(int32)
+            adj.add_forward(f"const wp::int32 {out.emit()} = {rhs};")
+            return out
+        # Kernel body / view-result subarray: the literal value of
+        # arr.baked_value.shape[K] IS the value.  Emit a Python
+        # constant Var so loop unrolling and downstream constant
+        # propagation fire automatically.
+        return adj.add_var(int32, constant=int(arr_var.baked_value.shape[K]))
+
     def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):
             node.value.is_adjoint = True
@@ -2725,9 +2801,9 @@ class Adjoint:
 
             else:
                 # Spec hook: when the aggregate is a baked array Var and we're
-                # reading ``.shape``, synthesize a baked_shape_t local
-                # populated with baked values (lazy, memoised on the Var).
-                # The struct fields are never read through this path otherwise.
+                # reading ``.shape``, return a marker Var that the subscript
+                # site recognises and lowers to a literal (or Config:: lookup
+                # in templated wp.func bodies) without going through extract.
                 if isinstance(aggregate, Var):
                     baked_attr = aggregate.emit_for_attribute(node.attr, adj)
                     if baked_attr is not None:
@@ -3459,6 +3535,18 @@ class Adjoint:
                 )
 
         else:
+            # Spec hook: ``arr.shape[K]`` on a baked array.  The target
+            # Var is a marker (``_baked_shape_of`` points at the array
+            # Var); the helper either constant-folds at codegen time
+            # (literal K) or materialises a shape_t local and dispatches
+            # to the generic ``extract`` builtin (runtime K).
+            if (
+                isinstance(target, Var)
+                and target._baked_shape_of is not None
+                and len(indices) == 1
+            ):
+                return adj._emit_baked_shape_subscript(target._baked_shape_of, indices[0])
+
             # handles non-array type indexing, e.g: vec3, mat33, etc
             out = adj.add_builtin_call("extract", [target, *indices])
 
@@ -5280,10 +5368,10 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     to `Config::<label>`.  Baked arrays drop from the ABI too — the
     callee receives only the raw data pointer `<T>* _wp_baked_var_<label>_data`.
     The body references that pointer directly at scheme-B call sites
-    (rewritten by `add_call._format_fwd_args` at adj.build() time) and
-    emits a lazy `baked_shape_t<...>` local via `Var.emit_for_attribute`
-    for the rare `&arr.shape` access pattern — so no `array_t<T>`
-    reconstruction is needed.
+    (rewritten by `add_call._format_fwd_args` at adj.build() time).
+    `&arr.shape` reads on a baked array are constant-folded at codegen
+    time via `_emit_baked_shape_subscript`, so no `array_t<T>`
+    reconstruction is needed for the common case.
 
     Multiple kernel bakings of the same wp.func share one template
     declaration.  Per-baking differences are captured entirely in the
@@ -5306,8 +5394,8 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     # already been emitted correctly for the templated context:
     # ``.data`` was rewritten to ``_wp_baked_var_<label>_data`` at each
     # scheme-B / baked-wp.func call site by ``add_call._format_fwd_args``,
-    # and ``&arr.shape`` was emitted via ``Var.emit_for_attribute`` as a
-    # lazy ``baked_shape_t`` local populated from ``Config::<label>_shape_K``.
+    # and ``arr.shape[K]`` was constant-folded to ``Config::<label>_shape_K``
+    # at codegen time via ``_emit_baked_shape_subscript``.
     # No body-level post-processing required.
     #
     # The exception is baked arrays passed *by value* to a non-scheme-B,
@@ -5541,9 +5629,9 @@ def codegen_kernel(kernel, device, options):
                 # `T* __restrict__` kernel parameter.  No `array_t<T>`
                 # struct in cmem, no metadata writes in the body.  All
                 # access goes through scheme-B templated address helpers
-                # (which take `T*` + compile-time shape/stride), and the
-                # rare `&arr.shape` read emits a lazy `baked_shape_t<...>`
-                # local via `Var.emit_for_attribute`.
+                # (which take `T*` + compile-time shape/stride), and
+                # `arr.shape[K]` reads are constant-folded at codegen
+                # time via `_emit_baked_shape_subscript`.
                 #
                 # Isolated microbench (apply_impulses, n=200, L40, sm89):
                 #   array_t + dead writes  8.84 us  — NVRTC partial-

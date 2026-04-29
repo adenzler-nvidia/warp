@@ -194,10 +194,12 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(var_y_data,")
 
     def test_codegen_baked_shape_local(self):
-        """Verify `.shape` access on a baked array emits a
-        `wp::baked_shape_t<N>` local whose dims are encoded as template
-        args, so NVRTC can fold downstream `extract`/dims reads to
-        compile-time constants.
+        """Verify `arr.shape[K]` on a baked array constant-folds to the
+        literal at codegen time — no shape_t local is materialised in
+        the kernel body, and no `extract` call is emitted for the
+        literal-K case.  The literal flows through Warp's constant Var
+        machinery, which downstream consumers (loops, comparisons) see
+        as a compile-time constant.
         """
         N = 123
         device = "cuda:0"
@@ -212,10 +214,10 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # New baked-shape pattern: template-arg-encoded local, no
-        # runtime dims[k] writes.
-        self.assertRegex(source, rf"wp::baked_shape_t<{N}> __wp_baked_var_a_shape;")
-        self.assertNotIn("__wp_baked_var_a_shape.dims[0] = ", source)
+        # No materialised shape local for the literal-K case.
+        self.assertNotIn("__wp_baked_var_a_shape", source)
+        # The literal N should appear directly as a const initialiser.
+        self.assertRegex(source, rf"const wp::int32 var_\d+ = {N};")
 
         # End-to-end: the kernel reads back N correctly.
         wp.synchronize_device(device)
@@ -321,14 +323,11 @@ class TestKernelSpecialize(unittest.TestCase):
         np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M * K)
 
     def test_codegen_view_result_shape_baked(self):
-        """`slice = arr[i]; slice.shape[0]` on a baked source emits a
-        `wp::baked_shape_t<...>` local for the sub-array, matching the
-        kernel-arg `.shape` path.  Without this, the `.shape[K]` read
-        would fall through to the inherited `shape_t.dims[K]` field of
-        the baked_array_t local — values are constexpr-init by the
-        ctor and NVRTC folds, but that's a fold, not a template-arg
-        encoding.  Hooking it gives type-level static info for view-
-        result `.shape` accesses too.
+        """``slice = arr[i]; slice.shape[0]`` on a baked source: the
+        view result carries its post-view ``baked_value`` (shape ``(M,)``
+        after viewing the 0th row of an ``(N, M)`` array), and
+        ``slice.shape[0]`` constant-folds to ``M`` at codegen time
+        without any shape_t materialisation.
         """
         N = 8
         M = 5
@@ -344,9 +343,10 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # The sub-array gets a baked_shape_t local with the post-view
-        # shape (here: 1D shape of M after viewing the 0th row).
-        self.assertRegex(source, rf"wp::baked_shape_t<{M}> __wp_baked_var_\d+_shape;")
+        # No materialised shape local; the post-view shape M appears
+        # directly as a const literal.
+        self.assertNotIn("__wp_baked_var_", source.split("// shared memory")[-1] if "shared memory" in source else "")
+        self.assertRegex(source, rf"const wp::int32 var_\d+ = {M};")
 
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), M)
