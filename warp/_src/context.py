@@ -65,7 +65,7 @@ import warp._src.codegen
 import warp.config
 from warp._src.codegen import WarpCodegenTypeError, synchronized
 from warp._src.texture import Texture1D, Texture2D, Texture3D, texture1d_t, texture2d_t, texture3d_t
-from warp._src.types import Array, launch_bounds_t, type_repr
+from warp._src.types import Array, array_t, launch_bounds_t, type_repr
 
 _wp_module_name_ = "warp.context"
 
@@ -760,7 +760,28 @@ class Kernel:
     Kernels can be launched on CPU or GPU devices using :func:`warp.launch`.
     """
 
-    def __init__(self, func, key=None, module=None, options=None, code_transformers=None, source=None):
+    def __init__(
+        self,
+        func,
+        key=None,
+        module=None,
+        options=None,
+        code_transformers=None,
+        source=None,
+        overload_annotations=None,
+    ):
+        """Construct a Kernel.
+
+        Args:
+            overload_annotations: When ``func`` is a Python function whose
+                annotations are still generic (e.g. ``Any``-typed params
+                from a kernel factory), pass the resolved concrete
+                annotations of an existing overload here.  The Adjoint
+                will be built against those instead of re-reading the
+                generic source annotations, so the resulting Kernel
+                isn't flagged as generic and skips the overload-table
+                lookup at module-hash time.
+        """
         self.func = func
 
         if module is None:
@@ -778,7 +799,12 @@ class Kernel:
         if code_transformers is None:
             code_transformers = []
 
-        self.adj = warp._src.codegen.Adjoint(func, transformers=code_transformers, source=source)
+        self.adj = warp._src.codegen.Adjoint(
+            func,
+            transformers=code_transformers,
+            source=source,
+            overload_annotations=overload_annotations,
+        )
 
         # check if generic
         self.is_generic = False
@@ -2264,8 +2290,6 @@ class ModuleBuilder:
         data/grad pointers are excluded so reallocations with identical
         layout share a single compiled instantiation.
         """
-        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
         # Hash baked *label set* separately from baked *values*.  The ABI
         # (which args are dropped / replaced by a data pointer) is a function
         # of the label set only — two bakings that share labels can share one
@@ -2279,7 +2303,7 @@ class ModuleBuilder:
             val = baked_params[param_name]
             # Encode the *kind* of baking (array vs scalar) — not the value —
             # so "q baked as array" and "q baked as scalar" don't collide.
-            labels_h.update(b"A" if isinstance(val, array_t_type) else b"S")
+            labels_h.update(b"A" if isinstance(val, array_t) else b"S")
         labels_hash = labels_h.hexdigest()[:8]
 
         h = hashlib.sha256()
@@ -2287,7 +2311,7 @@ class ModuleBuilder:
         for param_name in sorted(baked_params):
             val = baked_params[param_name]
             h.update(param_name.encode())
-            if isinstance(val, array_t_type):
+            if isinstance(val, array_t):
                 h.update(val.ndim.to_bytes(4, "little", signed=True))
                 for i in range(val.ndim):
                     h.update(val.shape[i].to_bytes(4, "little", signed=True))
@@ -2312,6 +2336,13 @@ class ModuleBuilder:
         if config_key not in self.specialized_functions:
             self.specialized_functions[config_key] = (func, template_name, baked_params)
 
+        # In a spec module every caller of this wp.func is rewritten to
+        # the baked variant, so the generic body is dead.  Drop it from
+        # `self.functions` so the generic-emission pass in `codegen()`
+        # doesn't emit it (the body would reference an undefined `Config`
+        # in the outer non-templated scope).
+        self.functions.pop(func, None)
+
         # The template lives in `namespace wp`, so qualify the call site.
         # User wp.funcs register with `namespace=""`, so we bake the `wp::`
         # qualifier into the returned symbol.  Callers from inside namespace wp
@@ -2325,13 +2356,12 @@ class ModuleBuilder:
         scalars are just `<label>` with the appropriate ctype.
         """
         import builtins as _builtins  # noqa: PLC0415
-        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
         from warp._src.codegen import Var  # noqa: PLC0415
 
         lines = ["namespace wp {", f"struct {name} {{"]
         for label in sorted(baked_params):
             val = baked_params[label]
-            if isinstance(val, array_t_type):
+            if isinstance(val, array_t):
                 for k in range(val.ndim):
                     lines.append(f"    static constexpr int {label}_shape_{k} = {int(val.shape[k])};")
                 for k in range(val.ndim):
@@ -2582,24 +2612,11 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
         # Pass 3: Forward functions that use wp.grad() (these call adjoints, so must come after pass 2)
         #         Note: Functions using wp.grad() don't have adjoints generated.
 
-        # Phase D: a wp.func that has been specialized shares its built adj
-        # body with the generic (unbaked) emission, but that body references
-        # `Config::...` at scheme-B builtin call sites — valid only inside the
-        # templated wrapper.  In a spec module, every caller is rewritten to
-        # the baked variant, so the generic forward/adjoint bodies are dead.
-        # Skip them to avoid emitting code that references an undefined
-        # `Config` in the outer (non-templated) scope.
-        _specialized_funcs = {func for (_k, _h), (func, _n, _p) in self.specialized_functions.items()}
-
-        # Separate functions into those that use grad() and those that don't
-        grad_functions = [
-            f for f in self.functions.keys()
-            if f.adj.uses_grad_call and f not in _specialized_funcs
-        ]
-        non_grad_functions = [
-            f for f in self.functions.keys()
-            if not f.adj.uses_grad_call and f not in _specialized_funcs
-        ]
+        # `register_specialized_function` removes a wp.func from
+        # `self.functions` once a baked variant is emitted, so this loop
+        # only sees generic functions.
+        grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
+        non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
 
         # Phase D: emit traits structs for every (wp.func, baking) pair.
         # These must come before the scheme-B builtin helpers and before the
@@ -9536,15 +9553,13 @@ def _hash_baked_args(baked_args, kernel_args, kernel_module_hash):
     For arrays, only shape/stride/ndim are hashed (not data pointers), so
     different allocations with the same layout share the cached module.
     """
-    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
     h = hashlib.sha256()
     h.update(kernel_module_hash)
     h.update(bytes(baked_args["dim"]))
     for arg_idx, arg in enumerate(kernel_args):
         h.update(arg_idx.to_bytes(4, "little"))  # separator prevents cross-arg collisions
         packed = baked_args[arg.label]
-        if isinstance(packed, array_t_type):
+        if isinstance(packed, array_t):
             # Hash metadata only — exclude data/grad pointers.
             h.update(packed.ndim.to_bytes(4, "little", signed=True))
             for i in range(packed.ndim):
@@ -9561,7 +9576,6 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     Works both during graph capture and for regular launches.
     If ``graph`` is provided, the module exec is retained by the graph.
     """
-    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
     from warp._src.types import launch_bounds_t  # noqa: PLC0415
 
     if kernel.is_generic:
@@ -9608,31 +9622,22 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     # deprecation-shim recursion on missing attributes.
     spec_kernel = _spec_kernel_cache.get(module_name)
     if spec_kernel is None:
+        # If ``kernel`` is a concrete overload of a generic factory (e.g.
+        # a kernel defined inside ``create_foo_kernel()`` that takes
+        # ``Any``-typed params), ``kernel.func`` still carries the
+        # generic annotations.  Pass the concrete arg types from the
+        # source kernel so the spec kernel's Adjoint is built against
+        # those — without this it would be flagged as generic, fail to
+        # produce a module hash, and crash ``get_mangled_name()``.
+        overload_annotations = dict(kernel.adj.arg_types) if not kernel.is_generic else None
         spec_kernel = Kernel(
             func=kernel.func,
             key=kernel.key,
             module=module,
             options={"baked_args": baked_args, "enable_backward": False},
+            source=kernel.adj.source,
+            overload_annotations=overload_annotations,
         )
-
-        # If `kernel` is a concrete overload of a generic factory (e.g. a
-        # kernel defined inside `create_foo_kernel()` that takes `Any`-typed
-        # params), `kernel.func` still carries the generic annotations.
-        # Kernel.__init__ would re-read those and flag spec_kernel as
-        # generic, after which ModuleHasher hashes only overloads (of
-        # which spec_kernel has none) and `get_mangled_name()` fails with
-        # "Missing hash".  Rebuild the spec kernel's adjoint from the
-        # overload's concrete annotations so it enters the module build
-        # as a plain non-generic kernel.
-        if not kernel.is_generic and spec_kernel.is_generic:
-            spec_kernel.adj = warp._src.codegen.Adjoint(
-                kernel.func,
-                overload_annotations=dict(kernel.adj.arg_types),
-                source=kernel.adj.source,
-            )
-            spec_kernel.is_generic = False
-            spec_kernel.arg_indices = {a.label: i for i, a in enumerate(spec_kernel.adj.args)}
-
         _spec_kernel_cache[module_name] = spec_kernel
 
     module_exec = module.load(device, block_dim)
@@ -9657,7 +9662,7 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
         baked = baked_args[a.label]
         if isinstance(baked, ctypes._SimpleCData):
             continue
-        if isinstance(baked, array_t_type):
+        if isinstance(baked, array_t):
             holder = ctypes.c_uint64(int(baked.data))
             _baked_ptr_holders.append(holder)
             kernel_args.append(ctypes.c_void_p(ctypes.addressof(holder)))

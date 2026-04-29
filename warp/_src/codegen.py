@@ -721,6 +721,91 @@ class Var:
         # Used to associate the variable with the Python statement that resulted in it being created.
         self.relative_lineno = relative_lineno
 
+        # Spec-feature metadata.  When `enable_kernel_specialize` is on and
+        # this Var is a kernel/wp.func arg with a baked value, `baked_value`
+        # holds the array_t (with shape/strides/ndim) or _SimpleCData scalar.
+        # `is_used_by_value` is set true if a baked array is passed by value
+        # to a callee that doesn't get rewritten — see `Adjoint.add_call`
+        # and `codegen_func_specialized` for the materialization fallback.
+        # The two `_baked_*` context flags determine which of the three
+        # data-pointer naming conventions `baked_data_name()` emits.
+        # `_baked_shape_local_name` memoizes the synthesized shape_t local
+        # name used by `emit_for_attribute('shape', ...)`.
+        self.baked_value: array_t | ctypes._SimpleCData | None = None
+        self.is_used_by_value: builtins.bool = False
+        self._baked_is_view_result: builtins.bool = False
+        self._baked_in_templated_func: builtins.bool = False
+        self._baked_shape_local_name: str | None = None
+
+    def emit_for_truthiness(self) -> str:
+        """C++ expression for this Var in a boolean context.
+
+        For baked-array kernel/func args under the T*-ABI, the struct
+        identifier (`var_X`) doesn't exist — only `var_X_data` is in
+        scope.  Return the raw-pointer truthiness check so `if (arr):`,
+        `while (arr):`, and `arr1 and arr2` all compile.
+        """
+        if isinstance(self.baked_value, array_t):
+            return self.baked_data_name()
+        return self.emit()
+
+    def baked_data_name(self) -> str:
+        """C++ expression for this Var's data pointer.
+
+        Three contexts, three identifiers:
+          - kernel arg in kernel body         -> ``var_<label>_data``
+          - kernel arg in templated wp.func   -> ``_wp_baked_var_<label>_data``
+          - view-result baked subarray        -> ``var_<label>.data``
+
+        The first two reference the raw ``T* __restrict__`` parameter
+        emitted by ``codegen_kernel`` / ``codegen_func_specialized``.
+        The third reads the ``data`` field of the ``baked_array_t<...>``
+        local emitted by a preceding ``wp::view`` call.
+        """
+        if self._baked_is_view_result:
+            return f"var_{self.label}.data"
+        if self._baked_in_templated_func:
+            return f"_wp_baked_var_{self.label}_data"
+        return f"var_{self.label}_data"
+
+    def emit_for_attribute(self, attr: str, adj: "Adjoint") -> "Var | None":
+        """Return a Var for ``self.<attr>`` when the access can be
+        synthesized from this Var's baked metadata.  Returns None
+        otherwise (caller falls through to the generic struct-field
+        path).
+
+        Currently only ``.shape`` is recognized — synthesizes a
+        ``wp::baked_shape_t<S0,...>`` local at the outermost block,
+        memoized via ``self._baked_shape_local_name`` so repeated
+        accesses share one declaration.  Template args use
+        ``Config::<label>_shape_K`` for kernel-arg arrays inside a
+        templated wp.func body, and pure literal ints in every other
+        context (kernel bodies, view-result subarrays whose shape was
+        derived at compile time from index shifts).
+        """
+        if not isinstance(self.baked_value, array_t) or attr != "shape":
+            return None
+
+        if self._baked_shape_local_name is None:
+            self._baked_shape_local_name = f"__wp_baked_var_{self.label}_shape"
+            # Use ``Config::`` template params only for kernel-arg baked
+            # arrays inside a templated wp.func body — the values come
+            # through the per-Config traits struct.  Sub-arrays from
+            # view results aren't carried in the per-Config struct
+            # (their shape is derived at the call site from compile-
+            # time shifts), so always emit literal ints for them.
+            use_config = adj.is_user_function and not self._baked_is_view_result
+            template_args = [
+                f"Config::{self.label}_shape_{k}" if use_config else str(int(self.baked_value.shape[k]))
+                for k in range(self.baked_value.ndim)
+            ]
+            decl = f"wp::baked_shape_t<{', '.join(template_args)}> {self._baked_shape_local_name};"
+            # Prepend at the outermost block so the local is visible
+            # from every nested scope that takes ``&arr.shape``.
+            adj.blocks[0].body_forward.insert(0, adj.indentation + decl)
+
+        return Var(self._baked_shape_local_name, shape_t, prefix=False)
+
     def __str__(self):
         return self.label
 
@@ -1176,29 +1261,6 @@ class Adjoint:
         adj.blocks = [Block()]
         adj.loop_blocks = []
 
-        # Reset spec-codegen caches tied to the current block contents.
-        # `_baked_shape_locals` is populated lazily by
-        # `_spec_attribute_access` the first time `&arr.shape` is taken on
-        # a baked array.  `_baked_arrays_used_by_value` is populated by
-        # `add_call` when a baked array is passed by value to a non-baked
-        # callee — `codegen_func_specialized` uses it to decide whether
-        # to materialize the full `array_t<T>` struct.  Without these
-        # resets, caches persist across rebuilds (a function built once
-        # per Config instantiation) and skip work that's needed for the
-        # fresh build, leaving references to undeclared locals.
-        adj._baked_shape_locals = {}
-        adj._baked_arrays_used_by_value = set()
-        # `_baked_view_results` maps a Var label produced by an
-        # int-indexed `wp::view(arr, i, ...)` on a baked array (kernel
-        # arg or already-tracked sub-array) to an `array_t`-shaped
-        # sub-array value carrying the post-view shape / strides /
-        # ndim.  This propagates the static metadata one extra hop:
-        # later builtin calls (`address`, `array_store`, atomics) on
-        # the view result will see the sub-array's compile-time
-        # shape/stride and emit scheme-B helpers that bake those into
-        # template args, just like for direct kernel-arg access.
-        adj._baked_view_results = {}
-
         # holds current indent level
         adj.indentation = ""
 
@@ -1211,6 +1273,27 @@ class Adjoint:
         # update symbol map for each argument
         for a in adj.args:
             adj.symbols[a.label] = a
+
+        # Spec-feature: bind baked metadata onto arg Vars for the current
+        # build.  Every consumer (truthiness check, attribute access,
+        # data-pointer reference, scheme-B dispatch) reads from the Var
+        # rather than looking up `baked_args[label]` at the call site.
+        # Reset spec-feature flags first so a function rebuilt without
+        # baking (or with a different baking) starts clean.
+        for a in adj.args:
+            a.baked_value = None
+            a.is_used_by_value = False
+            a._baked_in_templated_func = False
+            a._baked_shape_local_name = None
+        baked_args = adj.builder_options.get("baked_args") if adj.builder_options else None
+        if isinstance(baked_args, dict):
+            for a in adj.args:
+                value = baked_args.get(a.label)
+                if isinstance(value, array_t) and is_array(a.type):
+                    a.baked_value = value
+                    a._baked_in_templated_func = adj.is_user_function
+                elif isinstance(value, ctypes._SimpleCData) and type_is_value(a.type):
+                    a.baked_value = value
 
         # recursively evaluate function body
         try:
@@ -1675,16 +1758,17 @@ class Adjoint:
             if adj.builder is not None:
                 baked_args = adj.builder_options.get("baked_args")
                 if isinstance(baked_args, dict):
-                    import warp._src.types as _types  # noqa: PLC0415
-                    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
                     for param_name, arg_var in bound_args.items():
-                        if not (isinstance(arg_var, Var) and arg_var.label in baked_args):
+                        if not isinstance(arg_var, Var) or arg_var.baked_value is None:
                             continue
-                        caller_val = baked_args[arg_var.label]
-                        if isinstance(caller_val, array_t_type) and not _types.is_array(arg_var.type):
+                        # Type guard: caller-side Var type must agree with
+                        # the baked-value kind so a label collision (e.g. a
+                        # struct-typed callee param sharing a name with an
+                        # array-typed kernel arg) doesn't poison the callee.
+                        caller_val = arg_var.baked_value
+                        if isinstance(caller_val, array_t) and not is_array(arg_var.type):
                             continue
-                        if isinstance(caller_val, ctypes._SimpleCData) and not _types.type_is_value(arg_var.type):
+                        if isinstance(caller_val, ctypes._SimpleCData) and not type_is_value(arg_var.type):
                             continue
                         if param_name not in baked_args:
                             baked_args[param_name] = caller_val
@@ -1705,6 +1789,12 @@ class Adjoint:
                     if func.custom_replay_func:
                         adj.builder.deferred_functions.append(func.custom_replay_func)
             finally:
+                # Scope cleanup: entries added by this call's propagation
+                # must be removed after the callee build returns.  They
+                # were only needed while that callee was being built —
+                # leaving them in place poisons sibling calls that share
+                # a param name (e.g. two callees that both declare ``s``
+                # but expect different baked values).
                 if propagated_keys:
                     baked_args = adj.builder_options.get("baked_args") if adj.builder is not None else None
                     if isinstance(baked_args, dict):
@@ -1772,51 +1862,38 @@ class Adjoint:
         # (kernel arg or already-tracked sub-array) with all-int
         # indices, the result is itself a baked sub-array — its
         # shape/strides/ndim are pure shifts of the source's
-        # compile-time values.  Track the result Var's label so the
-        # scheme-B path above fires on subsequent
-        # `address`/`array_store`/`atomic_*` calls applied to it.
+        # compile-time values.  Set the baked metadata directly on the
+        # result Var so subsequent attribute access, scheme-B builtin
+        # dispatch, and codegen-time type emission all see it as just
+        # another baked array — no separate label-keyed dict needed.
         if (
             func.is_builtin()
             and func.key == "view"
             and adj.builder is not None
-            and adj.builder_options
             and isinstance(output, Var)
+            and is_array(output.type)
         ):
-            from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
-            from warp._src.types import is_array as _is_array  # noqa: PLC0415
-
-            _baked_args_dict = adj.builder_options.get("baked_args")
-            if isinstance(_baked_args_dict, dict):
-                _src_arr = bound_args.get("arr")
-                if _src_arr is None:
-                    _src_arr = next(iter(bound_args.values()), None)
-                _src_baked = None
-                if isinstance(_src_arr, Var) and _is_array(_src_arr.type):
-                    if _src_arr.label in _baked_args_dict:
-                        _cand = _baked_args_dict[_src_arr.label]
-                        if isinstance(_cand, _array_t_type):
-                            _src_baked = _cand
-                    if _src_baked is None:
-                        _cand = adj._baked_view_results.get(_src_arr.label)
-                        if isinstance(_cand, _array_t_type):
-                            _src_baked = _cand
-                if _src_baked is not None:
-                    _idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
-                    _consumed = len(_idx_keys)
-                    if 0 < _consumed < _src_baked.ndim:
-                        _src_shape = [int(_src_baked.shape[i]) for i in range(_src_baked.ndim)]
-                        _src_strides = [int(_src_baked.strides[i]) for i in range(_src_baked.ndim)]
-                        _new_ndim = _src_baked.ndim - _consumed
-                        _new_shape = _src_shape[_consumed:]
-                        _new_strides = _src_strides[_consumed:]
-                        _sub = _array_t_type(
-                            data=0,
-                            grad=0,
-                            ndim=_new_ndim,
-                            shape=tuple(_new_shape),
-                            strides=tuple(_new_strides),
-                        )
-                        adj._baked_view_results[output.label] = _sub
+            _src_arr = bound_args.get("arr")
+            if _src_arr is None:
+                _src_arr = next(iter(bound_args.values()), None)
+            _src_baked = None
+            if isinstance(_src_arr, Var) and isinstance(_src_arr.baked_value, array_t):
+                _src_baked = _src_arr.baked_value
+            if _src_baked is not None:
+                _idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
+                _consumed = len(_idx_keys)
+                if 0 < _consumed < _src_baked.ndim:
+                    _src_shape = [int(_src_baked.shape[i]) for i in range(_src_baked.ndim)]
+                    _src_strides = [int(_src_baked.strides[i]) for i in range(_src_baked.ndim)]
+                    _sub = array_t(
+                        data=0,
+                        grad=0,
+                        ndim=_src_baked.ndim - _consumed,
+                        shape=tuple(_src_shape[_consumed:]),
+                        strides=tuple(_src_strides[_consumed:]),
+                    )
+                    output.baked_value = _sub
+                    output._baked_is_view_result = True
 
         # Scheme B: specialize selected array-access builtins when the array
         # arg is baked.  Emits a `static __device__ __forceinline__` helper
@@ -1844,78 +1921,48 @@ class Adjoint:
             "atomic_cas",
             "atomic_exch",
         }
-        baked_builtin_arr_idx = None  # index of the array arg in fwd_args to rewrite to `.data`
-        # `baked_builtin_arr_is_subarray` tracks whether the array arg
-        # is a tracked view-result sub-array (stored as a baked_array_t
-        # local with `.data` member) rather than a kernel-arg baked
-        # array (raw `T*` parameter named `var_<label>_data`).  The
-        # call-site rewrite below uses this to choose between
-        # `var_<label>.data` and `var_<label>_data`.
-        baked_builtin_arr_is_subarray = False
+        # Index of the array arg in fwd_args to rewrite to its data-pointer
+        # name (or None when the arg isn't baked).
+        baked_builtin_arr_idx = None
         if func.is_builtin() and adj.builder is not None and func.key in BAKED_BUILTINS:
-            baked_args_dict = adj.builder_options.get("baked_args") if adj.builder_options else None
-            if isinstance(baked_args_dict, dict):
-                import warp._src.types as _types  # noqa: PLC0415
-                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
-                # The array arg is always the first positional — named "arr"
-                # in the registrations.  It's either `bound_args["arr"]` or
-                # the first bound arg.
-                arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
-                # Resolve the baked metadata for this arg.  Two sources:
-                # (1) kernel-arg baked array (`baked_args_dict`),
-                # (2) view-result sub-array (`adj._baked_view_results`,
-                #     populated below for prior `wp::view` calls on a
-                #     baked source).
-                baked_arr = None
-                arg_is_subarray = False
-                if isinstance(arr_var, Var) and _types.is_array(arr_var.type):
-                    if arr_var.label in baked_args_dict:
-                        candidate = baked_args_dict[arr_var.label]
-                        if isinstance(candidate, array_t_type):
-                            baked_arr = candidate
-                    if baked_arr is None:
-                        view_results = getattr(adj, "_baked_view_results", {})
-                        candidate = view_results.get(arr_var.label)
-                        if isinstance(candidate, array_t_type):
-                            baked_arr = candidate
-                            arg_is_subarray = True
-                if baked_arr is not None:
-                    elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
-                    # Count actual provided indices (non-None in bound_args)
-                    idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
-                    # Guard: ndim must match the number of index args we have.
-                    if baked_arr.ndim == len(idx_keys):
-                        value_ctype = None
-                        if func.key == "array_store" or func.key.startswith("atomic_"):
-                            # Value type is the array element's dtype.
-                            value_ctype = elem_ctype
-                        # Phase D: inside a templated wp.func body, template
-                        # args come from `Config::<label>_shape_k` so the
-                        # body is reusable across Config instantiations.
-                        # Sub-array shape/stride values aren't carried in
-                        # the per-Config traits struct — they were derived
-                        # at the view callsite from compile-time constants
-                        # — so always emit literals when the source is a
-                        # tracked view result.
-                        config_label = arr_var.label if adj.is_user_function and not arg_is_subarray else None
-                        helper_name = adj.builder.register_specialized_builtin(
-                            func.key,
-                            baked_arr,
-                            elem_ctype,
-                            value_ctype=value_ctype,
-                            config_label=config_label,
-                        )
-                        func_name = helper_name
-                        # Find the position of the array arg in func_args
-                        # so we can rewrite it to `arr.data` at the call site.
-                        arr_pos = None
-                        for i, fa in enumerate(func_args):
-                            if isinstance(fa, Var) and fa.label == arr_var.label:
-                                arr_pos = i
-                                break
-                        baked_builtin_arr_idx = arr_pos
-                        baked_builtin_arr_is_subarray = arg_is_subarray
+            # The array arg is always the first positional — named ``arr``
+            # in the registrations.  It's either ``bound_args["arr"]`` or
+            # the first bound arg.
+            arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
+            if (
+                isinstance(arr_var, Var)
+                and is_array(arr_var.type)
+                and isinstance(arr_var.baked_value, array_t)
+            ):
+                baked_arr = arr_var.baked_value
+                elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
+                # Count actual provided indices (non-None in bound_args)
+                idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
+                # Guard: ndim must match the number of index args we have.
+                if baked_arr.ndim == len(idx_keys):
+                    value_ctype = elem_ctype if (func.key == "array_store" or func.key.startswith("atomic_")) else None
+                    # Inside a templated wp.func body, template args come
+                    # from ``Config::<label>_shape_k`` so the body is
+                    # reusable across Config instantiations.  Sub-array
+                    # shape/stride values aren't carried in the per-Config
+                    # traits struct (they were derived at the view callsite
+                    # from compile-time constants) — emit literals for them
+                    # in every context.
+                    config_label = arr_var.label if (adj.is_user_function and not arr_var._baked_is_view_result) else None
+                    func_name = adj.builder.register_specialized_builtin(
+                        func.key,
+                        baked_arr,
+                        elem_ctype,
+                        value_ctype=value_ctype,
+                        config_label=config_label,
+                    )
+                    # Find the position of the array arg in func_args
+                    # so we can rewrite it to its data-pointer name at
+                    # the call site.
+                    for i, fa in enumerate(func_args):
+                        if isinstance(fa, Var) and fa.label == arr_var.label:
+                            baked_builtin_arr_idx = i
+                            break
 
         # Register a baked variant and rewrite the call name.
         # Baked param names were already propagated to baked_args above
@@ -1932,26 +1979,21 @@ class Adjoint:
             and func.custom_grad_func is None
             and func.replay_snippet is None
         ):
-            baked_args = adj.builder_options.get("baked_args")
-            if isinstance(baked_args, dict):
-                import warp._src.types as _types  # noqa: PLC0415
-                from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
-                baked_params = {}
-                for param_name, arg_var in bound_args.items():
-                    if not (isinstance(arg_var, Var) and arg_var.label in baked_args):
-                        continue
-                    val = baked_args[arg_var.label]
-                    # Guard against name-collision false aliases (see the
-                    # propagation block above): the baked value kind must
-                    # match the caller-side Var type.
-                    if isinstance(val, array_t_type) and _types.is_array(arg_var.type):
-                        baked_params[param_name] = val
-                    elif isinstance(val, ctypes._SimpleCData) and _types.type_is_value(arg_var.type):
-                        baked_params[param_name] = val
-                if baked_params:
-                    func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
-                    baked_call_info = (list(bound_args.keys()), baked_params)
+            baked_params = {}
+            for param_name, arg_var in bound_args.items():
+                if not isinstance(arg_var, Var) or arg_var.baked_value is None:
+                    continue
+                # Guard against name-collision false aliases (see the
+                # propagation block above): the baked-value kind must
+                # match the caller-side Var type.
+                val = arg_var.baked_value
+                if isinstance(val, array_t) and is_array(arg_var.type):
+                    baked_params[param_name] = val
+                elif isinstance(val, ctypes._SimpleCData) and type_is_value(arg_var.type):
+                    baked_params[param_name] = val
+            if baked_params:
+                func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
+                baked_call_info = (list(bound_args.keys()), baked_params)
 
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
@@ -1974,58 +2016,30 @@ class Adjoint:
         # If we're inside a templated wp.func and a baked array is being
         # passed by value to a call that *won't* be rewritten to use its
         # raw pointer (i.e. neither a scheme-B baked builtin nor a baked
-        # wp.func call), the callee reads the whole `array_t<T>` struct.
-        # Mark the arg so `codegen_func_specialized` materializes the
-        # struct at function entry.  Without this the struct name exists
-        # in the body text but has no declaration, and NVRTC errors out.
-        if baked_builtin_arr_idx is None and baked_call_info is None and adj.builder_options:
-            _baked_args_dict = adj.builder_options.get("baked_args")
-            if isinstance(_baked_args_dict, dict):
-                import warp._src.types as _types2  # noqa: PLC0415
-                from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
-
-                if not hasattr(adj, "_baked_arrays_used_by_value"):
-                    adj._baked_arrays_used_by_value = set()
-                for a in fwd_args:
-                    if isinstance(a, Var) and _types2.is_array(a.type):
-                        baked_val = _baked_args_dict.get(a.label)
-                        if isinstance(baked_val, _array_t_type):
-                            adj._baked_arrays_used_by_value.add(a.label)
+        # wp.func call), the callee reads the whole ``array_t<T>``
+        # struct.  Mark the Var so ``codegen_func_specialized``
+        # materializes the struct at function entry — otherwise the
+        # struct name exists in the body text but has no declaration
+        # and NVRTC errors out.
+        if baked_builtin_arr_idx is None and baked_call_info is None:
+            for a in fwd_args:
+                if isinstance(a, Var) and is_array(a.type) and isinstance(a.baked_value, array_t):
+                    a.is_used_by_value = True
 
         # When the forward call targets a baked variant, rewrite the arg
-        # list: baked scalars are dropped (emitted as `const` inside the
+        # list: baked scalars are dropped (emitted as ``const`` inside the
         # callee), and baked arrays are passed as raw data pointers (the
-        # callee reconstructs a const array_t with baked shape/stride/ndim).
+        # callee reconstructs a const ``array_t`` with baked shape/stride/ndim).
         # Reverse and replay calls keep the unbaked ABI — they invoke the
-        # generic adj_/replay_ symbols which aren't specialized.
-        def _baked_data_ref(arg_label, is_subarray=False):
-            """C++ expression for a baked array's data pointer at a call site.
-
-            Three sources, three name conventions:
-
-              kernel arg, kernel body       -> var_<label>_data
-              kernel arg, templated wp.func -> _wp_baked_var_<label>_data
-              view-result sub-array         -> var_<label>.data
-
-            The view-result form references the `data` field of the
-            baked_array_t local emitted by the prior `wp::view` call —
-            the local is alive in scope, the field has the correct
-            (offset-adjusted) pointer, and the access is constexpr-
-            foldable to a register-resident value.
-            """
-            if is_subarray:
-                return f"var_{arg_label}.data"
-            if adj.is_user_function:
-                return f"_wp_baked_var_{arg_label}_data"
-            return f"var_{arg_label}_data"
-
+        # generic ``adj_``/``replay_`` symbols which aren't specialized.
         def _format_fwd_args(args, init_list):
-            # Scheme-B baked builtin: rewrite the single array arg to `.data`.
+            # Scheme-B baked builtin: rewrite the single array arg to its
+            # data-pointer name.
             if baked_builtin_arr_idx is not None:
                 parts = []
                 for i, a in enumerate(args):
                     if i == baked_builtin_arr_idx:
-                        parts.append(_baked_data_ref(a.label, baked_builtin_arr_is_subarray))
+                        parts.append(a.baked_data_name())
                     else:
                         parts.extend(adj.format_args("var", [a]))
                 arg_str = ", ".join(parts)
@@ -2036,16 +2050,14 @@ class Adjoint:
             if baked_call_info is None:
                 return adj.format_forward_call_args(args, init_list)
             param_names, _baked_params = baked_call_info
-            from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
             parts = []
-            # Output args (tail of `args`) have no matching param name — keep as-is.
+            # Output args (tail of ``args``) have no matching param name — keep as-is.
             n_params = len(param_names)
             for i, a in enumerate(args):
                 if i < n_params and param_names[i] in _baked_params:
                     val = _baked_params[param_names[i]]
-                    if isinstance(val, array_t_type):
-                        parts.append(_baked_data_ref(a.label))
+                    if isinstance(val, array_t):
+                        parts.append(a.baked_data_name())
                     # scalar: dropped from the call
                 else:
                     parts.extend(adj.format_args("var", [a]))
@@ -2293,7 +2305,7 @@ class Adjoint:
     # define an if statement
     def begin_if(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if ({adj._spec_cond_emit(cond)}) {{")
+        adj.add_forward(f"if ({cond.emit_for_truthiness()}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2307,7 +2319,7 @@ class Adjoint:
 
     def begin_else(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if (!{adj._spec_cond_emit(cond)}) {{")
+        adj.add_forward(f"if (!{cond.emit_for_truthiness()}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2398,7 +2410,7 @@ class Adjoint:
         c = adj.eval(cond)
         c = adj.load(c)
 
-        cond_block.body_forward.append(f"if (({adj._spec_cond_emit(c)}) == false) goto end_{cond_block.label};")
+        cond_block.body_forward.append(f"if (({c.emit_for_truthiness()}) == false) goto end_{cond_block.label};")
 
         # being block around loop
         adj.begin_block()
@@ -2576,45 +2588,23 @@ class Adjoint:
 
         op = node.op
         if isinstance(op, ast.And):
-            is_and = True
+            op_string = "&&"
         elif isinstance(op, ast.Or):
-            is_and = False
+            op_string = "||"
         else:
             raise WarpCodegenKeyError(f"Op {op} is not supported")
 
-        # Short-circuit evaluation: only evaluate subsequent operands
-        # if the result so far permits it (true for 'and', false for 'or').
-        # Each operand contributes through `_spec_cond_emit` so a baked-
+        # Each operand contributes through `Var.emit_for_truthiness` so a baked-
         # array operand becomes `var_X_data` (raw pointer truthiness)
         # instead of `var_X` (which doesn't exist under the T*-ABI for
-        # kernel-arg arrays).
+        # kernel-arg arrays).  C++ `&&` / `||` already short-circuit at
+        # runtime, so the joined expression has the same evaluation
+        # behavior as separate guarded blocks would.
+        exprs = [adj.load(adj.eval(expr)) for expr in node.values]
         output = adj.add_var(builtins.bool)
-        first = adj.eval(node.values[0])
-        first = adj.load(first)
-        adj.add_forward(f"{output.emit()} = {adj._spec_cond_emit(first)};")
-
-        for expr in node.values[1:]:
-            # Guard: only evaluate next operand if short-circuit condition holds
-            if is_and:
-                adj.add_forward(f"if ({output.emit()}) {{")
-                adj.add_reverse("}")
-            else:
-                adj.add_forward(f"if (!{output.emit()}) {{")
-                adj.add_reverse("}")
-            adj.indent()
-
-            val = adj.eval(expr)
-            val = adj.load(val)
-            op_str = "&&" if is_and else "||"
-            adj.add_forward(f"{output.emit()} = {output.emit()} {op_str} {adj._spec_cond_emit(val)};")
-
-            adj.dedent()
-            adj.add_forward("}")
-            if is_and:
-                adj.add_reverse(f"if ({output.emit()}) {{")
-            else:
-                adj.add_reverse(f"if (!{output.emit()}) {{")
-
+        parts = [e.emit_for_truthiness() for e in exprs]
+        command = output.emit() + " = " + (" " + op_string + " ").join(parts) + ";"
+        adj.add_forward(command)
         return output
 
     def emit_Name(adj, node):
@@ -2687,144 +2677,6 @@ class Adjoint:
         # possibly holding differentiable values (for which gradients must be accumulated)
         return type_scalar_type(var_type) in float_types or isinstance(var_type, Struct)
 
-    def _spec_cond_emit(adj, cond_var):
-        """Return the C++ expression for a boolean-context condition.
-
-        For baked-array args under the T*-ABI, rewrite `if (var_X)`
-        (which would require the full array_t struct to compile) to
-        `if (var_X_data)` — a raw pointer-truthiness check on the
-        array's data pointer kernel param.  Without this rewrite, the
-        spec compile fails with "identifier var_X is undefined" for
-        every kernel that uses Python `if arr:` on a baked array
-        (mjwarp's `verify_narrow_phase_buffers`, newton's
-        `narrow_phase_primitive_kernel`, etc.) and the silent-fallback
-        path runs the unspec'd version instead.
-
-        For non-baked-array conditions, fall through to the usual
-        `cond.emit()`.  Inside templated wp.func bodies the array's
-        raw data pointer is `_wp_baked_var_<label>_data` (Phase D
-        param naming); inside kernel bodies it's `var_<label>_data`.
-        """
-        if not isinstance(cond_var, Var):
-            return cond_var.emit()
-        if not adj.builder_options:
-            return cond_var.emit()
-        baked_args = adj.builder_options.get("baked_args")
-        if not isinstance(baked_args, dict):
-            return cond_var.emit()
-        from warp._src.types import array_t as _array_t_type  # noqa: PLC0415
-
-        baked = baked_args.get(cond_var.label)
-        if isinstance(baked, _array_t_type):
-            if adj.is_user_function:
-                return f"_wp_baked_var_{cond_var.label}_data"
-            return f"var_{cond_var.label}_data"
-        return cond_var.emit()
-
-    def _spec_attribute_access(adj, aggregate, attr_name):
-        """Return a Var representing `aggregate.<attr_name>` when the
-        aggregate is a baked array argument, emitting a baked expression
-        directly instead of a struct-field read.  Returns None otherwise.
-
-        Fires in both kernel and templated-wp.func contexts.  Under the
-        T*-ABI the baked array is passed as a raw `T* __restrict__`
-        pointer, so `&var_X.shape` has nothing to dereference and we
-        synthesise a `shape_t` local at function scope.  For kernel
-        bodies the shape values are literal ints; for templated wp.func
-        bodies they come from `Config::<label>_shape_K`.
-
-        Currently handles only `.shape`.  `.strides`, `.ndim`, `.data`,
-        `.grad` either don't show up as reads in the bodies we generate
-        today, or are handled at call-site rewriting time in
-        `add_call`.
-        """
-        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
-        # Fires in both kernel and templated-wp.func contexts: baked
-        # arrays are no longer `array_t<T>` structs in either case — the
-        # ABI is `T* __restrict__`, so `&arr.shape` has nothing to
-        # reference and we must synthesise one.  For kernel bodies the
-        # shape values are literal ints; for templated wp.funcs they
-        # come from `Config::<label>_shape_K`.  Also fires for view-result
-        # sub-arrays tracked in `_baked_view_results` — those have a
-        # local baked_array_t struct whose `.shape` IS readable through
-        # inheritance, but routing through the same baked_shape_t local
-        # mechanism keeps the type-level view consistent (template-arg
-        # encoded shape) instead of relying on NVRTC to fold the
-        # inherited shape_t.dims[K] reads.
-        if not isinstance(aggregate, Var):
-            return None
-        if not adj.builder_options:
-            return None
-        baked_args = adj.builder_options.get("baked_args")
-        if not isinstance(baked_args, dict):
-            return None
-
-        # Resolve baked metadata: kernel-arg first, then view-result
-        # sub-array.  `is_subarray` distinguishes the two so we know
-        # whether to use Config:: template params (kernel arg in
-        # templated wp.func) or pure literal ints (sub-array, always
-        # has constant shape from compile-time index shifts).
-        baked = baked_args.get(aggregate.label)
-        is_subarray = False
-        if not isinstance(baked, array_t_type):
-            view_results = getattr(adj, "_baked_view_results", {})
-            cand = view_results.get(aggregate.label)
-            if isinstance(cand, array_t_type):
-                baked = cand
-                is_subarray = True
-            else:
-                return None
-
-        if attr_name != "shape":
-            # `.strides`, `.ndim`, `.data`, `.grad` don't hit this path in
-            # any body we emit today — leave them for the generic code.
-            return None
-
-        # Declare a function-scope baked shape local once per arg.
-        #
-        # Must be emitted at the *outermost* block — not at the current
-        # adj cursor — because the reference is often first taken inside
-        # a nested `if` or loop, and a declaration there would be scoped
-        # to that inner block.  A later reference from a sibling branch
-        # would be a compile error.  We prepend directly to block[0] so
-        # the local is visible from every point in the function.
-        if not hasattr(adj, "_baked_shape_locals"):
-            adj._baked_shape_locals = {}
-        local_name = adj._baked_shape_locals.get(aggregate.label)
-        if local_name is None:
-            local_name = f"__wp_baked_var_{aggregate.label}_shape"
-            adj._baked_shape_locals[aggregate.label] = local_name
-            # Use Config:: template params only for kernel-arg baked
-            # arrays inside a templated wp.func body.  Sub-arrays from
-            # view results aren't carried in the per-Config traits
-            # struct (they're derived inside the body from compile-time
-            # shifts), so always emit literal ints for them.
-            use_config = adj.is_user_function and not is_subarray
-            template_args = [
-                f"Config::{aggregate.label}_shape_{k}" if use_config else str(int(baked.shape[k]))
-                for k in range(baked.ndim)
-            ]
-            decl = f"wp::baked_shape_t<{', '.join(template_args)}> {local_name};"
-            # Prepend at the outermost block so the local is visible from
-            # every nested scope that takes `&arr.shape`.
-            adj.blocks[0].body_forward.insert(0, adj.indentation + decl)
-
-        # shape_t is the field type for array_t.shape in both warp arrays
-        # and the baked-array proxy here; import from its canonical location.
-        from warp._src.types import shape_t as _shape_t  # noqa: PLC0415
-
-        # Return an unregistered Var that emits as the baked_shape_t
-        # local's name directly — no intermediate `wp::shape_t*`
-        # pointer, no `*var_X` dereference at the use site.  This
-        # preserves the local's static `wp::baked_shape_t<S0,...>` type
-        # at the `wp::extract(s, K)` call site, so the templated
-        # `extract(baked_shape_t<...>&, int)` overload fires (collapsing
-        # to the matching template arg constant) instead of the generic
-        # `extract(shape_t&, int)` which reads `s.dims[i]` and depends
-        # on NVRTC dataflow analysis to fold the constexpr-init values.
-        return Var(local_name, _shape_t, prefix=False)
-
     def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):
             node.value.is_adjoint = True
@@ -2872,15 +2724,14 @@ class Adjoint:
                     return adj.add_builtin_call("transform_get_rotation", [aggregate])
 
             else:
-                # Spec hook: when the aggregate is a baked array kernel/func
-                # argument and we're reading `.shape`, return the address of
-                # a lazily-declared local `shape_t` that's populated with
-                # baked values.  Avoids having to write shape metadata into
-                # the struct at the top of the kernel — the struct fields
-                # are never read through this path again once this fires.
-                baked_attr = adj._spec_attribute_access(aggregate, node.attr)
-                if baked_attr is not None:
-                    return baked_attr
+                # Spec hook: when the aggregate is a baked array Var and we're
+                # reading ``.shape``, synthesize a baked_shape_t local
+                # populated with baked values (lazy, memoised on the Var).
+                # The struct fields are never read through this path otherwise.
+                if isinstance(aggregate, Var):
+                    baked_attr = aggregate.emit_for_attribute(node.attr, adj)
+                    if baked_attr is not None:
+                        return baked_attr
 
                 attr_var = aggregate_type.vars[node.attr]
 
@@ -3556,19 +3407,25 @@ class Adjoint:
 
             else:
                 if warp._src.types.matches_array_class(target_type, warp._src.types.array):
-                    # If at least one index is a real slice, convert any
-                    # bare ints in the index list to step-0 slices so the
-                    # variadic `view(array_t<T>&, Slices...)` overload
-                    # accepts the mixed call uniformly.  When every index
-                    # is an int, leave them alone so the int-arity view
-                    # overloads (`view(arr, int)` / `view(arr, int, int)`
-                    # / `view(arr, int, int, int)`) fire instead — those
-                    # have a baked_array_t form that returns
-                    # `baked_array_t<...>` with shifted template args,
-                    # keeping the static shape/stride info flowing
-                    # without materialising an `array_t<T>`.
+                    # By default convert bare-int indices to step-0 slices
+                    # so every ``arr[i, j]`` reduces to the variadic
+                    # ``view(array_t<T>&, Slices...)`` overload.  This
+                    # keeps the C++ overload count manageable for non-spec
+                    # callers.
+                    #
+                    # Spec exception: when the target is a baked array,
+                    # leaving an all-int index list as plain ints lets the
+                    # int-arity ``view(arr, int)`` / ``view(arr, int, int)``
+                    # / ``view(arr, int, int, int)`` overloads fire, whose
+                    # ``baked_array_t<...>`` form returns a sub-array with
+                    # shifted shape/stride template args.  Without this we
+                    # lose the type-level baked metadata at the view
+                    # boundary.  Mixed int/slice still uses the variadic
+                    # form; that path can't keep the metadata anyway.
                     has_slice = any(warp._src.types.is_slice(strip_reference(idx.type)) for idx in indices)
-                    if has_slice:
+                    target_is_baked = isinstance(target, Var) and isinstance(target.baked_value, array_t)
+                    convert_to_slices = has_slice or not target_is_baked
+                    if convert_to_slices:
                         new_indices = []
                         for idx in indices:
                             if not warp._src.types.is_slice(strip_reference(idx.type)):
@@ -5114,23 +4971,21 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
 
-    # View-result baked sub-arrays declared as `wp::baked_array_t<...>`
+    # View-result baked sub-arrays declared as ``wp::baked_array_t<...>``
     # carry their static shape/stride template args through the kernel
-    # body — without this, the assignment from `wp::view(baked, ...)`
-    # would slice the templated return type to plain `array_t<T>` and
-    # downstream consumers (`wp::tile_load`, `wp::tile_store`, ...)
+    # body — without this, the assignment from ``wp::view(baked, ...)``
+    # would slice the templated return type to plain ``array_t<T>`` and
+    # downstream consumers (``wp::tile_load``, ``wp::tile_store``, ...)
     # would only see the inherited fields (read OK via NVRTC fold of
-    # the constexpr-init values, but no longer type-encoded).  Looked
-    # up from `adj._baked_view_results`, which `add_call` populates
-    # when a view fires on a baked source.
-    view_baked = getattr(adj, "_baked_view_results", {})
-
+    # the constexpr-init values, but no longer type-encoded).  The Var
+    # carries its own ``baked_value`` and ``_baked_is_view_result``
+    # flag, set by ``add_call`` when a view fires on a baked source.
     def _baked_view_ctype(var):
-        sub = view_baked.get(var.label)
-        if sub is None:
+        if not (var._baked_is_view_result and isinstance(var.baked_value, array_t)):
             return None
         if not is_array(strip_reference(var.type)):
             return None
+        sub = var.baked_value
         ndim = int(sub.ndim)
         elem = Var.type_to_ctype(strip_reference(var.type).dtype)
         shape = [str(int(sub.shape[i])) if i < ndim else "0" for i in range(4)]
@@ -5143,7 +4998,7 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
         elif is_tile_stack(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
         elif var.constant is None:
-            override = _baked_view_ctype(var) if view_baked else None
+            override = _baked_view_ctype(var)
             ctype = override if override is not None else var.ctype()
             lines += [f"{ctype} {var.emit()};\n"]
         else:
@@ -5426,7 +5281,7 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     callee receives only the raw data pointer `<T>* _wp_baked_var_<label>_data`.
     The body references that pointer directly at scheme-B call sites
     (rewritten by `add_call._format_fwd_args` at adj.build() time) and
-    emits a lazy `shape_t` local via `Adjoint._spec_attribute_access`
+    emits a lazy `baked_shape_t<...>` local via `Var.emit_for_attribute`
     for the rare `&arr.shape` access pattern — so no `array_t<T>`
     reconstruction is needed.
 
@@ -5439,8 +5294,6 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
 
     baked_params = baked_params or {}
 
-    from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
     def _array_elem_ctype(array_ctype_str):
         """Extract T from an `array_t<T>` / `wp::array_t<T>` ctype string."""
         lt = array_ctype_str.find("<")
@@ -5451,20 +5304,19 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
 
     # Build the body.  Every baked-array access in the common path has
     # already been emitted correctly for the templated context:
-    # `.data` was rewritten to `_wp_baked_var_<label>_data` at each
-    # scheme-B / baked-wp.func call site by `add_call._format_fwd_args`,
-    # and `&var.shape` was emitted via `Adjoint._spec_attribute_access`
-    # as a lazy shape_t local populated from `Config::<label>_shape_K`.
+    # ``.data`` was rewritten to ``_wp_baked_var_<label>_data`` at each
+    # scheme-B / baked-wp.func call site by ``add_call._format_fwd_args``,
+    # and ``&arr.shape`` was emitted via ``Var.emit_for_attribute`` as a
+    # lazy ``baked_shape_t`` local populated from ``Config::<label>_shape_K``.
     # No body-level post-processing required.
     #
     # The exception is baked arrays passed *by value* to a non-scheme-B,
-    # non-baked-wp.func call (e.g. `wp::store(ptr, arr)` on an
-    # array-of-array_t<T>).  The body references `var_<label>` as a
-    # whole struct, so we still have to materialize it.  We detect this
-    # during adj.build() in `add_call` by recording labels into
-    # `adj._baked_arrays_used_by_value`.
+    # non-baked-wp.func call (e.g. ``wp::store(ptr, arr)`` on an
+    # array-of-array_t<T>).  The body references ``var_<label>`` as a
+    # whole struct, so we still have to materialize it.  ``add_call``
+    # marks each affected arg Var with ``is_used_by_value`` during the
+    # build; we read that flag here.
     forward_body = codegen_func_forward(adj, func_type="function", device=device)
-    used_by_value = getattr(adj, "_baked_arrays_used_by_value", set())
 
     forward_args = []
     baked_decls = ""
@@ -5473,16 +5325,16 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
         var_name = "var_" + arg.label
         if arg.label in baked_params:
             value = baked_params[arg.label]
-            if isinstance(value, array_t_type):
+            if isinstance(value, array_t):
                 # Baked array: raw data pointer ABI, no struct, no prologue
                 # — except when the body passes the array by value, in
-                # which case materialize the full struct with Config::*
+                # which case materialize the full struct with ``Config::*``
                 # values so the copy is correct.
                 array_ctype = arg.ctype()
                 elem_ctype = _array_elem_ctype(array_ctype)
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
-                if arg.label in used_by_value:
+                if arg.is_used_by_value:
                     shape_args = [f"Config::{arg.label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
                     stride_args = [f"Config::{arg.label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
                     baked_decls += (
@@ -5679,21 +5531,19 @@ def codegen_kernel(kernel, device, options):
     baked_decls_inner = ""
 
     if specialize:
-        from warp._src.types import array_t as array_t_type  # noqa: PLC0415
-
         baked_decls_outer = bake_scalar("wp::launch_bounds_t", "dim", baked_args["dim"])
 
         forward_args = []
         for arg in adj.args:
             value = baked_args[arg.label]
-            if isinstance(value, array_t_type):
+            if isinstance(value, array_t):
                 # Baked array: pass the element data pointer as a raw
                 # `T* __restrict__` kernel parameter.  No `array_t<T>`
                 # struct in cmem, no metadata writes in the body.  All
                 # access goes through scheme-B templated address helpers
                 # (which take `T*` + compile-time shape/stride), and the
-                # rare `&arr.shape` read emits a lazy `shape_t` local via
-                # `Adjoint._spec_attribute_access`.
+                # rare `&arr.shape` read emits a lazy `baked_shape_t<...>`
+                # local via `Var.emit_for_attribute`.
                 #
                 # Isolated microbench (apply_impulses, n=200, L40, sm89):
                 #   array_t + dead writes  8.84 us  — NVRTC partial-
@@ -5706,16 +5556,15 @@ def codegen_kernel(kernel, device, options):
                 # shrinks in unexpected directions), but the kernel win
                 # is the stronger signal and the code is cleaner.
                 #
-                # Fallback: if the kernel body passes `var_X` by value to
-                # a builtin that expects `array_t<T>` (e.g. `wp::view`,
-                # `wp::store` on an array-of-arrays), we still need the
-                # struct locally.  `add_call` records those cases into
-                # `adj._baked_arrays_used_by_value` and we reconstruct
-                # the struct from the pointer + baked metadata.
+                # Fallback: if the kernel body passes ``var_X`` by value to
+                # a builtin that expects ``array_t<T>`` (e.g. ``wp::view``,
+                # ``wp::store`` on an array-of-arrays), we still need the
+                # struct locally.  ``add_call`` sets ``arg.is_used_by_value``
+                # on those Vars; we reconstruct the struct from the pointer
+                # + baked metadata.
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
-                used_by_value = getattr(adj, "_baked_arrays_used_by_value", set())
-                if arg.label in used_by_value:
+                if arg.is_used_by_value:
                     var_name = "var_" + arg.label
                     shape_args = [str(int(value.shape[i])) if i < value.ndim else "0" for i in range(4)]
                     stride_args = [str(int(value.strides[i])) if i < value.ndim else "0" for i in range(4)]
