@@ -102,6 +102,14 @@ def reads_shape_runtime(a: wp.array2d(dtype=float), k_in: wp.array(dtype=int), o
         out[0] = a.shape[k]
 
 
+# Exercises arr.ndim on a baked kernel-arg array.
+@wp.kernel
+def reads_ndim(a: wp.array2d(dtype=float), out: wp.array(dtype=int)):
+    tid = wp.tid()
+    if tid == 0:
+        out[0] = a.ndim
+
+
 @wp.kernel
 def views_2d(arr: wp.array2d(dtype=float), out: wp.array(dtype=float)):
     tid = wp.tid()
@@ -266,6 +274,33 @@ class TestKernelSpecialize(unittest.TestCase):
         # End-to-end: the kernel reads back M (since k=1).
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), M)
+
+    def test_codegen_baked_ndim(self):
+        """Verify `arr.ndim` on a baked kernel-arg array constant-folds
+        to the literal at codegen time without going through any struct
+        field access.  Without the spec hook, codegen would emit
+        `var_a.ndim` which fails compile under T*-ABI (no `var_a`).
+        """
+        N, M = 17, 32
+        device = "cuda:0"
+        a = wp.zeros((N, M), dtype=float, device=device)
+        out = wp.zeros(1, dtype=int, device=device)
+
+        new_specs = _run_specialized(reads_ndim, dim=N, inputs=[a, out], device=device)
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # The literal 2 (ndim) appears directly as a const initialiser.
+        self.assertRegex(source, r"const wp::int32 var_\d+ = 2;")
+        # No struct-field access on var_a.
+        self.assertNotIn("var_a.ndim", source)
+
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), 2)
 
     def test_codegen_baked_array_for_view(self):
         """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.

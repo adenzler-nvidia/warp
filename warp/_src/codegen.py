@@ -729,16 +729,18 @@ class Var:
         # and `codegen_func_specialized` for the materialization fallback.
         # The two `_baked_*` context flags determine which of the three
         # data-pointer naming conventions `baked_data_name()` emits.
-        # `_baked_shape_of` points back to the array Var when this Var is
-        # a marker for `arr.shape` (returned by `emit_for_attribute`); the
-        # subscript site reads through to the array's `baked_value` to
-        # constant-propagate `arr.shape[K]` into a literal at codegen time
-        # (or to emit `Config::<label>_shape_K` inside templated wp.funcs).
+        # `_baked_attr_of` is set on a marker Var returned by
+        # `emit_for_attribute` for `arr.shape` or `arr.strides`; it
+        # carries `(array_var, attr_name)` so `emit_indexing` can
+        # constant-propagate `arr.shape[K]` / `arr.strides[K]` into a
+        # literal at codegen time (or `Config::<label>_<shape|stride>_K`
+        # inside templated wp.funcs).  `arr.ndim` is emitted directly
+        # as a constant — no marker needed.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_is_view_result: builtins.bool = False
         self._baked_in_templated_func: builtins.bool = False
-        self._baked_shape_of: "Var | None" = None
+        self._baked_attr_of: "tuple[Var, str] | None" = None
 
     def emit_for_truthiness(self) -> str:
         """C++ expression for this Var in a boolean context.
@@ -777,31 +779,44 @@ class Var:
         otherwise (caller falls through to the generic struct-field
         path).
 
-        Currently only ``.shape`` is recognized.  Returns a *marker*
-        Var with ``_baked_shape_of`` pointing back to ``self`` —
-        subsequent ``arr.shape[K]`` lowering in ``emit_indexing``
-        recognises the marker and:
+        Without this hook, attribute access on a kernel-arg baked
+        array under the T*-ABI emits ``var_<label>.<attr>`` which
+        fails compile because ``var_<label>`` is not in scope (only
+        ``var_<label>_data`` is, the raw pointer parameter).
 
-          - For literal ``K`` in a kernel body or view-result subarray:
-            substitutes ``arr.baked_value.shape[K]`` as a Python
-            constant Var, which flows through Warp's loop unroller and
-            NVRTC's basic constant propagation reliably.
+        Two attributes are handled:
 
-          - For literal ``K`` inside a templated wp.func body: emits
-            ``const wp::int32 var_X = Config::<label>_shape_K;`` so
-            the body remains shared across Config instantiations.
+          - ``"shape"`` — returns a *marker* Var with
+            ``_baked_attr_of = (self, "shape")``.  ``emit_indexing``
+            recognises the marker for ``arr.shape[K]`` and
+            constant-folds via the array's ``baked_value`` (literal K)
+            or emits ``wp::baked_shape_extract<...>(k)`` (runtime K).
 
-          - For runtime ``K`` (rare): emits a call to the templated
-            ``wp::baked_shape_extract<S0, S1, S2, S3>(k)`` free
-            function, which carries the static shape values as
-            template arguments — no struct materialisation, the
-            runtime ternary collapses over compile-time constants.
+          - ``"ndim"`` — emits the constant value directly as a
+            Python constant Var (kernel body / view-result) or
+            ``const wp::int32 var_X = Config::<label>_ndim;``
+            (templated wp.func body).
+
+        Anything else (``.strides``, ``.data``, ``.grad``) — return
+        None, fall through to generic.  ``.strides`` is not a
+        registered attr on ``array_t`` even in non-spec mode (the
+        ``vars`` dict only has ``"shape"``), so user code that uses
+        it doesn't compile in either mode.
         """
-        if not isinstance(self.baked_value, array_t) or attr != "shape":
+        if not isinstance(self.baked_value, array_t):
             return None
-        marker = Var("", shape_t, prefix=False)
-        marker._baked_shape_of = self
-        return marker
+        if attr == "shape":
+            marker = Var("", shape_t, prefix=False)
+            marker._baked_attr_of = (self, attr)
+            return marker
+        if attr == "ndim":
+            use_config = adj.is_user_function and not self._baked_is_view_result
+            if use_config:
+                out = adj.add_var(int32)
+                adj.add_forward(f"const wp::int32 {out.emit()} = Config::{self.label}_ndim;")
+                return out
+            return adj.add_var(int32, constant=int(self.baked_value.ndim))
+        return None
 
     def __str__(self):
         return self.label
@@ -2673,8 +2688,14 @@ class Adjoint:
         # possibly holding differentiable values (for which gradients must be accumulated)
         return type_scalar_type(var_type) in float_types or isinstance(var_type, Struct)
 
-    def _emit_baked_shape_subscript(adj, arr_var, idx_var):
-        """Lower ``arr.shape[K]`` on a baked array.
+    def _emit_baked_metadata_subscript(adj, arr_var, attr, idx_var):
+        """Lower ``arr.shape[K]`` or ``arr.strides[K]`` on a baked array.
+
+        ``attr`` is ``"shape"`` or ``"strides"`` — the lowering is
+        identical except for which 4-int sequence in
+        ``arr.baked_value`` is consulted, and which Config:: member
+        is referenced inside templated wp.func bodies
+        (``Config::<label>_shape_K`` vs ``Config::<label>_stride_K``).
 
         Three cases:
 
@@ -2689,50 +2710,51 @@ class Adjoint:
           2. ``K`` is a Python literal **and** we're inside a templated
              wp.func body (the body is shared across Config
              instantiations): emit ``const wp::int32 var_X =
-             Config::<label>_shape_K;`` so the same body resolves to a
-             different literal per instantiation.
+             Config::<label>_<shape|stride>_K;`` so the same body
+             resolves to a different literal per instantiation.
 
-          3. ``K`` is runtime: emit ``wp::baked_shape_extract<S0,...>(k)``
-             — a templated free function whose template args carry the
-             static shape values.  Runtime ternary collapses to a
-             compare-select chain over compile-time constants; no struct
-             materialisation, no SROA dependency.  Rare — happens only
-             when ``arr.shape[k]`` is reached with a non-literal ``k``
-             (e.g. inside a non-unrollable loop).
+          3. ``K`` is runtime: emit
+             ``wp::baked_shape_extract<V0, V1, V2, V3>(k)`` — a
+             templated free function whose template args carry the
+             static values (shape or strides).  Runtime ternary
+             collapses to a compare-select chain over compile-time
+             constants; no struct materialisation, no SROA dependency.
+             Rare — happens only when the index is non-literal (e.g.
+             inside a non-unrollable loop).
         """
+        # 4-int sequence and Config:: stem differ between shape and strides.
+        seq = arr_var.baked_value.shape if attr == "shape" else arr_var.baked_value.strides
+        config_stem = "shape" if attr == "shape" else "stride"
+        ndim = int(arr_var.baked_value.ndim)
+        use_config = adj.is_user_function and not arr_var._baked_is_view_result
+
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
         if idx_const is None:
             # Runtime K: dispatch to the templated baked_shape_extract
             # so the static values flow through C++ template args without
-            # going through a materialised struct.
-            shape = arr_var.baked_value
-            use_config = adj.is_user_function and not arr_var._baked_is_view_result
-            template_args = []
-            for k in range(4):
-                if k < int(shape.ndim):
-                    if use_config:
-                        template_args.append(f"Config::{arr_var.label}_shape_{k}")
-                    else:
-                        template_args.append(str(int(shape.shape[k])))
-                else:
-                    template_args.append("0")
+            # going through a materialised struct.  The function body is
+            # a generic 4-int select — works for shape or stride values.
+            template_args = [
+                (f"Config::{arr_var.label}_{config_stem}_{k}" if use_config else str(int(seq[k])))
+                if k < ndim else "0"
+                for k in range(4)
+            ]
             out = adj.add_var(int32)
             adj.add_forward(
                 f"const wp::int32 {out.emit()} = wp::baked_shape_extract<{', '.join(template_args)}>({idx_var.emit()});"
             )
             return out
         K = int(idx_const)
-        use_config = adj.is_user_function and not arr_var._baked_is_view_result
         if use_config:
-            rhs = f"Config::{arr_var.label}_shape_{K}"
             out = adj.add_var(int32)
-            adj.add_forward(f"const wp::int32 {out.emit()} = {rhs};")
+            adj.add_forward(
+                f"const wp::int32 {out.emit()} = Config::{arr_var.label}_{config_stem}_{K};"
+            )
             return out
-        # Kernel body / view-result subarray: the literal value of
-        # arr.baked_value.shape[K] IS the value.  Emit a Python
-        # constant Var so loop unrolling and downstream constant
-        # propagation fire automatically.
-        return adj.add_var(int32, constant=int(arr_var.baked_value.shape[K]))
+        # Kernel body / view-result subarray: the literal value IS the
+        # value.  Emit a Python constant Var so loop unrolling and
+        # downstream constant propagation fire automatically.
+        return adj.add_var(int32, constant=int(seq[K]))
 
     def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):
@@ -3516,17 +3538,18 @@ class Adjoint:
                 )
 
         else:
-            # Spec hook: ``arr.shape[K]`` on a baked array.  The target
-            # Var is a marker (``_baked_shape_of`` points at the array
-            # Var); the helper either constant-folds at codegen time
-            # (literal K) or materialises a shape_t local and dispatches
-            # to the generic ``extract`` builtin (runtime K).
+            # Spec hook: ``arr.shape[K]`` or ``arr.strides[K]`` on a
+            # baked array.  The target Var is a marker —
+            # ``_baked_attr_of`` carries ``(array_var, attr_name)``.
+            # The helper constant-folds at codegen time (literal K) or
+            # emits a templated baked_shape_extract call (runtime K).
             if (
                 isinstance(target, Var)
-                and target._baked_shape_of is not None
+                and target._baked_attr_of is not None
                 and len(indices) == 1
             ):
-                return adj._emit_baked_shape_subscript(target._baked_shape_of, indices[0])
+                arr_var, attr_name = target._baked_attr_of
+                return adj._emit_baked_metadata_subscript(arr_var, attr_name, indices[0])
 
             # handles non-array type indexing, e.g: vec3, mat33, etc
             out = adj.add_builtin_call("extract", [target, *indices])
@@ -5351,7 +5374,7 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     The body references that pointer directly at scheme-B call sites
     (rewritten by `add_call._format_fwd_args` at adj.build() time).
     `&arr.shape` reads on a baked array are constant-folded at codegen
-    time via `_emit_baked_shape_subscript`, so no `array_t<T>`
+    time via `_emit_baked_metadata_subscript`, so no `array_t<T>`
     reconstruction is needed for the common case.
 
     Multiple kernel bakings of the same wp.func share one template
@@ -5376,7 +5399,7 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
     # ``.data`` was rewritten to ``_wp_baked_var_<label>_data`` at each
     # scheme-B / baked-wp.func call site by ``add_call._format_fwd_args``,
     # and ``arr.shape[K]`` was constant-folded to ``Config::<label>_shape_K``
-    # at codegen time via ``_emit_baked_shape_subscript``.
+    # at codegen time via ``_emit_baked_metadata_subscript``.
     # No body-level post-processing required.
     #
     # The exception is baked arrays passed *by value* to a non-scheme-B,
@@ -5612,7 +5635,7 @@ def codegen_kernel(kernel, device, options):
                 # access goes through scheme-B templated address helpers
                 # (which take `T*` + compile-time shape/stride), and
                 # `arr.shape[K]` reads are constant-folded at codegen
-                # time via `_emit_baked_shape_subscript`.
+                # time via `_emit_baked_metadata_subscript`.
                 #
                 # Isolated microbench (apply_impulses, n=200, L40, sm89):
                 #   array_t + dead writes  8.84 us  — NVRTC partial-
