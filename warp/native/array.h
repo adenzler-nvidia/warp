@@ -150,6 +150,18 @@ CUDA_CALLABLE inline int extract(const shape_t& s, int i) { return s.dims[i]; }
 
 CUDA_CALLABLE inline void adj_extract(const shape_t& s, int i, const shape_t& adj_s, int adj_i, int adj_ret) { }
 
+// Templated runtime-K shape access for kernel-specialize codegen's
+// baked arrays.  Used when ``arr.shape[k]`` is hit with a non-literal
+// ``k`` (rare — happens when the index is from a non-unrollable loop).
+// Template args carry the static shape values; the runtime ternary
+// collapses to a compare-select chain over compile-time constants
+// without any field reads through a struct.
+template <int S0, int S1, int S2, int S3>
+CUDA_CALLABLE constexpr int baked_shape_extract(int k)
+{
+    return (k == 0) ? S0 : (k == 1) ? S1 : (k == 2) ? S2 : S3;
+}
+
 inline CUDA_CALLABLE void print(shape_t s)
 {
     // todo: only print valid dims, currently shape has a fixed size

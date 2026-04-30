@@ -734,13 +734,11 @@ class Var:
         # subscript site reads through to the array's `baked_value` to
         # constant-propagate `arr.shape[K]` into a literal at codegen time
         # (or to emit `Config::<label>_shape_K` inside templated wp.funcs).
-        # `_baked_shape_local_name` memoizes a runtime-K materialization.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_is_view_result: builtins.bool = False
         self._baked_in_templated_func: builtins.bool = False
         self._baked_shape_of: "Var | None" = None
-        self._baked_shape_local_name: str | None = None
 
     def emit_for_truthiness(self) -> str:
         """C++ expression for this Var in a boolean context.
@@ -793,47 +791,17 @@ class Var:
             ``const wp::int32 var_X = Config::<label>_shape_K;`` so
             the body remains shared across Config instantiations.
 
-          - For runtime ``K`` (rare): lazily materialises a
-            ``wp::shape_t`` local with literal/Config-init writes via
-            ``materialize_baked_shape_local`` and dispatches to the
-            generic ``extract(shape_t&, int)`` builtin.
+          - For runtime ``K`` (rare): emits a call to the templated
+            ``wp::baked_shape_extract<S0, S1, S2, S3>(k)`` free
+            function, which carries the static shape values as
+            template arguments — no struct materialisation, the
+            runtime ternary collapses over compile-time constants.
         """
         if not isinstance(self.baked_value, array_t) or attr != "shape":
             return None
         marker = Var("", shape_t, prefix=False)
         marker._baked_shape_of = self
         return marker
-
-    def materialize_baked_shape_local(self, adj: "Adjoint") -> str:
-        """Declare a ``wp::shape_t`` local at the outermost block,
-        populated from this baked-array Var's metadata, and return its
-        identifier.  Memoised on ``_baked_shape_local_name`` so
-        repeated runtime-K subscripts share one declaration.
-
-        The dims values are Python literals in kernel bodies (and
-        view-result subarrays whose shape was derived from compile-time
-        index shifts) and ``Config::<label>_shape_K`` in templated
-        wp.func bodies.  Either form gives NVRTC a const-init shape_t
-        that the generic ``extract(shape_t&, int)`` builtin can read
-        from per-instantiation.
-        """
-        assert isinstance(self.baked_value, array_t)
-        if self._baked_shape_local_name is None:
-            local = f"__wp_baked_var_{self.label}_shape"
-            self._baked_shape_local_name = local
-            use_config = adj.is_user_function and not self._baked_is_view_result
-            lines = [f"wp::shape_t {local};"]
-            for k in range(int(self.baked_value.ndim)):
-                rhs = f"Config::{self.label}_shape_{k}" if use_config else str(int(self.baked_value.shape[k]))
-                lines.append(f"{local}.dims[{k}] = {rhs};")
-            ndim_rhs = f"Config::{self.label}_ndim" if use_config else str(int(self.baked_value.ndim))
-            lines.append(f"{local}.ndim = {ndim_rhs};")
-            # Prepend at the outermost block so the local is visible
-            # from every nested scope.  Insert in reverse so the lines
-            # land in declaration order.
-            for line in reversed(lines):
-                adj.blocks[0].body_forward.insert(0, adj.indentation + line)
-        return self._baked_shape_local_name
 
     def __str__(self):
         return self.label
@@ -1313,7 +1281,6 @@ class Adjoint:
             a.baked_value = None
             a.is_used_by_value = False
             a._baked_in_templated_func = False
-            a._baked_shape_local_name = None
         baked_args = adj.builder_options.get("baked_args") if adj.builder_options else None
         if isinstance(baked_args, dict):
             for a in adj.args:
@@ -2725,21 +2692,35 @@ class Adjoint:
              Config::<label>_shape_K;`` so the same body resolves to a
              different literal per instantiation.
 
-          3. ``K`` is runtime: lazily materialise a ``wp::shape_t``
-             local (literal/Config-init writes) and return None to let
-             the generic ``extract(shape_t&, int)`` path fire.  Rare —
-             happens only when ``arr.shape[k]`` is reached with a
-             non-literal ``k`` (e.g. inside a non-unrollable loop).
+          3. ``K`` is runtime: emit ``wp::baked_shape_extract<S0,...>(k)``
+             — a templated free function whose template args carry the
+             static shape values.  Runtime ternary collapses to a
+             compare-select chain over compile-time constants; no struct
+             materialisation, no SROA dependency.  Rare — happens only
+             when ``arr.shape[k]`` is reached with a non-literal ``k``
+             (e.g. inside a non-unrollable loop).
         """
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
         if idx_const is None:
-            # Runtime K: materialise the shape_t local and dispatch
-            # through the generic ``extract`` builtin.  Build a local-
-            # name Var with the right identifier so format_args emits
-            # the materialised local at the call site.
-            local_name = arr_var.materialize_baked_shape_local(adj)
-            local_var = Var(local_name, shape_t, prefix=False)
-            return adj.add_builtin_call("extract", [local_var, idx_var])
+            # Runtime K: dispatch to the templated baked_shape_extract
+            # so the static values flow through C++ template args without
+            # going through a materialised struct.
+            shape = arr_var.baked_value
+            use_config = adj.is_user_function and not arr_var._baked_is_view_result
+            template_args = []
+            for k in range(4):
+                if k < int(shape.ndim):
+                    if use_config:
+                        template_args.append(f"Config::{arr_var.label}_shape_{k}")
+                    else:
+                        template_args.append(str(int(shape.shape[k])))
+                else:
+                    template_args.append("0")
+            out = adj.add_var(int32)
+            adj.add_forward(
+                f"const wp::int32 {out.emit()} = wp::baked_shape_extract<{', '.join(template_args)}>({idx_var.emit()});"
+            )
+            return out
         K = int(idx_const)
         use_config = adj.is_user_function and not arr_var._baked_is_view_result
         if use_config:

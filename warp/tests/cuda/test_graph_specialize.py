@@ -91,6 +91,17 @@ def reads_shape(a: wp.array(dtype=float), out: wp.array(dtype=int)):
         out[0] = a.shape[0]
 
 
+# Exercises the runtime-K path: `a.shape[k]` with `k` from a non-
+# unrollable source (the volatile load forces ptxas to keep `k` runtime).
+# The kernel returns 1 if the runtime-K access produces the expected dim.
+@wp.kernel
+def reads_shape_runtime(a: wp.array2d(dtype=float), k_in: wp.array(dtype=int), out: wp.array(dtype=int)):
+    tid = wp.tid()
+    if tid == 0:
+        k = k_in[0]
+        out[0] = a.shape[k]
+
+
 @wp.kernel
 def views_2d(arr: wp.array2d(dtype=float), out: wp.array(dtype=float)):
     tid = wp.tid()
@@ -222,6 +233,39 @@ class TestKernelSpecialize(unittest.TestCase):
         # End-to-end: the kernel reads back N correctly.
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), N)
+
+    def test_codegen_baked_shape_runtime_k(self):
+        """Verify `arr.shape[k]` with runtime ``k`` dispatches through
+        the templated ``wp::baked_shape_extract<S0, S1, S2, S3>(k)``
+        free function, not through a materialised ``shape_t`` local.
+        Static shape values arrive as template args; the runtime
+        ternary collapses over compile-time constants.
+        """
+        N, M = 17, 32
+        device = "cuda:0"
+        a = wp.zeros((N, M), dtype=float, device=device)
+        k_in = wp.array([1], dtype=int, device=device)  # k=1 → expect M
+        out = wp.zeros(1, dtype=int, device=device)
+
+        new_specs = _run_specialized(
+            reads_shape_runtime, dim=N, inputs=[a, k_in, out], device=device
+        )
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # The runtime-K path emits a templated baked_shape_extract call
+        # with the literal shape values as template args.
+        self.assertRegex(source, rf"wp::baked_shape_extract<{N}, {M}, 0, 0>\(")
+        # No materialised shape_t local for this kernel.
+        self.assertNotIn("__wp_baked_var_a_shape", source)
+
+        # End-to-end: the kernel reads back M (since k=1).
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), M)
 
     def test_codegen_baked_array_for_view(self):
         """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.
