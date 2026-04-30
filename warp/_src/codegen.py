@@ -810,7 +810,7 @@ class Var:
             marker._baked_attr_of = (self, attr)
             return marker
         if attr == "ndim":
-            use_config = adj.is_user_function and self._baked_view_source is None
+            use_config = (adj.is_user_function or adj.in_spec_kernel) and self._baked_view_source is None
             if use_config:
                 out = adj.add_var(int32)
                 adj.add_forward(f"const wp::int32 {out.emit()} = {self.label}_ndim;")
@@ -1090,6 +1090,12 @@ class Adjoint:
         adj.func = func
 
         adj.is_user_function = is_user_function
+        # Phase AA: set true while emitting a templated spec kernel body
+        # so attribute access / scheme-B dispatch use bare template-arg
+        # references (``<label>_shape_K`` etc.) instead of the first
+        # caller's literals — same routing that templated wp.func bodies
+        # use, just applied to the kernel body too.
+        adj.in_spec_kernel = False
 
         # whether the generation of the forward code is skipped for this function
         adj.skip_forward_codegen = skip_forward_codegen
@@ -1930,7 +1936,7 @@ class Adjoint:
                 baked_arr = arr_var.baked_value
                 idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
                 if baked_arr.ndim == len(idx_keys):
-                    config_label = arr_var.label if adj.is_user_function else None
+                    config_label = arr_var.label if (adj.is_user_function or adj.in_spec_kernel) else None
                     scheme_b_addr_call = adj.builder.register_specialized_address_helper(baked_arr, config_label)
                     scheme_b_op = func.key
                     for i, fa in enumerate(func_args):
@@ -2706,7 +2712,7 @@ class Adjoint:
         ndim = int(arr_var.baked_value.ndim)
 
         is_view_result = arr_var._baked_view_source is not None
-        templated_kernel_arg = adj.is_user_function and not is_view_result
+        templated_kernel_arg = (adj.is_user_function or adj.in_spec_kernel) and not is_view_result
 
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
         if idx_const is None:
@@ -2735,7 +2741,7 @@ class Adjoint:
             out = adj.add_var(int32)
             adj.add_forward(f"{out.emit()} = {arr_var.label}_{config_stem}_{K};")
             return out
-        if is_view_result and adj.is_user_function:
+        if is_view_result and (adj.is_user_function or adj.in_spec_kernel):
             # Inside a body-shared wp.func: view-result's baked_value
             # carries the first caller's literals.  Emit a runtime read
             # of the typed local's static accessor instead — NVRTC folds
@@ -4740,6 +4746,32 @@ cuda_kernel_template_forward = """
 
 """
 
+# Phase AA: templated spec kernel.  Same body shape as the non-spec
+# template, but with a C++ template prefix carrying every baked value
+# as an NTTP and no `extern "C"` (templates can't have C linkage).
+# NVRTC instantiates the kernel via nvrtcAddNameExpression; the lowered
+# (mangled) symbol is looked up via nvrtcGetLoweredName.  At namespace
+# scope (no enclosing `extern "C"`).
+cuda_spec_kernel_template_forward = """
+
+{line_directive}template <{template_params}>
+{line_directive}{launch_bounds_str}__global__ void {name}_cuda_kernel_forward(
+    {forward_args})
+{{
+{line_directive}    wp::tile_shared_storage_t tile_mem;
+{baked_decls_outer}
+{line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
+{line_directive}         _idx < dim.size;
+{line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
+    {{
+            // reset shared memory allocator
+{line_directive}        wp::tile_shared_storage_t::init();
+{baked_decls_inner}
+{forward_body}{line_directive}    }}
+{line_directive}}}
+
+"""
+
 
 cuda_kernel_template_backward = """
 
@@ -5588,7 +5620,10 @@ def codegen_kernel(kernel, device, options):
         template_forward = cpu_kernel_template_forward
         template_backward = cpu_kernel_template_backward
     elif device == "cuda":
-        template_forward = cuda_kernel_template_forward
+        # Spec mode: use the templated kernel form (Phase AA).
+        baked_args = kernel.options.get("baked_args")
+        is_spec_cuda = bool(isinstance(baked_args, dict) and "dim" in baked_args)
+        template_forward = cuda_spec_kernel_template_forward if is_spec_cuda else cuda_kernel_template_forward
         template_backward = cuda_kernel_template_backward
     else:
         raise ValueError(f"Device {device} is not supported")
@@ -5621,40 +5656,50 @@ def codegen_kernel(kernel, device, options):
     baked_decls_outer = ""
     baked_decls_inner = ""
 
+    # Phase AA: collected for templated spec kernel emission
+    kernel_template_params = []   # signature: ["int dim_shape_0", ..., "float alpha"]
+    kernel_template_values = []   # instantiation: ["256", ..., "2.0f"]
+
     if specialize:
-        baked_decls_outer = bake_scalar("wp::launch_bounds_t", "dim", baked_args["dim"])
+        # Phase AA: every baked value becomes an NTTP on the kernel
+        # template; the kernel body uses bare references to those
+        # template args (no Python literal substitution).  NVRTC
+        # instantiates the requested kernel via nvrtcAddNameExpression
+        # and we look up the lowered (mangled) name from the .symbols
+        # file post-compile.
+        bounds = baked_args["dim"]
+        for k in range(4):
+            kernel_template_params.append(f"int dim_shape_{k}")
+            kernel_template_values.append(str(int(bounds.shape[k])))
+        kernel_template_params.append("int dim_ndim")
+        kernel_template_values.append(str(int(bounds.ndim)))
+        kernel_template_params.append("size_t dim_size")
+        kernel_template_values.append(str(int(bounds.size)))
+        baked_decls_outer = (
+            "    wp::launch_bounds_t dim;\n"
+            "    dim.shape[0] = dim_shape_0;\n"
+            "    dim.shape[1] = dim_shape_1;\n"
+            "    dim.shape[2] = dim_shape_2;\n"
+            "    dim.shape[3] = dim_shape_3;\n"
+            "    dim.ndim = dim_ndim;\n"
+            "    dim.size = dim_size;\n"
+        )
 
         forward_args = []
         for arg in adj.args:
             value = baked_args[arg.label]
             if isinstance(value, array_t):
-                # Baked array: pass the element data pointer as a raw
-                # `T* __restrict__` kernel parameter.  No `array_t<T>`
-                # struct in cmem, no metadata writes in the body.  All
-                # access goes through scheme-B templated address helpers
-                # (which take `T*` + compile-time shape/stride), and
-                # `arr.shape[K]` reads are constant-folded at codegen
-                # time via `_emit_baked_metadata_subscript`.
-                #
-                # Isolated microbench (apply_impulses, n=200, L40, sm89):
-                #   array_t + dead writes  8.84 us  — NVRTC partial-
-                #                                    unrolls inner loop
-                #                                    less, 7 FMAs
-                #   T* __restrict__        8.47 us  — 4× unrolled, 31 FMAs
-                # This is a 4.4% kernel-level speedup on the raw execution
-                # path.  It's partially offset at the Warp-bench level by
-                # some non-kernel overhead (cmem/dispatch cost that
-                # shrinks in unexpected directions), but the kernel win
-                # is the stronger signal and the code is cleaner.
-                #
-                # Fallback: if the kernel body passes ``var_X`` by value to
-                # a builtin that expects ``array_t<T>`` (e.g. ``wp::view``,
-                # ``wp::store`` on an array-of-arrays), we still need the
-                # struct locally.  ``add_call`` sets ``arg.is_used_by_value``
-                # on those Vars; we reconstruct the struct from the pointer
-                # + baked metadata.
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
+                ndim = int(value.ndim)
+                for k in range(4):
+                    kernel_template_params.append(f"int {arg.label}_shape_{k}")
+                    kernel_template_values.append(str(int(value.shape[k])) if k < ndim else "0")
+                for k in range(4):
+                    kernel_template_params.append(f"int {arg.label}_stride_{k}")
+                    kernel_template_values.append(str(int(value.strides[k])) if k < ndim else "0")
+                kernel_template_params.append(f"int {arg.label}_ndim")
+                kernel_template_values.append(str(ndim))
                 if arg.is_used_by_value:
                     baked_decls_inner += bake_array_struct_decl(
                         elem_ctype,
@@ -5662,17 +5707,25 @@ def codegen_kernel(kernel, device, options):
                         value,
                         f"var_{arg.label}_data",
                         pad="        ",
+                        config_label=arg.label,
                     )
             elif isinstance(value, ctypes._SimpleCData):
-                # Scalar: drop from ABI, emit as const inside the body.
-                baked_decls_inner += bake_scalar(arg.ctype(), "var_" + arg.label, value, pad="        ")
+                ctype_str = Var.type_to_ctype(arg.type)
+                raw = value.value
+                if ctype_str == "bool":
+                    literal = "true" if raw else "false"
+                elif ctype_str in ("wp::float32", "float"):
+                    literal = f"{raw!r}f"
+                elif "float" in ctype_str or ctype_str == "double":
+                    literal = repr(raw)
+                else:
+                    literal = str(int(raw))
+                kernel_template_params.append(f"{ctype_str} {arg.label}")
+                kernel_template_values.append(literal)
+                baked_decls_inner += f"        const {ctype_str} var_{arg.label} = {arg.label};\n"
             else:
                 # Anything else (structs, vectors, matrices, tuples, textures, ...)
-                # is passed through as a normal kernel param — bake_scalar only
-                # knows how to emit C++ for array_t / _SimpleCData / launch_bounds_t
-                # and would crash on e.g. a ctypes.Structure.  These args are
-                # still forwarded verbatim, so the kernel receives them through
-                # the regular parameter-packing path.
+                # passes through as a normal kernel param.
                 forward_args.append(arg.ctype() + " var_" + arg.label)
     else:
         forward_args = ["wp::launch_bounds_t dim"]
@@ -5694,6 +5747,8 @@ def codegen_kernel(kernel, device, options):
             "baked_decls_inner": baked_decls_inner,
         }
     )
+    if specialize and device == "cuda":
+        template_fmt_args["template_params"] = ", ".join(kernel_template_params)
     template += template_forward
 
     if options["enable_backward"]:
@@ -5722,7 +5777,17 @@ def codegen_kernel(kernel, device, options):
         template += template_backward
 
     s = template.format(**template_fmt_args)
-    return args_struct + s
+    # Phase AA: spec mode emits a templated kernel — return the C++ name
+    # expression so the caller can register it with NVRTC and look up
+    # the lowered (mangled) symbol after compile.  Non-spec kernels
+    # return None.
+    spec_name_expression = None
+    if specialize and device == "cuda":
+        spec_name_expression = (
+            f"{kernel.get_mangled_name()}_cuda_kernel_forward<"
+            f"{', '.join(kernel_template_values)}>"
+        )
+    return args_struct + s, spec_name_expression
 
 
 def codegen_module(kernel, device, options):

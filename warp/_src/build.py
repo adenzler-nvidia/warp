@@ -42,6 +42,7 @@ def build_cuda(
     arch_suffix="",
     llvm_cuda=False,
     use_precompiled_headers=True,
+    name_expressions=None,
 ) -> None:
     with open(cu_path, "rb") as src_file:
         src = src_file.read()
@@ -71,6 +72,16 @@ def build_cuda(
         # isolated between threads and processes to avoid .pch races.
         pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
         arch_suffix_bytes = arch_suffix.encode("utf-8")
+
+        # Phase AA: NVRTC name expressions for templated spec kernels.
+        if name_expressions:
+            expr_bytes = [e.encode("utf-8") for e in name_expressions]
+            arr_expr = (ctypes.c_char_p * len(expr_bytes))(*expr_bytes)
+            num_expr = len(expr_bytes)
+        else:
+            arr_expr = None
+            num_expr = 0
+
         err = warp._src.context.runtime.core.wp_cuda_compile_program(
             src,
             program_name_bytes,
@@ -94,6 +105,8 @@ def build_cuda(
             arr_link,
             arr_link_sizes,
             arr_link_input_types,
+            num_expr,
+            arr_expr,
         )
         if err != 0:
             raise Exception(f"CUDA kernel build failed with error code {err}")

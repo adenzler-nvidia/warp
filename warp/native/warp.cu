@@ -3807,7 +3807,9 @@ size_t wp_cuda_compile_program(
     size_t num_ltoirs,
     char** ltoirs,
     size_t* ltoir_sizes,
-    int* ltoir_input_types
+    int* ltoir_input_types,
+    int num_name_expressions,
+    const char** name_expressions
 )
 {
     // use file extension to determine whether to output PTX or CUBIN
@@ -3971,6 +3973,17 @@ size_t wp_cuda_compile_program(
     if (!check_nvrtc(res))
         return size_t(res);
 
+    // Phase AA: register C++ name expressions (e.g.
+    // ``"axpy_kernel<256, 4, ..., 2.0f>"``) so NVRTC instantiates the
+    // requested templated kernels and we can later retrieve their
+    // mangled symbols via nvrtcGetLoweredName.
+    for (int i = 0; i < num_name_expressions; ++i) {
+        if (!check_nvrtc(nvrtcAddNameExpression(prog, name_expressions[i]))) {
+            nvrtcDestroyProgram(&prog);
+            return size_t(-1);
+        }
+    }
+
     if (print_debug) {
         printf("NVRTC options:\n");
         for (auto o : opts) {
@@ -4119,6 +4132,29 @@ size_t wp_cuda_compile_program(
 
             if (!write_file(output.data(), output.size(), output_path, output_mode)) {
                 res = nvrtcResult(-1);
+            }
+
+            // Phase AA: write the lowered (mangled) symbol names for
+            // all registered name expressions to ``<output_path>.symbols``.
+            // The Python launch path reads this to find the CUmodule
+            // function symbol corresponding to the desired template
+            // instantiation.
+            if (num_name_expressions > 0 && res == NVRTC_SUCCESS) {
+                std::string symbols_path = std::string(output_path) + ".symbols";
+                FILE* sf = fopen(symbols_path.c_str(), "wt");
+                if (sf == nullptr) {
+                    res = nvrtcResult(-1);
+                } else {
+                    for (int i = 0; i < num_name_expressions; ++i) {
+                        const char* lowered = nullptr;
+                        if (!check_nvrtc(nvrtcGetLoweredName(prog, name_expressions[i], &lowered))) {
+                            res = nvrtcResult(-1);
+                            break;
+                        }
+                        fprintf(sf, "%s\t%s\n", name_expressions[i], lowered);
+                    }
+                    fclose(sf);
+                }
             }
         }
     }

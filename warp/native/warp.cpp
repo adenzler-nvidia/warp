@@ -1139,7 +1139,9 @@ WP_API size_t wp_cuda_compile_program(
     size_t num_ltoirs,
     char** ltoirs,
     size_t* ltoir_sizes,
-    int* ltoir_input_types
+    int* ltoir_input_types,
+    int num_name_expressions,
+    const char** name_expressions
 )
 {
     return 0;

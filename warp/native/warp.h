@@ -527,7 +527,14 @@ WP_API size_t wp_cuda_compile_program(
     size_t num_ltoirs,
     char** ltoirs,
     size_t* ltoir_sizes,
-    int* ltoir_input_types
+    int* ltoir_input_types,
+    // Phase AA: NVRTC name-expression interface for templated kernels.
+    // ``name_expressions`` are C++ expressions like
+    // ``"axpy_kernel<256, 4, 256, 4, 2.0f>"`` that NVRTC instantiates
+    // and exposes as mangled symbols.  Their lowered (mangled) names
+    // are written, one per line, to ``<output_path>.symbols``.
+    int num_name_expressions,
+    const char** name_expressions
 );
 WP_API bool wp_cuda_compile_fft(
     const char* ltoir_output_path,

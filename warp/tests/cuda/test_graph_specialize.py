@@ -233,30 +233,27 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Baked dim and scalar.
-        self.assertIn(f"dim.size = {N}", source)
-        self.assertIn("var_alpha = 2", source)
-        # Baked array ABI: kernel receives `T* __restrict__` directly,
-        # no `array_t<T>` struct on the stack, no metadata writes.
+        # Templated kernel: every baked value is a non-type template
+        # parameter on the kernel template.
+        self.assertRegex(source, r"template <int dim_shape_0,.*int y_shape_0,.*wp::float32 alpha>")
+        # Body uses bare template-arg refs (no Python literal substitution).
+        self.assertIn("dim.size = dim_size;", source)
+        self.assertIn("var_alpha = alpha;", source)
+        # Baked array ABI: kernel receives `T* __restrict__` directly.
         self.assertRegex(source, r"wp::float32\* __restrict__ var_y_data")
         self.assertRegex(source, r"wp::float32\* __restrict__ var_x_data")
-        self.assertNotIn(f"var_y.shape.dims[0] = {N}", source)
-        self.assertNotIn(f"var_x.shape.dims[0] = {N}", source)
-        # Scheme-B helpers: array accesses route through templated baked
-        # helpers in array.h (one template per ndim, instantiated per
-        # (shape, stride, T)).  Call sites pass shape/stride as template
-        # args and the raw data pointer directly.
-        self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(var_x_data,")
-        # array_store collapses to deref of the address helper.
-        self.assertRegex(source, rf"\*wp::wp_address_baked_1d<{N}, 4>\(var_y_data,")
+        # scheme-B address helpers receive shape/stride as template-arg
+        # refs, not literals — NVRTC instantiates with the right values
+        # for this baking via nvrtcAddNameExpression.
+        self.assertRegex(source, r"wp::wp_address_baked_1d<x_shape_0, x_stride_0>\(var_x_data,")
+        self.assertRegex(source, r"\*wp::wp_address_baked_1d<y_shape_0, y_stride_0>\(var_y_data,")
 
     def test_codegen_baked_shape_local(self):
-        """Verify `arr.shape[K]` on a baked array constant-folds to the
-        literal at codegen time — no shape_t local is materialised in
-        the kernel body, and no `extract` call is emitted for the
-        literal-K case.  The literal flows through Warp's constant Var
-        machinery, which downstream consumers (loops, comparisons) see
-        as a compile-time constant.
+        """Verify `arr.shape[K]` on a baked array uses a bare
+        template-arg reference (the kernel is templated; NVRTC
+        substitutes per-instantiation), with no shape_t local
+        materialised.  End-to-end the kernel reads back the correct
+        value.
         """
         N = 123
         device = "cuda:0"
@@ -271,10 +268,10 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # No materialised shape local for the literal-K case.
+        # No materialised shape local.
         self.assertNotIn("__wp_baked_var_a_shape", source)
-        # The literal N should appear directly as a const initialiser.
-        self.assertRegex(source, rf"const wp::int32 var_\d+ = {N};")
+        # Body references the template arg, not a literal.
+        self.assertRegex(source, r"var_\d+ = a_shape_0;")
 
         # End-to-end: the kernel reads back N correctly.
         wp.synchronize_device(device)
@@ -303,9 +300,10 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # The runtime-K path emits a templated baked_shape_extract call
-        # with the literal shape values as template args.
-        self.assertRegex(source, rf"wp::baked_shape_extract<{N}, {M}, 0, 0>\(")
+        # Templated kernel: runtime-K shape access uses
+        # baked_shape_extract with template-arg refs for the in-use
+        # dims (slots beyond ndim are zero-padded).
+        self.assertRegex(source, r"wp::baked_shape_extract<a_shape_0, a_shape_1, 0, 0>\(")
         # No materialised shape_t local for this kernel.
         self.assertNotIn("__wp_baked_var_a_shape", source)
 
@@ -332,8 +330,8 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # The literal 2 (ndim) appears directly as a const initialiser.
-        self.assertRegex(source, r"const wp::int32 var_\d+ = 2;")
+        # Templated kernel: ndim ref points to the template arg, not a literal.
+        self.assertRegex(source, r"var_\d+ = a_ndim;")
         # No struct-field access on var_a.
         self.assertNotIn("var_a.ndim", source)
 
@@ -365,11 +363,11 @@ class TestKernelSpecialize(unittest.TestCase):
         # Row-major (N, M) float32 array → strides[0] = M * 4, strides[1] = 4.
         st0 = M * 4
         st1 = 4
-        # Literal-K path: literal stride as a const.
-        self.assertRegex(source, rf"const wp::int32 var_\d+ = {st0};")
-        # Runtime-K path: templated baked_shape_extract with stride values.
+        # Templated kernel: strides[K] reads the template arg ref.
+        self.assertRegex(source, r"var_\d+ = a_stride_0;")
+        # Runtime-K path: baked_shape_extract with stride template-arg refs.
         self.assertRegex(
-            source, rf"wp::baked_shape_extract<{st0}, {st1}, 0, 0>\("
+            source, r"wp::baked_shape_extract<a_stride_0, a_stride_1, 0, 0>\("
         )
 
         wp.synchronize_device(device)
@@ -396,17 +394,15 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # New emit pattern: one-line baked_array_t with template-arg
-        # shape/strides/ndim.  No reconstructed array_t writes.
+        # Templated kernel: kernel-arg materialized as baked_array_t
+        # with template-arg refs for the in-use dims (extra slots
+        # zero-padded since `bake_array_struct_decl` only fills 0..ndim).
         self.assertRegex(
             source,
-            rf"wp::baked_array_t<wp::float32, 2, {N}, {M}, 0, 0, \d+, \d+, 0, 0>",
+            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0, arr_shape_1, 0, 0, arr_stride_0, arr_stride_1, 0, 0>",
         )
-        self.assertNotIn(f"var_arr.shape.dims[0] = {N};", source)
         # Codegen passes the bare int index through to view (rather than
-        # wrapping in slice_t(i, i, 0)), which dispatches to the templated
-        # baked_array_t int overload that returns a baked_array_t with
-        # shifted template args.
+        # wrapping in slice_t(i, i, 0)).
         self.assertRegex(source, r"wp::view\(var_arr, var_\d+\);")
         self.assertNotIn("wp::slice_t(var_", source)
 
@@ -432,7 +428,12 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        self.assertRegex(source, rf"wp::baked_array_t<wp::float32, 1, {N}, 0, 0, 0,")
+        # Templated kernel: kernel-arg materialized as baked_array_t
+        # with template-arg refs.
+        self.assertRegex(
+            source,
+            r"wp::baked_array_t<wp::float32, maybe_ndim, maybe_shape_0,",
+        )
         self.assertIn("wp::where(var_maybe,", source)
 
         wp.synchronize_device(device)
@@ -460,10 +461,11 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Two int-indexed views chained off the kernel arg.
+        # Two int-indexed views chained off the kernel arg.  Kernel-arg
+        # materialized via templated `baked_array_t<...>` with template-arg refs.
         self.assertRegex(
             source,
-            rf"wp::baked_array_t<wp::float32, 3, {N}, {M}, {K}, 0, \d+, \d+, \d+, 0> var_arr",
+            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0,.*> var_arr",
         )
         # View-result locals declared via decltype(wp::view(...)) — C++
         # template deduction picks the post-view baked_array_t<...> type.
@@ -501,10 +503,11 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # No materialised shape local; the post-view shape M appears
-        # directly as a const literal.
+        # Templated kernel: view-result `.shape[K]` reads the typed
+        # local's static accessor (`baked_shape[K]`); NVRTC folds to
+        # the right per-instantiation value.  No materialised shape_t.
         self.assertNotIn("__wp_baked_var_", source.split("// shared memory")[-1] if "shared memory" in source else "")
-        self.assertRegex(source, rf"const wp::int32 var_\d+ = {M};")
+        self.assertRegex(source, r"var_\d+ = var_\d+\.baked_shape\[0\];")
 
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), M)
@@ -729,14 +732,21 @@ class TestKernelSpecialize(unittest.TestCase):
         new_specs = _run_specialized(scalar_through_func, dim=N, inputs=[a, out, 5.0], device=device)
         self.assertTrue(len(new_specs) > 0)
 
-        # Verify the baked function variant has the scalar constant
+        # Verify the baked function variant exists (a wp.func template
+        # is emitted with `s` as an NTTP).  Templated kernel: the
+        # kernel calls the wp.func template instantiated with the scalar.
         cu_path = _find_spec_cu("scalar_through_func")
         self.assertIsNotNone(cu_path)
         with open(cu_path) as f:
             source = f.read()
         self.assertIn("scale_func_0_baked_", source)
-        # The baked variant should assign the scalar value
-        self.assertIn("var_s = 5", source)
+        # The kernel body references the scalar via the template arg `s`
+        # (NVRTC instantiates per baking via nvrtcAddNameExpression).
+        self.assertIn("var_s = s;", source)
+        # And the wp.func template instantiation in the body uses the
+        # scalar value as a template arg.
+        self.assertIn("scale_func_0_baked_", source)
+        self.assertIn("<5.0f>", source)
 
         np.testing.assert_allclose(out.numpy(), a.numpy() * 5.0, rtol=1e-5)
 

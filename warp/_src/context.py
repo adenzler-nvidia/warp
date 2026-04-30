@@ -2231,6 +2231,11 @@ class ModuleBuilder:
         self.module = module
         self.deferred_functions = []
         self.specialized_functions = {}  # (func_key, spec_hash) -> (func, mangled_name, baked_params)
+        # Phase AA: NVRTC name expressions for templated spec kernels.
+        # Codegen appends ``"<kernel_name>_cuda_kernel_forward<args...>"`` strings
+        # here; the build path passes them to NVRTC and reads back the lowered
+        # mangled symbols from ``<output>.symbols``.
+        self.name_expressions = []
         self.fatbins = {}  # map from <some identifier> to fatbins, to add at link time
         self.ltoirs = {}  # map from lto symbol to lto binary
         self.ltoirs_decl = {}  # map from lto symbol to lto forward declaration
@@ -2418,7 +2423,14 @@ class ModuleBuilder:
         # (set by `_launch_specialized` for spec launches; absent
         # otherwise).  No need for the back channel through
         # ``module.options["baked_args"]``.
-        kernel.adj.build(self, baked_params=kernel.options.get("baked_args"))
+        baked = kernel.options.get("baked_args")
+        # Phase AA: spec kernel body emits with template-arg references
+        # (``<label>_shape_K`` etc.) so codegen branches that pick
+        # template-arg refs vs literals route through the same path
+        # used for templated wp.func bodies.
+        if isinstance(baked, dict) and "dim" in baked:
+            kernel.adj.in_spec_kernel = True
+        kernel.adj.build(self, baked_params=baked)
 
         if kernel.adj.return_var is not None:
             raise WarpCodegenTypeError(f"'{kernel.key}': Error, kernels can't have return values")
@@ -2566,7 +2578,16 @@ class ModuleBuilder:
             source += body
 
         for kernel in self.kernels:
-            source += warp._src.codegen.codegen_kernel(kernel, device=device, options=self.options)
+            kernel_source, name_expression = warp._src.codegen.codegen_kernel(
+                kernel, device=device, options=self.options
+            )
+            source += kernel_source
+            if name_expression is not None:
+                self.name_expressions.append(name_expression)
+                # Stash on the kernel so ``get_kernel_hooks`` can map
+                # the spec name expression to its lowered (mangled) symbol
+                # via ``ModuleExec.lowered_names``.
+                kernel.spec_name_expression = name_expression
             source += warp._src.codegen.codegen_module(kernel, device=device, options=self.options)
 
         # Detect whether this module uses bfloat16; if not, define WP_NO_BFLOAT16
@@ -2600,12 +2621,16 @@ class ModuleExec:
         instance.handle = None
         return instance
 
-    def __init__(self, handle, module_hash, device, meta):
+    def __init__(self, handle, module_hash, device, meta, lowered_names=None):
         self.handle = handle
         self.module_hash = module_hash
         self.device = device
         self.kernel_hooks = {}
         self.meta = meta
+        # Phase AA: maps name expressions (e.g. ``"axpy_HASH_cuda_kernel_forward<256, 4, ...>"``)
+        # to lowered (mangled) symbol names; populated from
+        # ``<binary>.symbols`` at module-load time for templated spec kernels.
+        self.lowered_names = lowered_names or {}
 
     # release the loaded module
     def __del__(self):
@@ -2636,8 +2661,17 @@ class ModuleExec:
 
         if self.device.is_cuda:
             forward_name = name + "_cuda_kernel_forward"
+            # Phase AA: spec kernels are templated and looked up by their
+            # NVRTC-computed mangled name.  ``kernel.spec_name_expression``
+            # is set in ``_launch_specialized``; the .symbols mapping was
+            # parsed at module-load time.
+            spec_expr = getattr(kernel, "spec_name_expression", None)
+            if spec_expr is not None:
+                lookup_name = self.lowered_names.get(spec_expr, spec_expr)
+            else:
+                lookup_name = forward_name
             forward_kernel = runtime.core.wp_cuda_get_kernel(
-                self.device.context, self.handle, forward_name.encode("utf-8")
+                self.device.context, self.handle, lookup_name.encode("utf-8")
             )
 
             if options["enable_backward"]:
@@ -3258,6 +3292,7 @@ class Module:
                         pch_dir=runtime.get_nvrtc_pch_dir(),
                         llvm_cuda=options["llvm_cuda"],
                         use_precompiled_headers=options["use_precompiled_headers"],
+                        name_expressions=builder.name_expressions or None,
                     )
 
             except Exception as e:
@@ -3434,7 +3469,20 @@ class Module:
             elif device.is_cuda:
                 cuda_module = warp._src.build.load_cuda(binary_path, device)
                 if cuda_module is not None:
-                    module_exec = ModuleExec(cuda_module, module_hash, device, meta)
+                    # Phase AA: parse `<binary>.symbols` (written by NVRTC
+                    # via wp_cuda_compile_program when name expressions
+                    # were registered) so the launch path can map a
+                    # templated spec kernel's name expression to its
+                    # lowered (mangled) symbol.
+                    lowered_names = {}
+                    symbols_path = binary_path + ".symbols"
+                    if os.path.exists(symbols_path):
+                        with open(symbols_path) as sf:
+                            for line in sf:
+                                if "\t" in line:
+                                    expr, lowered = line.rstrip("\n").split("\t", 1)
+                                    lowered_names[expr] = lowered
+                    module_exec = ModuleExec(cuda_module, module_hash, device, meta, lowered_names)
                     self.execs[(device.context, active_block_dim)] = module_exec
                 else:
                     module_load_timer.extra_msg = " (error)"
@@ -5722,6 +5770,8 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_char_p),  # ltoirs
                 ctypes.POINTER(ctypes.c_size_t),  # ltoir_sizes
                 ctypes.POINTER(ctypes.c_int),  # ltoir_input_types, each of type nvJitLinkInputType
+                ctypes.c_int,  # num_name_expressions (Phase AA)
+                ctypes.POINTER(ctypes.c_char_p),  # name_expressions
             ]
             self.core.wp_cuda_compile_program.restype = ctypes.c_size_t
 
@@ -9471,6 +9521,37 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     module = get_module(module_name)
     module.options["enable_backward"] = False
 
+    # Phase AA: build the C++ name expression for this baked instantiation.
+    # NVRTC compiles the template instance and exposes its mangled symbol
+    # via ``nvrtcGetLoweredName``; the launch path looks up the lowered
+    # name from ``ModuleExec.lowered_names`` and uses it for
+    # ``cuModuleGetFunction``.  Order must match codegen (codegen_kernel).
+    name_expr_values = [str(int(bounds.shape[k])) for k in range(4)]
+    name_expr_values.append(str(int(bounds.ndim)))
+    name_expr_values.append(str(int(bounds.size)))
+    for arg in kernel.adj.args:
+        v = baked_args[arg.label]
+        if isinstance(v, array_t):
+            ndim = int(v.ndim)
+            name_expr_values += [str(int(v.shape[k])) if k < ndim else "0" for k in range(4)]
+            name_expr_values += [str(int(v.strides[k])) if k < ndim else "0" for k in range(4)]
+            name_expr_values.append(str(ndim))
+        elif isinstance(v, ctypes._SimpleCData):
+            ctype_str = warp._src.codegen.Var.type_to_ctype(arg.type)
+            raw = v.value
+            if ctype_str == "bool":
+                lit = "true" if raw else "false"
+            elif ctype_str in ("wp::float32", "float"):
+                lit = f"{raw!r}f"
+            elif "float" in ctype_str or ctype_str == "double":
+                lit = repr(raw)
+            else:
+                lit = str(int(raw))
+            name_expr_values.append(lit)
+    spec_name_expression = (
+        f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(name_expr_values)}>"
+    )
+
     # The spec module holds a single kernel with a stable identity across
     # all launches that share this baked_hash.  Cache it on the module so
     # repeated launches don't register a fresh Kernel each time: that used
@@ -9501,6 +9582,10 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
             overload_annotations=overload_annotations,
         )
         _spec_kernel_cache[module_name] = spec_kernel
+
+    # Set the name expression every launch (cached path doesn't re-run
+    # codegen, so we can't rely on codegen_kernel's setter).
+    spec_kernel.spec_name_expression = spec_name_expression
 
     module_exec = module.load(device, block_dim)
     if graph is not None:
