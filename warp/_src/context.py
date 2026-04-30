@@ -2394,105 +2394,56 @@ class ModuleBuilder:
         lines.append("}\n")
         return "\n".join(lines)
 
-    def register_specialized_builtin(self, builtin_name, arr_val, elem_ctype, value_ctype=None, config_label=None):
-        """Register a scheme-B baked helper for an array-access builtin.
+    def register_specialized_address_helper(self, arr_val, config_label=None):
+        """Register a scheme-B address helper for the given baked array.
 
-        Shape and stride are expressed as non-type template parameters of
-        a single function template per (builtin_name, ndim).  One template
-        declaration serves every instantiation — so a module that bakes
-        many kernels with different shapes only gets one `wp_address_baked_1d`
-        template declaration and multiple compile-time instantiations.
+        Shape and stride are non-type template parameters of a single
+        function template per ndim:
 
-        The call site passes the template args inline:
+            template<int S0, int S1, int St0, int St1, typename T>
+            T* wp_address_baked_2d(T* data, int i, int j) {
+                return reinterpret_cast<T*>(...);
+            }
 
-            wp::wp_address_baked_1d<1212416, 12>(arr.data, i)
+        One template declaration serves every (shape, stride, T)
+        instantiation — a module with many kernels of different shapes
+        gets one declaration and many compile-time instantiations.
 
-        with `T` deduced from the `data` argument.  Non-type params come
-        first so explicit `<S, St>` works without spelling `T` at the
-        call site.
+        Returns the call-site instantiation string with template args
+        already filled in (e.g. ``wp::wp_address_baked_2d<17, 32, 128, 4>``).
+        Inside templated wp.func bodies (``config_label`` provided) the
+        args are ``Config::<label>_shape_K`` / ``Config::<label>_stride_K``
+        references so the body is shared across Config instantiations.
 
-        This is Phase A of the template transition — same IR as literal
-        baking, but enables later `if constexpr` additions inside the
-        helper body (Phase B).
+        Higher-level operations (``array_store``, ``atomic_*``) reuse
+        this address helper — the codegen wraps the call site at the
+        emission point: ``*addr = value`` for store,
+        ``wp::atomic_X(addr, value)`` for atomics.  Saves ~80 lines of
+        per-builtin scheme-B helper bodies that each just deref/forward.
         """
         ndim = arr_val.ndim
         shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
         strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
 
-        # One template declaration per (builtin_name, ndim).  The template
-        # has `T` deduced from the data pointer and non-type params for
-        # shape / stride (/ value param layout where it differs, e.g.
-        # atomic_cas).  value_ctype is encoded into the key because cas
-        # has a distinct signature (two value params) from add/sub/...; the
-        # template body differs.
-        key_sig = "cas" if builtin_name == "atomic_cas" else ("value" if value_ctype is not None else "none")
-        key = (builtin_name, ndim, key_sig)
+        key = ("address", ndim)
         if key not in self.specialized_builtins:
-            helper_name = f"wp_{builtin_name}_baked_{ndim}d"
-
-            # Template params:  int S0..S{ndim-1}, int St0..St{ndim-1}, typename T.
+            helper_name = f"wp_address_baked_{ndim}d"
             shape_tparams = ", ".join(f"int S{k}" for k in range(ndim))
             stride_tparams = ", ".join(f"int St{k}" for k in range(ndim))
             tparams = f"template<{shape_tparams}, {stride_tparams}, typename T>"
-
             index_params = ", ".join(f"int i{k}" for k in range(ndim))
             offset_parts = [f"((i{k} < 0 ? i{k} + S{k} : i{k}) * St{k})" for k in range(ndim)]
             offset_expr = " + ".join(offset_parts)
-            addr_stmt = f"T* __addr = reinterpret_cast<T*>(reinterpret_cast<char*>(data) + ({offset_expr}));"
-
-            if builtin_name == "address":
-                body = f"""namespace wp {{
+            body = f"""namespace wp {{
 {tparams}
 static __device__ __forceinline__ T* {helper_name}(T* data, {index_params}) {{
-    {addr_stmt}
-    return __addr;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(data) + ({offset_expr}));
 }}
 }}
 """
-            elif builtin_name == "array_store":
-                body = f"""namespace wp {{
-{tparams}
-static __device__ __forceinline__ void {helper_name}(T* data, {index_params}, T value) {{
-    {addr_stmt}
-    *__addr = value;
-}}
-}}
-"""
-            elif builtin_name == "atomic_cas":
-                body = f"""namespace wp {{
-{tparams}
-static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T compare, T value) {{
-    {addr_stmt}
-    return wp::{builtin_name}(__addr, compare, value);
-}}
-}}
-"""
-            elif builtin_name.startswith("atomic_"):
-                body = f"""namespace wp {{
-{tparams}
-static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T value) {{
-    {addr_stmt}
-    return wp::{builtin_name}(__addr, value);
-}}
-}}
-"""
-            else:
-                raise ValueError(f"Scheme-B helper not implemented for builtin '{builtin_name}'")
-
             self.specialized_builtins[key] = (helper_name, body)
 
         helper_name = self.specialized_builtins[key][0]
-        # Build the call-site instantiation.
-        #
-        # When emitted from a *kernel* body, the template args are literal
-        # integers read from the baked value:
-        #     wp_address_baked_1d<1212416, 4>(data, i)
-        #
-        # When emitted from a *templated user wp.func* body (Phase D) the
-        # same baked values are available via the function's `Config`
-        # template parameter — we emit `Config::<label>_shape_k` /
-        # `Config::<label>_stride_k` instead, so the body uses no
-        # literals and is reusable across all instantiations of Config.
         if config_label is None:
             tparam_values = ", ".join(str(x) for x in (*shape, *strides))
         else:
@@ -2500,7 +2451,7 @@ static __device__ __forceinline__ T {helper_name}(T* data, {index_params}, T val
                 [f"Config::{config_label}_shape_{k}" for k in range(ndim)]
                 + [f"Config::{config_label}_stride_{k}" for k in range(ndim)]
             )
-        return f"{helper_name}<{tparam_values}>"
+        return f"wp::{helper_name}<{tparam_values}>"
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []

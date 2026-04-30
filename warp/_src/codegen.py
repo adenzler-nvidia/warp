@@ -727,9 +727,11 @@ class Var:
         # `is_used_by_value` is set true if a baked array is passed by value
         # to a callee that doesn't get rewritten — see `Adjoint.add_call`
         # and `codegen_func_specialized` for the materialization fallback.
-        # The two `_baked_*` context flags determine which of the three
-        # data-pointer naming conventions `baked_data_name()` emits.
-        # `_baked_attr_of` is set on a marker Var returned by
+        # ``_baked_is_view_result`` distinguishes view-result subarrays
+        # from kernel/wp.func args: subarray data is accessed as
+        # ``var_<label>.data`` (the field of a baked_array_t local) vs.
+        # ``var_<label>_data`` (a raw T* parameter).
+        # ``_baked_attr_of`` is set on a marker Var returned by
         # `emit_for_attribute` for `arr.shape` or `arr.strides`; it
         # carries `(array_var, attr_name)` so `emit_indexing` can
         # constant-propagate `arr.shape[K]` / `arr.strides[K]` into a
@@ -747,11 +749,10 @@ class Var:
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_is_view_result: builtins.bool = False
-        self._baked_in_templated_func: builtins.bool = False
         self._baked_attr_of: "tuple[Var, str] | None" = None
         self._baked_view_source: "tuple[Var, int] | None" = None
 
-    def emit_for_truthiness(self) -> str:
+    def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
 
         For baked-array kernel/func args under the T*-ABI, the struct
@@ -760,10 +761,10 @@ class Var:
         `while (arr):`, and `arr1 and arr2` all compile.
         """
         if isinstance(self.baked_value, array_t):
-            return self.baked_data_name()
+            return self.baked_data_name(adj)
         return self.emit()
 
-    def baked_data_name(self) -> str:
+    def baked_data_name(self, adj: "Adjoint") -> str:
         """C++ expression for this Var's data pointer.
 
         Three contexts, three identifiers:
@@ -778,7 +779,7 @@ class Var:
         """
         if self._baked_is_view_result:
             return f"var_{self.label}.data"
-        if self._baked_in_templated_func:
+        if adj.is_user_function:
             return f"_wp_baked_var_{self.label}_data"
         return f"var_{self.label}_data"
 
@@ -1301,14 +1302,12 @@ class Adjoint:
         for a in adj.args:
             a.baked_value = None
             a.is_used_by_value = False
-            a._baked_in_templated_func = False
         baked_args = adj.builder_options.get("baked_args") if adj.builder_options else None
         if isinstance(baked_args, dict):
             for a in adj.args:
                 value = baked_args.get(a.label)
                 if isinstance(value, array_t) and is_array(a.type):
                     a.baked_value = value
-                    a._baked_in_templated_func = adj.is_user_function
                 elif isinstance(value, ctypes._SimpleCData) and type_is_value(a.type):
                     a.baked_value = value
 
@@ -1952,13 +1951,22 @@ class Adjoint:
             "atomic_cas",
             "atomic_exch",
         }
-        # Index of the array arg in fwd_args to rewrite to its data-pointer
-        # name (or None when the arg isn't baked).
+        # Scheme-B dispatch: when an `address`/`array_store`/`atomic_*`
+        # builtin is called on a baked array, register a templated
+        # address helper and let the call-site emission below wrap it
+        # appropriately:
+        #   address     → wp::wp_address_baked_<N>d<...>(data, i, j)
+        #   array_store → *wp::wp_address_baked_<N>d<...>(data, i, j) = value
+        #   atomic_X    → wp::atomic_X(wp::wp_address_baked_<N>d<...>(data, i, j), ...)
+        # Set ``scheme_b_op`` to the original builtin name and
+        # ``scheme_b_addr_call`` to the templated address helper
+        # instantiation; the forward-call construction below uses these
+        # to emit the right pattern instead of going through the
+        # generic ``func_name(args)`` path.
+        scheme_b_op = None
+        scheme_b_addr_call = None
         baked_builtin_arr_idx = None
         if func.is_builtin() and adj.builder is not None and func.key in BAKED_BUILTINS:
-            # The array arg is always the first positional — named ``arr``
-            # in the registrations.  It's either ``bound_args["arr"]`` or
-            # the first bound arg.
             arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
             if (
                 isinstance(arr_var, Var)
@@ -1966,30 +1974,11 @@ class Adjoint:
                 and isinstance(arr_var.baked_value, array_t)
             ):
                 baked_arr = arr_var.baked_value
-                elem_ctype = Var.type_to_ctype(arr_var.type.dtype)
-                # Count actual provided indices (non-None in bound_args)
                 idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
-                # Guard: ndim must match the number of index args we have.
                 if baked_arr.ndim == len(idx_keys):
-                    value_ctype = elem_ctype if (func.key == "array_store" or func.key.startswith("atomic_")) else None
-                    # Inside a templated wp.func body, template args come
-                    # from ``Config::<label>_shape_k`` so the body is
-                    # reusable across Config instantiations.  Sub-array
-                    # shape/stride values aren't carried in the per-Config
-                    # traits struct (they were derived at the view callsite
-                    # from compile-time constants) — emit literals for them
-                    # in every context.
                     config_label = arr_var.label if (adj.is_user_function and not arr_var._baked_is_view_result) else None
-                    func_name = adj.builder.register_specialized_builtin(
-                        func.key,
-                        baked_arr,
-                        elem_ctype,
-                        value_ctype=value_ctype,
-                        config_label=config_label,
-                    )
-                    # Find the position of the array arg in func_args
-                    # so we can rewrite it to its data-pointer name at
-                    # the call site.
+                    scheme_b_addr_call = adj.builder.register_specialized_address_helper(baked_arr, config_label)
+                    scheme_b_op = func.key
                     for i, fa in enumerate(func_args):
                         if isinstance(fa, Var) and fa.label == arr_var.label:
                             baked_builtin_arr_idx = i
@@ -2070,7 +2059,7 @@ class Adjoint:
                 parts = []
                 for i, a in enumerate(args):
                     if i == baked_builtin_arr_idx:
-                        parts.append(a.baked_data_name())
+                        parts.append(a.baked_data_name(adj))
                     else:
                         parts.extend(adj.format_args("var", [a]))
                 arg_str = ", ".join(parts)
@@ -2088,7 +2077,7 @@ class Adjoint:
                 if i < n_params and param_names[i] in _baked_params:
                     val = _baked_params[param_names[i]]
                     if isinstance(val, array_t):
-                        parts.append(a.baked_data_name())
+                        parts.append(a.baked_data_name(adj))
                     # scalar: dropped from the call
                 else:
                     parts.extend(adj.format_args("var", [a]))
@@ -2097,7 +2086,27 @@ class Adjoint:
                 arg_str = f"{{{arg_str}}}"
             return arg_str
 
-        if return_type is None:
+        if scheme_b_op is not None:
+            # Scheme-B: build the call site directly from the address
+            # helper.  args = [arr, i0, ..., i{ndim-1}, value_args...].
+            # The array slot is rewritten to its data-pointer name.
+            arr_var = fwd_args[baked_builtin_arr_idx]
+            n_idx = bound_args["arr"].baked_value.ndim if "arr" in bound_args else next(iter(bound_args.values())).baked_value.ndim
+            data_name = arr_var.baked_data_name(adj)
+            idx_strs = [a.emit() for a in fwd_args[1 : 1 + n_idx]]
+            tail_strs = [a.emit() for a in fwd_args[1 + n_idx :]]
+            addr_expr = f"{scheme_b_addr_call}({data_name}, {', '.join(idx_strs)})"
+            if scheme_b_op == "address":
+                forward_call = f"var_{output} = {addr_expr};"
+            elif scheme_b_op == "array_store":
+                forward_call = f"*{addr_expr} = {tail_strs[0]};"
+            elif scheme_b_op == "atomic_cas":
+                forward_call = f"var_{output} = wp::atomic_cas({addr_expr}, {tail_strs[0]}, {tail_strs[1]});"
+            else:  # atomic_add/sub/min/max/and/or/xor/exch
+                forward_call = f"var_{output} = wp::{scheme_b_op}({addr_expr}, {tail_strs[0]});"
+            replay_call = forward_call
+
+        elif return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
             forward_call = f"{func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
             replay_call = forward_call
@@ -2336,7 +2345,7 @@ class Adjoint:
     # define an if statement
     def begin_if(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if ({cond.emit_for_truthiness()}) {{")
+        adj.add_forward(f"if ({cond.emit_for_truthiness(adj)}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2350,7 +2359,7 @@ class Adjoint:
 
     def begin_else(adj, cond):
         cond = adj.load(cond)
-        adj.add_forward(f"if (!{cond.emit_for_truthiness()}) {{")
+        adj.add_forward(f"if (!{cond.emit_for_truthiness(adj)}) {{")
         adj.add_reverse("}")
 
         adj.indent()
@@ -2441,7 +2450,7 @@ class Adjoint:
         c = adj.eval(cond)
         c = adj.load(c)
 
-        cond_block.body_forward.append(f"if (({c.emit_for_truthiness()}) == false) goto end_{cond_block.label};")
+        cond_block.body_forward.append(f"if (({c.emit_for_truthiness(adj)}) == false) goto end_{cond_block.label};")
 
         # being block around loop
         adj.begin_block()
@@ -2633,7 +2642,7 @@ class Adjoint:
         # behavior as separate guarded blocks would.
         exprs = [adj.load(adj.eval(expr)) for expr in node.values]
         output = adj.add_var(builtins.bool)
-        parts = [e.emit_for_truthiness() for e in exprs]
+        parts = [e.emit_for_truthiness(adj) for e in exprs]
         command = output.emit() + " = " + (" " + op_string + " ").join(parts) + ";"
         adj.add_forward(command)
         return output
@@ -4967,19 +4976,13 @@ def constant_str(value):
         return str(value)
 
 
-def bake_array_metadata(var_name, value, pad="    "):
-    """Generate shape/stride/ndim assignments for an array_t variable."""
-    lines = []
-    for i in range(value.ndim):
-        lines.append(f"{pad}{var_name}.shape.dims[{i}] = {value.shape[i]};\n")
-    for i in range(value.ndim):
-        lines.append(f"{pad}{var_name}.strides[{i}] = {value.strides[i]};\n")
-    lines.append(f"{pad}{var_name}.ndim = {value.ndim};\n")
-    return "".join(lines)
+def bake_scalar(ctype_str, var_name, value, pad="    ", config_label=None):
+    """Generate a const declaration for a baked scalar or launch_bounds_t.
 
-
-def bake_scalar(ctype_str, var_name, value, pad="    "):
-    """Generate a const declaration for a baked scalar or launch_bounds_t."""
+    If ``config_label`` is provided, the RHS is ``Config::<config_label>``
+    (for templated wp.func bodies, where the same body is shared across
+    Config instantiations); otherwise the RHS is the literal value.
+    """
     from warp._src.types import launch_bounds_t  # noqa: PLC0415
 
     if isinstance(value, launch_bounds_t):
@@ -4990,6 +4993,9 @@ def bake_scalar(ctype_str, var_name, value, pad="    "):
         lines.append(f"{pad}{var_name}.size = {value.size};\n")
         return "".join(lines)
 
+    if config_label is not None:
+        return f"{pad}const {ctype_str} {var_name} = Config::{config_label};\n"
+
     if isinstance(value, ctypes._SimpleCData):
         raw = value.value
         if isinstance(raw, builtins.bool):
@@ -4997,6 +5003,31 @@ def bake_scalar(ctype_str, var_name, value, pad="    "):
         return f"{pad}const {ctype_str} {var_name} = {raw};\n"
 
     return f"{pad}const {ctype_str} {var_name} = {constant_str(value)};\n"
+
+
+def bake_array_struct_decl(elem_ctype, var_name, value, data_param, pad="    ", config_label=None):
+    """Generate a ``wp::baked_array_t<T, ...> var_X{data_param};``
+    declaration for a baked array's by-value materialization fallback.
+
+    Used by both ``codegen_kernel`` (T*-ABI fallback when the kernel
+    body passes a baked array by value) and ``codegen_func_specialized``
+    (templated wp.func body, same fallback).  The two contexts differ
+    only in whether the template args are literals or ``Config::*``
+    references — passing ``config_label`` switches between them.
+    """
+    if config_label is not None:
+        ndim_arg = f"Config::{config_label}_ndim"
+        shape_args = [f"Config::{config_label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
+        stride_args = [f"Config::{config_label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
+    else:
+        ndim_arg = str(int(value.ndim))
+        shape_args = [str(int(value.shape[i])) if i < value.ndim else "0" for i in range(4)]
+        stride_args = [str(int(value.strides[i])) if i < value.ndim else "0" for i in range(4)]
+    return (
+        f"{pad}wp::baked_array_t<{elem_ctype}, {ndim_arg}, "
+        f"{', '.join(shape_args)}, {', '.join(stride_args)}> "
+        f"{var_name}{{{data_param}}};\n"
+    )
 
 
 def indent(args, stops=1):
@@ -5485,21 +5516,15 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 # — except when the body passes the array by value, in
                 # which case materialize the full struct with ``Config::*``
                 # values so the copy is correct.
-                array_ctype = arg.ctype()
-                elem_ctype = _array_elem_ctype(array_ctype)
+                elem_ctype = _array_elem_ctype(arg.ctype())
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
                 if arg.is_used_by_value:
-                    shape_args = [f"Config::{arg.label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
-                    stride_args = [f"Config::{arg.label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
-                    baked_decls += (
-                        f"    wp::baked_array_t<{elem_ctype}, Config::{arg.label}_ndim, "
-                        f"{', '.join(shape_args)}, "
-                        f"{', '.join(stride_args)}> "
-                        f"{var_name}{{{data_param}}};\n"
+                    baked_decls += bake_array_struct_decl(
+                        elem_ctype, var_name, value, data_param, pad="    ", config_label=arg.label
                     )
             elif isinstance(value, ctypes._SimpleCData):
-                baked_decls += f"    const {arg.ctype()} {var_name} = Config::{arg.label};\n"
+                baked_decls += bake_scalar(arg.ctype(), var_name, value, pad="    ", config_label=arg.label)
             else:
                 # Unknown baked type — fall back to keeping as an ordinary param.
                 forward_args.append(arg.ctype() + " " + var_name)
@@ -5720,14 +5745,12 @@ def codegen_kernel(kernel, device, options):
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
                 if arg.is_used_by_value:
-                    var_name = "var_" + arg.label
-                    shape_args = [str(int(value.shape[i])) if i < value.ndim else "0" for i in range(4)]
-                    stride_args = [str(int(value.strides[i])) if i < value.ndim else "0" for i in range(4)]
-                    baked_decls_inner += (
-                        f"        wp::baked_array_t<{elem_ctype}, {int(value.ndim)}, "
-                        f"{', '.join(shape_args)}, "
-                        f"{', '.join(stride_args)}> "
-                        f"{var_name}{{var_{arg.label}_data}};\n"
+                    baked_decls_inner += bake_array_struct_decl(
+                        elem_ctype,
+                        f"var_{arg.label}",
+                        value,
+                        f"var_{arg.label}_data",
+                        pad="        ",
                     )
             elif isinstance(value, ctypes._SimpleCData):
                 # Scalar: drop from ABI, emit as const inside the body.

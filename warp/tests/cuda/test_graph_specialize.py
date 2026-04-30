@@ -249,7 +249,8 @@ class TestKernelSpecialize(unittest.TestCase):
         # (builtin, ndim) with many instantiations per module.
         self.assertIn("template<int S0, int St0, typename T>", source)
         self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(var_x_data,")
-        self.assertRegex(source, rf"wp::wp_array_store_baked_1d<{N}, 4>\(var_y_data,")
+        # Scheme-B array_store collapses to deref of the address helper.
+        self.assertRegex(source, rf"\*wp::wp_address_baked_1d<{N}, 4>\(var_y_data,")
 
     def test_codegen_baked_shape_local(self):
         """Verify `arr.shape[K]` on a baked array constant-folds to the
