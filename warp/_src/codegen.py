@@ -1244,7 +1244,7 @@ class Adjoint:
 
     # generate function ssa form and adjoint
     @synchronized
-    def build(adj, builder, default_builder_options=None):
+    def build(adj, builder, default_builder_options=None, baked_params=None):
         # arg Var read/write flags are held during module rebuilds, so we reset here even when skipping a build
         for arg in adj.args:
             arg.is_read = False
@@ -1302,10 +1302,9 @@ class Adjoint:
         for a in adj.args:
             a.baked_value = None
             a.is_used_by_value = False
-        baked_args = adj.builder_options.get("baked_args") if adj.builder_options else None
-        if isinstance(baked_args, dict):
+        if isinstance(baked_params, dict):
             for a in adj.args:
-                value = baked_args.get(a.label)
+                value = baked_params.get(a.label)
                 if isinstance(value, array_t) and is_array(a.type):
                     a.baked_value = value
                 elif isinstance(value, ctypes._SimpleCData) and type_is_value(a.type):
@@ -1750,72 +1749,36 @@ class Adjoint:
             if adj.used_by_backward_kernel:
                 func.adj.used_by_backward_kernel = True
 
-            # Propagate baked values (arrays AND scalars) from caller scope to
-            # the callee's parameter names so nested add_call invocations
-            # inside func.adj.build() can find them in baked_args.
-            #
-            # baked_args is keyed by Python label, which is not unique across
-            # scopes: a kernel arg `foo: wp.array(...)` and an inner-function
-            # local `foo: SomeStruct` are unrelated but share a label.  Two
-            # safeguards keep this robust:
-            #
-            #  1. Type guard:  only propagate when the caller Var's declared
-            #     type matches the baked value kind (array vs scalar).  This
-            #     blocks an array-typed kernel arg from staining a struct-
-            #     typed callee param that happens to share a name.
-            #
-            #  2. Scope cleanup:  entries added by this call's propagation are
-            #     removed again after build_function returns.  They are only
-            #     needed while this callee is being built — leaving them in
-            #     place poisons sibling calls (e.g. two different callees that
-            #     both declare a param named `s` but receive different baked
-            #     values would otherwise share the first's entry).
-            propagated_keys = []
-            if adj.builder is not None:
-                baked_args = adj.builder_options.get("baked_args")
-                if isinstance(baked_args, dict):
-                    for param_name, arg_var in bound_args.items():
-                        if not isinstance(arg_var, Var) or arg_var.baked_value is None:
-                            continue
-                        # Type guard: caller-side Var type must agree with
-                        # the baked-value kind so a label collision (e.g. a
-                        # struct-typed callee param sharing a name with an
-                        # array-typed kernel arg) doesn't poison the callee.
-                        caller_val = arg_var.baked_value
-                        if isinstance(caller_val, array_t) and not is_array(arg_var.type):
-                            continue
-                        if isinstance(caller_val, ctypes._SimpleCData) and not type_is_value(arg_var.type):
-                            continue
-                        if param_name not in baked_args:
-                            baked_args[param_name] = caller_val
-                            propagated_keys.append(param_name)
+            # Propagate baked metadata explicitly to the callee's build.
+            # The caller-side Var carries baked_value; map it onto the
+            # callee's parameter name.  Type guard: only propagate when
+            # the caller-side type matches the baked-value kind, so a
+            # label collision (e.g. an array-typed kernel arg sharing a
+            # name with a struct-typed callee param) doesn't poison
+            # the callee.
+            propagated_baked_params = {}
+            for param_name, arg_var in bound_args.items():
+                if not isinstance(arg_var, Var) or arg_var.baked_value is None:
+                    continue
+                caller_val = arg_var.baked_value
+                if isinstance(caller_val, array_t) and not is_array(arg_var.type):
+                    continue
+                if isinstance(caller_val, ctypes._SimpleCData) and not type_is_value(arg_var.type):
+                    continue
+                propagated_baked_params[param_name] = caller_val
 
-            try:
-                if adj.builder is None:
-                    func.build(None)
-
-                elif func not in adj.builder.functions:
-                    adj.builder.build_function(func)
-                    # add custom grad, replay functions to the list of functions
-                    # to be built later (invalid code could be generated if we built them now)
-                    # so that they are not missed when only the forward function is imported
-                    # from another module
-                    if func.custom_grad_func:
-                        adj.builder.deferred_functions.append(func.custom_grad_func)
-                    if func.custom_replay_func:
-                        adj.builder.deferred_functions.append(func.custom_replay_func)
-            finally:
-                # Scope cleanup: entries added by this call's propagation
-                # must be removed after the callee build returns.  They
-                # were only needed while that callee was being built —
-                # leaving them in place poisons sibling calls that share
-                # a param name (e.g. two callees that both declare ``s``
-                # but expect different baked values).
-                if propagated_keys:
-                    baked_args = adj.builder_options.get("baked_args") if adj.builder is not None else None
-                    if isinstance(baked_args, dict):
-                        for k in propagated_keys:
-                            baked_args.pop(k, None)
+            if adj.builder is None:
+                func.build(None, baked_params=propagated_baked_params)
+            elif func not in adj.builder.functions:
+                adj.builder.build_function(func, baked_params=propagated_baked_params)
+                # add custom grad, replay functions to the list of functions
+                # to be built later (invalid code could be generated if we built them now)
+                # so that they are not missed when only the forward function is imported
+                # from another module
+                if func.custom_grad_func:
+                    adj.builder.deferred_functions.append(func.custom_grad_func)
+                if func.custom_replay_func:
+                    adj.builder.deferred_functions.append(func.custom_replay_func)
 
         # Resolve the return value based on the types and values of the given arguments.
         bound_arg_types = {k: get_arg_type(v) for k, v in bound_args.items()}
@@ -5705,7 +5668,9 @@ def codegen_kernel(kernel, device, options):
         else:
             raise ValueError(f"launch_bounds must be an int or a tuple/list of 1-2 ints, got {type(launch_bounds)}")
 
-    baked_args = options.get("baked_args")
+    # Spec metadata lives on the kernel (set by ``_launch_specialized``),
+    # not on module.options — see ``ModuleBuilder.build_kernel``.
+    baked_args = kernel.options.get("baked_args")
     specialize = bool(isinstance(baked_args, dict) and "dim" in baked_args and device == "cuda")
     baked_decls_outer = ""
     baked_decls_inner = ""

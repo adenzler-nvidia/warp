@@ -520,8 +520,8 @@ class Function:
         bound_args = tuple(bound_args.arguments.values())
         return call_builtin_from_desc(desc, bound_args)
 
-    def build(self, builder: ModuleBuilder | None):
-        self.adj.build(builder)
+    def build(self, builder: ModuleBuilder | None, baked_params: dict | None = None):
+        self.adj.build(builder, baked_params=baked_params)
 
         # complete the function return type after we have analyzed it (inferred from return statement in ast)
         if not self.value_func:
@@ -2067,16 +2067,6 @@ class ModuleHasher:
 
         # configuration parameters
         for opt in sorted(options.keys()):
-            # `baked_args` is a dict of ctypes instances whose `repr()` encodes
-            # a Python object id / memory address.  Each launch creates fresh
-            # ctypes instances (same semantic values, new allocations), so
-            # hashing its repr would produce a different module hash every
-            # launch → rebuild + driver reload per call.  The semantic
-            # identity of the baked values is already encoded in the spec
-            # module's NAME (`<kernel>_spec_<baked_hash>`), so it's
-            # redundant — and harmful — to hash the dict here.
-            if opt == "baked_args":
-                continue
             s = f"{opt}:{options[opt]}"
             ch.update(bytes(s, "utf-8"))
 
@@ -2479,16 +2469,20 @@ static __device__ __forceinline__ T* {helper_name}(T* data, {index_params}) {{
         if kernel.options.get("enable_backward", True):
             kernel.adj.used_by_backward_kernel = True
 
-        kernel.adj.build(self)
+        # Top-level kernel build: pull baked metadata from kernel.options
+        # (set by `_launch_specialized` for spec launches; absent
+        # otherwise).  No need for the back channel through
+        # ``module.options["baked_args"]``.
+        kernel.adj.build(self, baked_params=kernel.options.get("baked_args"))
 
         if kernel.adj.return_var is not None:
             raise WarpCodegenTypeError(f"'{kernel.key}': Error, kernels can't have return values")
 
-    def build_function(self, func):
+    def build_function(self, func, baked_params: dict | None = None):
         if func in self.functions:
             return
         else:
-            func.build(self)
+            func.build(self, baked_params=baked_params)
 
             # use dict to preserve import order
             self.functions[func] = None
@@ -9549,15 +9543,6 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     baked_hash = _hash_baked_args(baked_args, kernel.adj.args, kernel.module.get_module_hash())
     module_name = f"{kernel.key}_spec_{baked_hash}"
     module = get_module(module_name)
-    # `baked_args` here is a dict of ctypes instances.  It's needed by the
-    # code generator (both the outer kernel and nested wp.func calls read
-    # it from `adj.builder_options`), so it has to live on module.options.
-    # But its values have unstable `repr()` (ctypes objects embed their
-    # memory address), which would poison `ModuleHasher` — that's why the
-    # hasher above explicitly skips the `baked_args` key.  The semantic
-    # identity of the baked values is already captured by `baked_hash`,
-    # which is part of the module NAME.
-    module.options["baked_args"] = baked_args
     module.options["enable_backward"] = False
 
     # The spec module holds a single kernel with a stable identity across
