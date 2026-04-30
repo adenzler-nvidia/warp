@@ -2706,54 +2706,34 @@ class Adjoint:
             handles per-caller correctness inside body-shared wp.funcs
             (the local's type uses the wp.func's template args).
         """
-        # 4-int sequence and template-arg stem differ between shape and strides.
-        seq = arr_var.baked_value.shape if attr == "shape" else arr_var.baked_value.strides
+        # template-arg stem differs between shape and strides.
         config_stem = "shape" if attr == "shape" else "stride"
         ndim = int(arr_var.baked_value.ndim)
 
         is_view_result = arr_var._baked_view_source is not None
-        templated_kernel_arg = (adj.is_user_function or adj.in_spec_kernel) and not is_view_result
+        out = adj.add_var(int32)
 
+        # All baked-array attribute access happens inside a templated body
+        # (kernel or wp.func).  Kernel-args reference the wp.func/kernel's
+        # bare template args; view-results read the typed local's static
+        # accessor (`baked_shape`/`baked_strides`).  Both cases let NVRTC
+        # fold to the right per-instantiation value.
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
-        if idx_const is None:
-            # Runtime K: dispatch to a 4-arg select.  For kernel-arg in a
-            # templated body, pass the wp.func's bare template args; for
-            # view-result, read the typed local's static accessor (the
-            # `baked_shape`/`baked_strides` constexpr arrays of `baked_array_t`).
-            out = adj.add_var(int32)
-            if is_view_result:
-                accessor = "baked_shape" if attr == "shape" else "baked_strides"
-                adj.add_forward(
-                    f"{out.emit()} = var_{arr_var.label}.{accessor}[{idx_var.emit()}];"
-                )
-            else:
-                if templated_kernel_arg:
-                    args = [f"{arr_var.label}_{config_stem}_{k}" if k < ndim else "0" for k in range(4)]
-                else:
-                    args = [str(int(seq[k])) if k < ndim else "0" for k in range(4)]
-                adj.add_forward(
-                    f"{out.emit()} = wp::baked_shape_extract<{', '.join(args)}>({idx_var.emit()});"
-                )
+        if is_view_result:
+            accessor = "baked_shape" if attr == "shape" else "baked_strides"
+            k_expr = str(int(idx_const)) if idx_const is not None else idx_var.emit()
+            adj.add_forward(f"{out.emit()} = var_{arr_var.label}.{accessor}[{k_expr}];")
             return out
 
-        K = int(idx_const)
-        if templated_kernel_arg:
-            out = adj.add_var(int32)
-            adj.add_forward(f"{out.emit()} = {arr_var.label}_{config_stem}_{K};")
-            return out
-        if is_view_result and (adj.is_user_function or adj.in_spec_kernel):
-            # Inside a body-shared wp.func: view-result's baked_value
-            # carries the first caller's literals.  Emit a runtime read
-            # of the typed local's static accessor instead — NVRTC folds
-            # to whatever the wp.func's template args deduce per
-            # instantiation.
-            accessor = "baked_shape" if attr == "shape" else "baked_strides"
-            out = adj.add_var(int32)
-            adj.add_forward(f"{out.emit()} = var_{arr_var.label}.{accessor}[{K}];")
-            return out
-        # Kernel body / view-result outside a templated wp.func body:
-        # the literal value IS the value (loop unroller can use it).
-        return adj.add_var(int32, constant=int(seq[K]))
+        # Kernel-arg array.
+        if idx_const is None:
+            args = [f"{arr_var.label}_{config_stem}_{k}" if k < ndim else "0" for k in range(4)]
+            adj.add_forward(
+                f"{out.emit()} = wp::baked_shape_extract<{', '.join(args)}>({idx_var.emit()});"
+            )
+        else:
+            adj.add_forward(f"{out.emit()} = {arr_var.label}_{config_stem}_{int(idx_const)};")
+        return out
 
     def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):
@@ -4948,53 +4928,25 @@ def constant_str(value):
         return str(value)
 
 
-def bake_scalar(ctype_str, var_name, value, pad="    ", config_label=None):
-    """Generate a const declaration for a baked scalar or launch_bounds_t.
-
-    If ``config_label`` is provided, the RHS is ``Config::<config_label>``
-    (for templated wp.func bodies, where the same body is shared across
-    Config instantiations); otherwise the RHS is the literal value.
+def bake_scalar(ctype_str, var_name, label, pad="    "):
+    """Generate ``const T var_X = label;`` for a baked scalar inside a
+    templated body — the RHS is the bare template-arg name (kernel and
+    wp.func bodies are both templates after Phase AA, so all baked
+    scalars resolve via NVRTC instantiation, never literal substitution).
     """
-    from warp._src.types import launch_bounds_t  # noqa: PLC0415
-
-    if isinstance(value, launch_bounds_t):
-        lines = [f"{pad}wp::launch_bounds_t {var_name};\n"]
-        for i in range(4):
-            lines.append(f"{pad}{var_name}.shape[{i}] = {value.shape[i]};\n")
-        lines.append(f"{pad}{var_name}.ndim = {value.ndim};\n")
-        lines.append(f"{pad}{var_name}.size = {value.size};\n")
-        return "".join(lines)
-
-    if config_label is not None:
-        return f"{pad}const {ctype_str} {var_name} = {config_label};\n"
-
-    if isinstance(value, ctypes._SimpleCData):
-        raw = value.value
-        if isinstance(raw, builtins.bool):
-            raw = "true" if raw else "false"
-        return f"{pad}const {ctype_str} {var_name} = {raw};\n"
-
-    return f"{pad}const {ctype_str} {var_name} = {constant_str(value)};\n"
+    return f"{pad}const {ctype_str} {var_name} = {label};\n"
 
 
-def bake_array_struct_decl(elem_ctype, var_name, value, data_param, pad="    ", config_label=None):
-    """Generate a ``wp::baked_array_t<T, ...> var_X{data_param};``
-    declaration for a baked array's by-value materialization fallback.
-
-    Used by both ``codegen_kernel`` (T*-ABI fallback when the kernel
-    body passes a baked array by value) and ``codegen_func_specialized``
-    (templated wp.func body, same fallback).  The two contexts differ
-    only in whether the template args are literals or ``Config::*``
-    references — passing ``config_label`` switches between them.
+def bake_array_struct_decl(elem_ctype, var_name, value, data_param, label, pad="    "):
+    """Generate a ``wp::baked_array_t<T, ...> var_X{data_param};`` local
+    for a baked array's by-value materialization (kernel-arg passed to a
+    non-baked builtin like ``wp::view`` or ``wp::store``).  Template args
+    are bare template-arg references on the enclosing kernel/wp.func
+    template.
     """
-    if config_label is not None:
-        ndim_arg = f"{config_label}_ndim"
-        shape_args = [f"{config_label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
-        stride_args = [f"{config_label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
-    else:
-        ndim_arg = str(int(value.ndim))
-        shape_args = [str(int(value.shape[i])) if i < value.ndim else "0" for i in range(4)]
-        stride_args = [str(int(value.strides[i])) if i < value.ndim else "0" for i in range(4)]
+    ndim_arg = f"{label}_ndim"
+    shape_args = [f"{label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
+    stride_args = [f"{label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
     return (
         f"{pad}wp::baked_array_t<{elem_ctype}, {ndim_arg}, "
         f"{', '.join(shape_args)}, {', '.join(stride_args)}> "
@@ -5461,10 +5413,10 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 forward_args.append(f"{elem_ctype}* {data_param}")
                 if arg.is_used_by_value:
                     baked_decls += bake_array_struct_decl(
-                        elem_ctype, var_name, value, data_param, pad="    ", config_label=arg.label
+                        elem_ctype, var_name, value, data_param, arg.label, pad="    "
                     )
             elif isinstance(value, ctypes._SimpleCData):
-                baked_decls += bake_scalar(arg.ctype(), var_name, value, pad="    ", config_label=arg.label)
+                baked_decls += bake_scalar(arg.ctype(), var_name, arg.label, pad="    ")
             else:
                 # Unknown baked type — fall back to keeping as an ordinary param.
                 forward_args.append(arg.ctype() + " " + var_name)
@@ -5706,8 +5658,8 @@ def codegen_kernel(kernel, device, options):
                         f"var_{arg.label}",
                         value,
                         f"var_{arg.label}_data",
+                        arg.label,
                         pad="        ",
-                        config_label=arg.label,
                     )
             elif isinstance(value, ctypes._SimpleCData):
                 ctype_str = Var.type_to_ctype(arg.type)
