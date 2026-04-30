@@ -273,7 +273,7 @@ template <typename T> struct array_t {
     T* data;
     T* grad;
     shape_t shape;
-    int strides[ARRAY_MAX_DIMS];
+    shape_t strides;
     uint16_t ndim;
     uint16_t flags;
 

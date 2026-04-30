@@ -3949,6 +3949,7 @@ class array(Array[DType, NDim]):
         # member attributes available during code-gen (e.g.: d = array.shape[0])
         return {
             "shape": warp._src.codegen.Var("shape", shape_t),
+            "strides": warp._src.codegen.Var("strides", shape_t),
             "ptr": warp._src.codegen.Var("data", pointer_t(self.dtype)),
         }
 
@@ -4673,6 +4674,7 @@ class fixedarray(array):
         # member attributes available during code-gen (e.g.: d = array.shape[0])
         return {
             "shape": warp._src.codegen.Var("shape", shape_t),
+            "strides": warp._src.codegen.Var("strides", shape_t),
             "ptr": warp._src.codegen.Var("data", pointer_t(self.dtype)),
         }
 
@@ -4983,6 +4985,7 @@ class _ArrayAnnotation(_ArrayAnnotationBase):
         if self._vars_cache is None:
             self._vars_cache = {
                 "shape": warp._src.codegen.Var("shape", shape_t),
+                "strides": warp._src.codegen.Var("strides", shape_t),
                 "ptr": warp._src.codegen.Var("data", pointer_t(self.dtype)),
             }
         return self._vars_cache

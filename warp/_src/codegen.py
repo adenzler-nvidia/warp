@@ -784,11 +784,11 @@ class Var:
         fails compile because ``var_<label>`` is not in scope (only
         ``var_<label>_data`` is, the raw pointer parameter).
 
-        Two attributes are handled:
+        Three attributes are handled:
 
-          - ``"shape"`` — returns a *marker* Var with
-            ``_baked_attr_of = (self, "shape")``.  ``emit_indexing``
-            recognises the marker for ``arr.shape[K]`` and
+          - ``"shape"`` / ``"strides"`` — returns a *marker* Var with
+            ``_baked_attr_of = (self, attr)``.  ``emit_indexing``
+            recognises the marker for ``arr.<attr>[K]`` and
             constant-folds via the array's ``baked_value`` (literal K)
             or emits ``wp::baked_shape_extract<...>(k)`` (runtime K).
 
@@ -797,15 +797,12 @@ class Var:
             ``const wp::int32 var_X = Config::<label>_ndim;``
             (templated wp.func body).
 
-        Anything else (``.strides``, ``.data``, ``.grad``) — return
-        None, fall through to generic.  ``.strides`` is not a
-        registered attr on ``array_t`` even in non-spec mode (the
-        ``vars`` dict only has ``"shape"``), so user code that uses
-        it doesn't compile in either mode.
+        Anything else (``.data``, ``.grad``) — return None, fall
+        through to generic.
         """
         if not isinstance(self.baked_value, array_t):
             return None
-        if attr == "shape":
+        if attr in ("shape", "strides"):
             marker = Var("", shape_t, prefix=False)
             marker._baked_attr_of = (self, attr)
             return marker

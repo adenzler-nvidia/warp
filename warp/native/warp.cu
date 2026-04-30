@@ -1458,14 +1458,14 @@ WP_API bool wp_array_copy_device(void* context, void* dst, void* src, int dst_ty
         src_data = src_arr.data;
         src_ndim = src_arr.ndim;
         src_shape = src_arr.shape.dims;
-        src_strides = src_arr.strides;
+        src_strides = src_arr.strides.dims;
         src_indices = null_indices;
     } else if (src_type == wp::ARRAY_TYPE_INDEXED) {
         const wp::indexedarray_t<void>& src_arr = *static_cast<const wp::indexedarray_t<void>*>(src);
         src_data = src_arr.arr.data;
         src_ndim = src_arr.arr.ndim;
         src_shape = src_arr.shape.dims;
-        src_strides = src_arr.arr.strides;
+        src_strides = src_arr.arr.strides.dims;
         src_indices = src_arr.indices;
     } else if (src_type == wp::ARRAY_TYPE_FABRIC) {
         src_fabricarray = static_cast<const wp::fabricarray_t<void>*>(src);
@@ -1483,14 +1483,14 @@ WP_API bool wp_array_copy_device(void* context, void* dst, void* src, int dst_ty
         dst_data = dst_arr.data;
         dst_ndim = dst_arr.ndim;
         dst_shape = dst_arr.shape.dims;
-        dst_strides = dst_arr.strides;
+        dst_strides = dst_arr.strides.dims;
         dst_indices = null_indices;
     } else if (dst_type == wp::ARRAY_TYPE_INDEXED) {
         const wp::indexedarray_t<void>& dst_arr = *static_cast<const wp::indexedarray_t<void>*>(dst);
         dst_data = dst_arr.arr.data;
         dst_ndim = dst_arr.arr.ndim;
         dst_shape = dst_arr.shape.dims;
-        dst_strides = dst_arr.arr.strides;
+        dst_strides = dst_arr.arr.strides.dims;
         dst_indices = dst_arr.indices;
     } else if (dst_type == wp::ARRAY_TYPE_FABRIC) {
         dst_fabricarray = static_cast<wp::fabricarray_t<void>*>(dst);
@@ -1805,14 +1805,14 @@ WP_API void wp_array_fill_device(void* context, void* arr_ptr, int arr_type, con
         data = arr.data;
         ndim = arr.ndim;
         shape = arr.shape.dims;
-        strides = arr.strides;
+        strides = arr.strides.dims;
         indices = null_indices;
     } else if (arr_type == wp::ARRAY_TYPE_INDEXED) {
         wp::indexedarray_t<void>& ia = *static_cast<wp::indexedarray_t<void>*>(arr_ptr);
         data = ia.arr.data;
         ndim = ia.arr.ndim;
         shape = ia.shape.dims;
-        strides = ia.arr.strides;
+        strides = ia.arr.strides.dims;
         indices = ia.indices;
     } else if (arr_type == wp::ARRAY_TYPE_FABRIC) {
         fa = static_cast<wp::fabricarray_t<void>*>(arr_ptr);

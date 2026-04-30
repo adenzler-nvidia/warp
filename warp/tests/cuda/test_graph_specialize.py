@@ -110,6 +110,20 @@ def reads_ndim(a: wp.array2d(dtype=float), out: wp.array(dtype=int)):
         out[0] = a.ndim
 
 
+# Exercises arr.strides[K] (literal K) and arr.strides[k] (runtime K).
+@wp.kernel
+def reads_strides(
+    a: wp.array2d(dtype=float),
+    k_in: wp.array(dtype=int),
+    out: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid == 0:
+        k = k_in[0]
+        out[0] = a.strides[0]
+        out[1] = a.strides[k]
+
+
 @wp.kernel
 def views_2d(arr: wp.array2d(dtype=float), out: wp.array(dtype=float)):
     tid = wp.tid()
@@ -301,6 +315,42 @@ class TestKernelSpecialize(unittest.TestCase):
 
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), 2)
+
+    def test_codegen_baked_strides(self):
+        """Verify ``arr.strides[K]`` (literal K) constant-folds to the
+        literal stride, and ``arr.strides[k]`` (runtime k) dispatches
+        through the templated ``wp::baked_shape_extract<...>`` free
+        function with the stride values as template args.
+        """
+        N, M = 17, 32
+        device = "cuda:0"
+        a = wp.zeros((N, M), dtype=float, device=device)
+        k_in = wp.array([1], dtype=int, device=device)
+        out = wp.zeros(2, dtype=int, device=device)
+
+        new_specs = _run_specialized(
+            reads_strides, dim=N, inputs=[a, k_in, out], device=device
+        )
+        spec_name = next(iter(new_specs))
+        cu_path = _find_spec_cu(spec_name.replace(".", "_"))
+        self.assertIsNotNone(cu_path)
+
+        with open(cu_path) as f:
+            source = f.read()
+
+        # Row-major (N, M) float32 array → strides[0] = M * 4, strides[1] = 4.
+        st0 = M * 4
+        st1 = 4
+        # Literal-K path: literal stride as a const.
+        self.assertRegex(source, rf"const wp::int32 var_\d+ = {st0};")
+        # Runtime-K path: templated baked_shape_extract with stride values.
+        self.assertRegex(
+            source, rf"wp::baked_shape_extract<{st0}, {st1}, 0, 0>\("
+        )
+
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), st0)
+        self.assertEqual(int(out.numpy()[1]), st1)
 
     def test_codegen_baked_array_for_view(self):
         """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.

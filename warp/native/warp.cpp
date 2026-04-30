@@ -712,14 +712,14 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
         src_data = src_arr.data;
         src_ndim = src_arr.ndim;
         src_shape = src_arr.shape.dims;
-        src_strides = src_arr.strides;
+        src_strides = src_arr.strides.dims;
         src_indices = null_indices;
     } else if (src_type == wp::ARRAY_TYPE_INDEXED) {
         const wp::indexedarray_t<void>& src_arr = *static_cast<const wp::indexedarray_t<void>*>(src);
         src_data = src_arr.arr.data;
         src_ndim = src_arr.arr.ndim;
         src_shape = src_arr.shape.dims;
-        src_strides = src_arr.arr.strides;
+        src_strides = src_arr.arr.strides.dims;
         src_indices = src_arr.indices;
     } else if (src_type == wp::ARRAY_TYPE_FABRIC) {
         src_fabricarray = static_cast<const wp::fabricarray_t<void>*>(src);
@@ -737,14 +737,14 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
         dst_data = dst_arr.data;
         dst_ndim = dst_arr.ndim;
         dst_shape = dst_arr.shape.dims;
-        dst_strides = dst_arr.strides;
+        dst_strides = dst_arr.strides.dims;
         dst_indices = null_indices;
     } else if (dst_type == wp::ARRAY_TYPE_INDEXED) {
         const wp::indexedarray_t<void>& dst_arr = *static_cast<const wp::indexedarray_t<void>*>(dst);
         dst_data = dst_arr.arr.data;
         dst_ndim = dst_arr.arr.ndim;
         dst_shape = dst_arr.shape.dims;
-        dst_strides = dst_arr.arr.strides;
+        dst_strides = dst_arr.arr.strides.dims;
         dst_indices = dst_arr.indices;
     } else if (dst_type == wp::ARRAY_TYPE_FABRIC) {
         dst_fabricarray = static_cast<wp::fabricarray_t<void>*>(dst);
@@ -929,10 +929,10 @@ WP_API void wp_array_fill_host(void* arr_ptr, int arr_type, const void* value_pt
 
     if (arr_type == wp::ARRAY_TYPE_REGULAR) {
         wp::array_t<void>& arr = *static_cast<wp::array_t<void>*>(arr_ptr);
-        array_fill_strided(arr.data, arr.shape.dims, arr.strides, arr.ndim, value_ptr, value_size);
+        array_fill_strided(arr.data, arr.shape.dims, arr.strides.dims, arr.ndim, value_ptr, value_size);
     } else if (arr_type == wp::ARRAY_TYPE_INDEXED) {
         wp::indexedarray_t<void>& ia = *static_cast<wp::indexedarray_t<void>*>(arr_ptr);
-        array_fill_indexed(ia.arr.data, ia.shape.dims, ia.arr.strides, ia.indices, ia.arr.ndim, value_ptr, value_size);
+        array_fill_indexed(ia.arr.data, ia.shape.dims, ia.arr.strides.dims, ia.indices, ia.arr.ndim, value_ptr, value_size);
     } else if (arr_type == wp::ARRAY_TYPE_FABRIC) {
         wp::fabricarray_t<void>& fa = *static_cast<wp::fabricarray_t<void>*>(arr_ptr);
         array_fill_fabric(fa, value_ptr, value_size);
