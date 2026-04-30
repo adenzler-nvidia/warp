@@ -727,30 +727,23 @@ class Var:
         # `is_used_by_value` is set true if a baked array is passed by value
         # to a callee that doesn't get rewritten — see `Adjoint.add_call`
         # and `codegen_func_specialized` for the materialization fallback.
-        # ``_baked_is_view_result`` distinguishes view-result subarrays
-        # from kernel/wp.func args: subarray data is accessed as
-        # ``var_<label>.data`` (the field of a baked_array_t local) vs.
-        # ``var_<label>_data`` (a raw T* parameter).
         # ``_baked_attr_of`` is set on a marker Var returned by
         # `emit_for_attribute` for `arr.shape` or `arr.strides`; it
         # carries `(array_var, attr_name)` so `emit_indexing` can
         # constant-propagate `arr.shape[K]` / `arr.strides[K]` into a
-        # literal at codegen time (or `Config::<label>_<shape|stride>_K`
+        # literal at codegen time (or `<label>_<shape|stride>_K`
         # inside templated wp.funcs).  `arr.ndim` is emitted directly
         # as a constant — no marker needed.
-        # `_baked_view_source` carries the provenance of a view-result
-        # Var: a `(root_var, dims_consumed)` tuple where ``root_var``
-        # is the kernel/wp.func arg the view chain originated from
-        # and ``dims_consumed`` is the total number of dims consumed
-        # back to that root.  Used inside templated wp.func bodies to
-        # rewrite ``slice.shape[K]`` to
-        # ``Config::<root.label>_shape_<dims_consumed + K>`` rather
-        # than baking the first caller's literal into the shared body.
+        # `_baked_view_source` is the immediate source Var of a
+        # view-result; non-None iff this Var is a view-result.  Used by
+        # codegen to emit the local's type as
+        # ``decltype(wp::view(<src>, 0...))``, letting C++ template
+        # deduction handle per-instantiation correctness across
+        # body-shared wp.funcs (no Python-side root/offset provenance).
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
-        self._baked_is_view_result: builtins.bool = False
         self._baked_attr_of: "tuple[Var, str] | None" = None
-        self._baked_view_source: "tuple[Var, int] | None" = None
+        self._baked_view_source: "Var | None" = None
 
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
@@ -777,7 +770,7 @@ class Var:
         The third reads the ``data`` field of the ``baked_array_t<...>``
         local emitted by a preceding ``wp::view`` call.
         """
-        if self._baked_is_view_result:
+        if self._baked_view_source is not None:
             return f"var_{self.label}.data"
         if adj.is_user_function:
             return f"_wp_baked_var_{self.label}_data"
@@ -817,7 +810,7 @@ class Var:
             marker._baked_attr_of = (self, attr)
             return marker
         if attr == "ndim":
-            use_config = adj.is_user_function and not self._baked_is_view_result
+            use_config = adj.is_user_function and self._baked_view_source is None
             if use_config:
                 out = adj.add_var(int32)
                 adj.add_forward(f"const wp::int32 {out.emit()} = {self.label}_ndim;")
@@ -1872,21 +1865,13 @@ class Adjoint:
                         strides=tuple(_src_strides[_consumed:]),
                     )
                     output.baked_value = _sub
-                    output._baked_is_view_result = True
-                    # Track provenance for view-result shape/stride access
-                    # inside templated wp.func bodies.  The body needs
-                    # ``Config::<root>_shape_<offset+K>`` references so
-                    # different Config instantiations resolve to their own
-                    # caller's values — without this, the literal from the
-                    # first caller's baking gets hardcoded into the shared
-                    # template body.  Chains through nested views: if the
-                    # source is itself a view-result, sum its consumed
-                    # count with the new one and inherit its root.
-                    if _src_arr._baked_view_source is not None:
-                        _root, _prev_consumed = _src_arr._baked_view_source
-                        output._baked_view_source = (_root, _prev_consumed + _consumed)
-                    else:
-                        output._baked_view_source = (_src_arr, _consumed)
+                    # Record the immediate source so codegen can emit the
+                    # view-result local's type via ``decltype(wp::view(<src>, 0...))``
+                    # — C++ template deduction handles per-instantiation
+                    # correctness inside body-shared wp.funcs (the source's
+                    # type carries the right template args; the view return
+                    # type follows).  No Python-side provenance needed.
+                    output._baked_view_source = _src_arr
 
         # Scheme B: specialize selected array-access builtins when the array
         # arg is baked.  Emits a `static __device__ __forceinline__` helper
@@ -1935,11 +1920,17 @@ class Adjoint:
                 isinstance(arr_var, Var)
                 and is_array(arr_var.type)
                 and isinstance(arr_var.baked_value, array_t)
+                # View-results are typed `baked_array_t<...>` locals; their
+                # element access is routed via overload resolution to the
+                # baked address overloads in array.h.  Only the kernel/wp.func
+                # arg path needs Python-side scheme-B (raw `T*` + explicit
+                # template args at the call site).
+                and arr_var._baked_view_source is None
             ):
                 baked_arr = arr_var.baked_value
                 idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
                 if baked_arr.ndim == len(idx_keys):
-                    config_label = arr_var.label if (adj.is_user_function and not arr_var._baked_is_view_result) else None
+                    config_label = arr_var.label if adj.is_user_function else None
                     scheme_b_addr_call = adj.builder.register_specialized_address_helper(baked_arr, config_label)
                     scheme_b_op = func.key
                     for i, fa in enumerate(func_args):
@@ -2698,78 +2689,64 @@ class Adjoint:
             args (runtime K).
 
           - **Kernel-arg array inside a templated wp.func body**:
-            ``Config::<arr_var.label>_<stem>_K`` so the shared body
-            resolves correctly per Config instantiation.
+            ``<arr_var.label>_<stem>_K`` (bare template-arg ref) so
+            the shared body resolves correctly per instantiation.
 
-          - **View-result inside a templated wp.func body**: route
-            through provenance.  ``arr_var._baked_view_source`` gives
-            ``(root_arr, dims_consumed)`` — the kernel-arg the view
-            chain originated from and how many dims have been
-            consumed.  ``slice.shape[K]`` becomes
-            ``Config::<root_arr.label>_<stem>_<dims_consumed + K>``,
-            so kernel A and kernel B (which call the same wp.func
-            with arrays of different shapes) get their own values
-            from their own Configs without ever baking a literal
-            into the shared body.
+          - **View-result**: the Var is a typed ``baked_array_t<...>``
+            local.  Static info rides on its type, so attribute access
+            uses the static accessors (``baked_shape[K]`` / ``baked_strides[K]``)
+            for runtime K, or the literal for compile-time K.  No
+            provenance tracking needed — C++ template instantiation
+            handles per-caller correctness inside body-shared wp.funcs
+            (the local's type uses the wp.func's template args).
         """
-        # 4-int sequence and Config:: stem differ between shape and strides.
+        # 4-int sequence and template-arg stem differ between shape and strides.
         seq = arr_var.baked_value.shape if attr == "shape" else arr_var.baked_value.strides
         config_stem = "shape" if attr == "shape" else "stride"
         ndim = int(arr_var.baked_value.ndim)
 
-        # Decide where the values come from:
-        #   templated_kernel_arg → Config::<arr_var.label>_<stem>_K
-        #   templated_view       → Config::<root.label>_<stem>_<offset+K>
-        #   else                 → literal seq[K]
-        templated_kernel_arg = adj.is_user_function and not arr_var._baked_is_view_result
-        templated_view = (
-            adj.is_user_function
-            and arr_var._baked_is_view_result
-            and arr_var._baked_view_source is not None
-        )
-        if templated_view:
-            root, offset = arr_var._baked_view_source
-
-        def value_for(k):
-            """C++ expression for the K-th element of the metadata sequence."""
-            if templated_kernel_arg:
-                return f"{arr_var.label}_{config_stem}_{k}"
-            if templated_view:
-                # Map view-result position k back to root position offset+k.
-                # Only valid for k < view-result.ndim (== ndim here).
-                return f"{root.label}_{config_stem}_{offset + k}"
-            return str(int(seq[k]))
+        is_view_result = arr_var._baked_view_source is not None
+        templated_kernel_arg = adj.is_user_function and not is_view_result
 
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
         if idx_const is None:
-            # Runtime K: dispatch to the templated baked_shape_extract
-            # so the static values flow through C++ template args without
-            # going through a materialised struct.  The function body is
-            # a generic 4-int select — works for shape or stride values.
-            # Emit as plain assignment (not ``const``) so we don't
-            # collide with the prologue's auto-declaration of the Var
-            # at function-body scope.  NVRTC still propagates the
-            # template-arg constants through the assignment.
-            template_args = [value_for(k) if k < ndim else "0" for k in range(4)]
+            # Runtime K: dispatch to a 4-arg select.  For kernel-arg in a
+            # templated body, pass the wp.func's bare template args; for
+            # view-result, read the typed local's static accessor (the
+            # `baked_shape`/`baked_strides` constexpr arrays of `baked_array_t`).
             out = adj.add_var(int32)
-            adj.add_forward(
-                f"{out.emit()} = wp::baked_shape_extract<{', '.join(template_args)}>({idx_var.emit()});"
-            )
+            if is_view_result:
+                accessor = "baked_shape" if attr == "shape" else "baked_strides"
+                adj.add_forward(
+                    f"{out.emit()} = var_{arr_var.label}.{accessor}[{idx_var.emit()}];"
+                )
+            else:
+                if templated_kernel_arg:
+                    args = [f"{arr_var.label}_{config_stem}_{k}" if k < ndim else "0" for k in range(4)]
+                else:
+                    args = [str(int(seq[k])) if k < ndim else "0" for k in range(4)]
+                adj.add_forward(
+                    f"{out.emit()} = wp::baked_shape_extract<{', '.join(args)}>({idx_var.emit()});"
+                )
             return out
 
         K = int(idx_const)
-        if templated_kernel_arg or templated_view:
-            # Templated wp.func body — the value is a per-Config
-            # template-arg reference, not a Python literal.  Emit a
-            # plain assignment to the prologue-declared Var (no
-            # ``const`` redeclaration) so this works at any scope.
+        if templated_kernel_arg:
             out = adj.add_var(int32)
-            adj.add_forward(f"{out.emit()} = {value_for(K)};")
+            adj.add_forward(f"{out.emit()} = {arr_var.label}_{config_stem}_{K};")
             return out
-        # Kernel body / view-result outside templated wp.func: the
-        # literal value IS the value.  Emit a Python constant Var so
-        # loop unrolling and downstream constant propagation fire
-        # automatically.
+        if is_view_result and adj.is_user_function:
+            # Inside a body-shared wp.func: view-result's baked_value
+            # carries the first caller's literals.  Emit a runtime read
+            # of the typed local's static accessor instead — NVRTC folds
+            # to whatever the wp.func's template args deduce per
+            # instantiation.
+            accessor = "baked_shape" if attr == "shape" else "baked_strides"
+            out = adj.add_var(int32)
+            adj.add_forward(f"{out.emit()} = var_{arr_var.label}.{accessor}[{K}];")
+            return out
+        # Kernel body / view-result outside a templated wp.func body:
+        # the literal value IS the value (loop unroller can use it).
         return adj.add_var(int32, constant=int(seq[K]))
 
     def emit_Attribute(adj, node, aggregate=None):
@@ -5101,45 +5078,23 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
 
-    # View-result baked sub-arrays declared as ``wp::baked_array_t<...>``
-    # carry their static shape/stride template args through the body —
-    # without this, the assignment from ``wp::view(baked, ...)`` would
-    # slice the templated return type to plain ``array_t<T>`` and
-    # downstream consumers (``wp::tile_load``, ``wp::tile_store``, ...)
-    # would only see the inherited fields (read OK via NVRTC fold of
-    # the constexpr-init values, but no longer type-encoded).  The Var
-    # carries its own ``baked_value`` and ``_baked_is_view_result``
-    # flag, set by ``add_call`` when a view fires on a baked source.
-    #
-    # Inside a templated wp.func body, the body is shared across
-    # ``Config`` instantiations — so if the view-result Var has
-    # provenance back to a kernel-arg (``_baked_view_source`` set),
-    # emit the template args as ``Config::<root.label>_<stem>_<offset+k>``
-    # references rather than the first caller's literal.  Each Config
-    # instantiation resolves to its own values; the body's source-
-    # level type expression is shared.
+    # View-result baked sub-arrays carry their static shape/stride/ndim
+    # via the C++ type of the local — set by ``add_call`` when ``wp::view``
+    # fires on a baked source.  Emit the local's type as
+    # ``decltype(wp::view(<src>, 0...))`` so C++ template deduction picks
+    # the post-view ``baked_array_t<...>`` type without Python-side
+    # provenance computation.  Inside body-shared wp.funcs, the source's
+    # type already carries the wp.func's template args; the deduced view
+    # return type follows naturally per instantiation.
     def _baked_view_ctype(var):
-        if not (var._baked_is_view_result and isinstance(var.baked_value, array_t)):
+        src = var._baked_view_source
+        if src is None or not isinstance(var.baked_value, array_t):
             return None
         if not is_array(strip_reference(var.type)):
             return None
-        sub = var.baked_value
-        ndim = int(sub.ndim)
-        elem = Var.type_to_ctype(strip_reference(var.type).dtype)
-        if adj.is_user_function and var._baked_view_source is not None:
-            root, offset = var._baked_view_source
-            shape = [
-                f"{root.label}_shape_{offset + i}" if i < ndim else "0"
-                for i in range(4)
-            ]
-            strides = [
-                f"{root.label}_stride_{offset + i}" if i < ndim else "0"
-                for i in range(4)
-            ]
-        else:
-            shape = [str(int(sub.shape[i])) if i < ndim else "0" for i in range(4)]
-            strides = [str(int(sub.strides[i])) if i < ndim else "0" for i in range(4)]
-        return f"wp::baked_array_t<{elem}, {ndim}, {', '.join(shape)}, {', '.join(strides)}>"
+        consumed = int(src.baked_value.ndim) - int(var.baked_value.ndim)
+        zeros = ", ".join(["0"] * consumed)
+        return f"decltype(wp::view(var_{src.label}, {zeros}))"
 
     for var in adj.variables:
         if is_tile(var.type):

@@ -465,12 +465,17 @@ class TestKernelSpecialize(unittest.TestCase):
             source,
             rf"wp::baked_array_t<wp::float32, 3, {N}, {M}, {K}, 0, \d+, \d+, \d+, 0> var_arr",
         )
+        # View-result locals declared via decltype(wp::view(...)) — C++
+        # template deduction picks the post-view baked_array_t<...> type.
+        self.assertRegex(source, r"decltype\(wp::view\(var_arr, 0\)\) var_\d+;")
+        self.assertRegex(source, r"decltype\(wp::view\(var_\d+, 0\)\) var_\d+;")
         self.assertRegex(source, r"wp::view\(var_arr, var_\d+\);")
         self.assertRegex(source, r"wp::view\(var_\d+, var_\d+\);")
-        # Terminal access on the (sub-array of sub-array) uses scheme-B
-        # with the innermost shape (K) and stride (sizeof(float)=4),
-        # routed through `.data` of the outer sub-array local.
-        self.assertRegex(source, rf"wp_address_baked_1d<{K}, 4>\(var_\d+\.data,")
+        # Terminal element access on the (sub-array of sub-array) uses
+        # standard wp::address; overload resolution routes to the baked
+        # variant in array.h via the local's templated type.  No
+        # codegen-emitted scheme-B helper for view-results.
+        self.assertRegex(source, r"wp::address\(var_\d+, var_\d+\);")
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M * K)

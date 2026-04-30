@@ -1452,6 +1452,52 @@ inline CUDA_CALLABLE T* wp_address_baked_4d(T* data, int i0, int i1, int i2, int
         + ((i3 < 0 ? i3 + S3 : i3) * St3));
 }
 
+// Phase Z: views are "just retemplated arrays" — the view-result
+// `baked_array_t<...>` local carries all static info on its type.
+// Element access on view-results goes through standard wp::address /
+// wp::array_store / wp::atomic_* call sites; overload resolution picks
+// these baked-array overloads, deduces S0..., St0... from the type,
+// and delegates to wp_address_baked_<N>d above.  Identical SASS to the
+// scheme-B path used for raw-pointer kernel args.
+#define WP_BAKED_TPL \
+    template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+#define WP_BAKED_AT const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&
+
+WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i)                       { return wp_address_baked_1d<S0, St0>(a.data, i); }
+WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j)                { return wp_address_baked_2d<S0, S1, St0, St1>(a.data, i, j); }
+WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j, int k)         { return wp_address_baked_3d<S0, S1, S2, St0, St1, St2>(a.data, i, j, k); }
+WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j, int k, int l)  { return wp_address_baked_4d<S0, S1, S2, S3, St0, St1, St2, St3>(a.data, i, j, k, l); }
+
+WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, T v)                       { *address(a, i) = v; }
+WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, T v)                { *address(a, i, j) = v; }
+WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, int k, T v)         { *address(a, i, j, k) = v; }
+WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, int k, int l, T v)  { *address(a, i, j, k, l) = v; }
+
+#define WP_BAKED_ATOMIC(op) \
+WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, T v)                       { return op(address(a, i), v); } \
+WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, T v)                { return op(address(a, i, j), v); } \
+WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, int k, T v)         { return op(address(a, i, j, k), v); } \
+WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, int k, int l, T v)  { return op(address(a, i, j, k, l), v); }
+
+WP_BAKED_ATOMIC(atomic_add)
+WP_BAKED_ATOMIC(atomic_sub)
+WP_BAKED_ATOMIC(atomic_min)
+WP_BAKED_ATOMIC(atomic_max)
+WP_BAKED_ATOMIC(atomic_and)
+WP_BAKED_ATOMIC(atomic_or)
+WP_BAKED_ATOMIC(atomic_xor)
+WP_BAKED_ATOMIC(atomic_exch)
+
+#undef WP_BAKED_ATOMIC
+
+WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, T o, T n)                       { return atomic_cas(address(a, i), o, n); }
+WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, T o, T n)                { return atomic_cas(address(a, i, j), o, n); }
+WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, int k, T o, T n)         { return atomic_cas(address(a, i, j, k), o, n); }
+WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, int k, int l, T o, T n)  { return atomic_cas(address(a, i, j, k, l), o, n); }
+
+#undef WP_BAKED_TPL
+#undef WP_BAKED_AT
+
 template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 {
     FP_VERIFY_FWD(value)
