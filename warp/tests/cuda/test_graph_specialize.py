@@ -242,14 +242,12 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertRegex(source, r"wp::float32\* __restrict__ var_x_data")
         self.assertNotIn(f"var_y.shape.dims[0] = {N}", source)
         self.assertNotIn(f"var_x.shape.dims[0] = {N}", source)
-        # Scheme-B helpers: array accesses route through per-module baked
-        # helpers that take the raw pointer directly.  In the template
-        # form (Phase A), shape + stride are non-type template params,
-        # so the helper itself has no hash suffix — one template per
-        # (builtin, ndim) with many instantiations per module.
-        self.assertIn("template<int S0, int St0, typename T>", source)
+        # Scheme-B helpers: array accesses route through templated baked
+        # helpers in array.h (one template per ndim, instantiated per
+        # (shape, stride, T)).  Call sites pass shape/stride as template
+        # args and the raw data pointer directly.
         self.assertRegex(source, rf"wp::wp_address_baked_1d<{N}, 4>\(var_x_data,")
-        # Scheme-B array_store collapses to deref of the address helper.
+        # array_store collapses to deref of the address helper.
         self.assertRegex(source, rf"\*wp::wp_address_baked_1d<{N}, 4>\(var_y_data,")
 
     def test_codegen_baked_shape_local(self):

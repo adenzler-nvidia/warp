@@ -1415,6 +1415,43 @@ inline CUDA_CALLABLE void array_store(const A<T>& buf, int i, int j, int k, int 
     index(buf, i, j, k, l) = value;
 }
 
+// Phase X: scheme-B address helpers for baked arrays — one template
+// per ndim, instantiated per (shape, stride, T) by codegen call sites.
+// Codegen emits e.g. `wp::wp_address_baked_2d<S0, S1, St0, St1>(data,
+// i, j)` for a baked-array element access.  No JIT helper emission;
+// the templates live here statically.  array_store / atomic_X reuse
+// these by wrapping the call site inline (`*addr = v`, `wp::atomic_X(addr, v)`).
+template <int S0, int St0, typename T>
+inline CUDA_CALLABLE T* wp_address_baked_1d(T* data, int i0)
+{
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
+        + ((i0 < 0 ? i0 + S0 : i0) * St0));
+}
+template <int S0, int S1, int St0, int St1, typename T>
+inline CUDA_CALLABLE T* wp_address_baked_2d(T* data, int i0, int i1)
+{
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
+        + ((i0 < 0 ? i0 + S0 : i0) * St0)
+        + ((i1 < 0 ? i1 + S1 : i1) * St1));
+}
+template <int S0, int S1, int S2, int St0, int St1, int St2, typename T>
+inline CUDA_CALLABLE T* wp_address_baked_3d(T* data, int i0, int i1, int i2)
+{
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
+        + ((i0 < 0 ? i0 + S0 : i0) * St0)
+        + ((i1 < 0 ? i1 + S1 : i1) * St1)
+        + ((i2 < 0 ? i2 + S2 : i2) * St2));
+}
+template <int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, typename T>
+inline CUDA_CALLABLE T* wp_address_baked_4d(T* data, int i0, int i1, int i2, int i3)
+{
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
+        + ((i0 < 0 ? i0 + S0 : i0) * St0)
+        + ((i1 < 0 ? i1 + S1 : i1) * St1)
+        + ((i2 < 0 ? i2 + S2 : i2) * St2)
+        + ((i3 < 0 ? i3 + S3 : i3) * St3));
+}
+
 template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 {
     FP_VERIFY_FWD(value)

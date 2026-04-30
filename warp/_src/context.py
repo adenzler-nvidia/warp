@@ -2236,12 +2236,6 @@ class ModuleBuilder:
         self.ltoirs_decl = {}  # map from lto symbol to lto forward declaration
         self.shared_memory_bytes = {}  # map from lto symbol to shared memory requirements
 
-        # Scheme B: helpers for array-access builtins specialized with
-        # baked shape/stride.  Keyed by hash of
-        # (builtin_name, ndim, elem_ctype, shape_tuple, stride_tuple, value_ctype).
-        # Value is the full C++ body for the helper (including signature).
-        self.specialized_builtins = {}  # hash_key -> (helper_name, helper_code)
-
         if hasher is None:
             hasher = ModuleHasher(module._get_live_kernels(), options)
 
@@ -2368,63 +2362,33 @@ class ModuleBuilder:
         return f"wp::{template_name}<{', '.join(template_values)}>"
 
     def register_specialized_address_helper(self, arr_val, config_label=None):
-        """Register a scheme-B address helper for the given baked array.
+        """Format the scheme-B address helper call-site for a baked array.
 
-        Shape and stride are non-type template parameters of a single
-        function template per ndim:
+        The helper templates (``wp::wp_address_baked_<N>d<S..., St..., T>(data, i...)``)
+        live as static templates in ``warp/native/array.h`` — one template per
+        ndim, instantiated per (shape, stride, T) at every call site.  This
+        method just formats the per-call instantiation prefix:
 
-            template<int S0, int S1, int St0, int St1, typename T>
-            T* wp_address_baked_2d(T* data, int i, int j) {
-                return reinterpret_cast<T*>(...);
-            }
+            wp::wp_address_baked_2d<17, 32, 128, 4>
 
-        One template declaration serves every (shape, stride, T)
-        instantiation — a module with many kernels of different shapes
-        gets one declaration and many compile-time instantiations.
-
-        Returns the call-site instantiation string with template args
-        already filled in (e.g. ``wp::wp_address_baked_2d<17, 32, 128, 4>``).
-        Inside templated wp.func bodies (``config_label`` provided) the
-        args are ``Config::<label>_shape_K`` / ``Config::<label>_stride_K``
-        references so the body is shared across Config instantiations.
-
-        Higher-level operations (``array_store``, ``atomic_*``) reuse
-        this address helper — the codegen wraps the call site at the
-        emission point: ``*addr = value`` for store,
-        ``wp::atomic_X(addr, value)`` for atomics.  Saves ~80 lines of
-        per-builtin scheme-B helper bodies that each just deref/forward.
+        With ``config_label`` set (templated wp.func body), the template
+        args are bare-name refs (``<label>_shape_K``, ``<label>_stride_K``)
+        so the body is shared across instantiations.  Higher-level
+        operations (``array_store``, ``atomic_*``) reuse this helper —
+        the codegen wraps the call site inline (``*addr = v`` for store,
+        ``wp::atomic_X(addr, v)`` for atomics).
         """
         ndim = arr_val.ndim
-        shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
-        strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
-
-        key = ("address", ndim)
-        if key not in self.specialized_builtins:
-            helper_name = f"wp_address_baked_{ndim}d"
-            shape_tparams = ", ".join(f"int S{k}" for k in range(ndim))
-            stride_tparams = ", ".join(f"int St{k}" for k in range(ndim))
-            tparams = f"template<{shape_tparams}, {stride_tparams}, typename T>"
-            index_params = ", ".join(f"int i{k}" for k in range(ndim))
-            offset_parts = [f"((i{k} < 0 ? i{k} + S{k} : i{k}) * St{k})" for k in range(ndim)]
-            offset_expr = " + ".join(offset_parts)
-            body = f"""namespace wp {{
-{tparams}
-static __device__ __forceinline__ T* {helper_name}(T* data, {index_params}) {{
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(data) + ({offset_expr}));
-}}
-}}
-"""
-            self.specialized_builtins[key] = (helper_name, body)
-
-        helper_name = self.specialized_builtins[key][0]
         if config_label is None:
+            shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
+            strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
             tparam_values = ", ".join(str(x) for x in (*shape, *strides))
         else:
             tparam_values = ", ".join(
                 [f"{config_label}_shape_{k}" for k in range(ndim)]
                 + [f"{config_label}_stride_{k}" for k in range(ndim)]
             )
-        return f"wp::{helper_name}<{tparam_values}>"
+        return f"wp::wp_address_baked_{ndim}d<{tparam_values}>"
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []
@@ -2545,16 +2509,6 @@ static __device__ __forceinline__ T* {helper_name}(T* data, {index_params}) {{
         # only sees generic functions.
         grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
         non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
-
-        # Emit scheme-B baked builtin helpers (address / array_store / atomic_*
-        # with shape/stride baked as immediates).  Emit before any function body
-        # so that both user wp.func baked variants and kernel bodies can call
-        # them.  These are small `static __device__ __forceinline__` wrappers
-        # that delegate to the scalar primitive or do direct pointer arithmetic.
-        for _key, (_helper_name, helper_code) in self.specialized_builtins.items():
-            source += helper_code
-        if self.specialized_builtins:
-            source += "\n"
 
         # Emit forward declarations for baked function variants before any
         # function bodies.  The adjoint build (in __init__) rewrites function
