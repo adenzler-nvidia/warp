@@ -2325,23 +2325,21 @@ class ModuleBuilder:
                 template_params.append(f"int {label}_ndim")
                 template_values.append(str(int(val.ndim)))
             elif isinstance(val, ctypes._SimpleCData):
-                warp_type = func.input_types.get(label) if getattr(func, "input_types", None) else None
-                ctype_str = Var.type_to_ctype(warp_type) if warp_type is not None else None
+                # The Warp type drives both the C++ NTTP type and the
+                # literal format — single source of truth via
+                # ``Var.type_to_ctype``.  No isinstance dispatch on the
+                # Python value.
+                warp_type = func.input_types[label]
+                ctype_str = Var.type_to_ctype(warp_type)
                 raw = val.value
-                if isinstance(raw, bool):
+                if ctype_str == "bool":
                     literal = "true" if raw else "false"
-                    ctype_str = ctype_str or "bool"
-                elif isinstance(raw, int):
-                    literal = str(raw)
-                    ctype_str = ctype_str or "int"
-                elif isinstance(raw, float):
-                    if ctype_str is None or ctype_str in ("wp::float32", "float"):
-                        literal = f"{raw!r}f"
-                        ctype_str = ctype_str or "float"
-                    else:
-                        literal = repr(raw)
+                elif ctype_str in ("wp::float32", "float"):
+                    literal = f"{raw!r}f"
+                elif "float" in ctype_str or ctype_str == "double":
+                    literal = repr(raw)
                 else:
-                    raise ValueError(f"unsupported baked scalar value for '{label}': {type(val).__name__}")
+                    literal = str(int(raw))
                 template_params.append(f"{ctype_str} {label}")
                 template_values.append(literal)
             else:
