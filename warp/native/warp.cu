@@ -3856,7 +3856,7 @@ size_t wp_cuda_compile_program(
     std::vector<const char*> opts;
     opts.push_back(arch_opt);
     opts.push_back(include_opt);
-    opts.push_back("--std=c++17");
+    opts.push_back("--std=c++20");
 
     // CUDA 12.9+ supports --Ofast-compile
 #if CUDA_VERSION >= 12090
