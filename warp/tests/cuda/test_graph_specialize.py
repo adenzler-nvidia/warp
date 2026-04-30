@@ -153,6 +153,31 @@ def view_then_shape(arr: wp.array2d(dtype=float), out: wp.array(dtype=int)):
         out[0] = slice.shape[0]
 
 
+# Exercises the Phase D body-sharing path: a wp.func that views one of
+# its array args and reads the view-result's shape, called twice from
+# the same kernel with two differently-shaped arrays.  Phase D shares
+# one template body across both bakings via Config:: traits — without
+# provenance tracking on view-result Vars, the body would bake in the
+# first caller's literal and the second call would silently get the
+# wrong answer.
+@wp.func
+def view_inner_shape(a: wp.array2d(dtype=float)) -> int:
+    s = a[0]
+    return s.shape[0]
+
+
+@wp.kernel
+def view_inner_shape_caller(
+    a: wp.array2d(dtype=float),
+    b: wp.array2d(dtype=float),
+    out: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    if tid == 0:
+        out[0] = view_inner_shape(a)
+        out[1] = view_inner_shape(b)
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -479,6 +504,35 @@ class TestKernelSpecialize(unittest.TestCase):
 
         wp.synchronize_device(device)
         self.assertEqual(int(out.numpy()[0]), M)
+
+    def test_view_result_shape_in_templated_func_two_callers(self):
+        """Phase D body-sharing correctness: a wp.func that views one
+        of its array args and reads the view-result's shape, called
+        twice from the same kernel with arrays of different shapes,
+        must produce the right answer for each call — not bake the
+        first caller's literal into the shared body.
+
+        Phase D registers ONE C++ template per (function, label-set)
+        and instantiates it with different ``Config`` traits per call.
+        Without provenance tracking on view-result Vars,
+        ``s.shape[0]`` inside ``view_inner_shape`` would emit
+        ``const int = M1`` from whichever call was built first, and
+        the second call would silently get the wrong answer.
+        """
+        device = "cuda:0"
+        N1, M1 = 8, 5
+        N2, M2 = 16, 11
+        a = wp.zeros((N1, M1), dtype=float, device=device)
+        b = wp.zeros((N2, M2), dtype=float, device=device)
+        out = wp.zeros(2, dtype=int, device=device)
+
+        _run_specialized(
+            view_inner_shape_caller, dim=N1, inputs=[a, b, out], device=device
+        )
+
+        wp.synchronize_device(device)
+        self.assertEqual(int(out.numpy()[0]), M1, "first call saw wrong shape from view-result")
+        self.assertEqual(int(out.numpy()[1]), M2, "second call saw wrong shape from view-result")
 
     def test_codegen_nested_func_variants(self):
         """Verify baked function variants are generated for nested wp.func calls."""

@@ -736,11 +736,20 @@ class Var:
         # literal at codegen time (or `Config::<label>_<shape|stride>_K`
         # inside templated wp.funcs).  `arr.ndim` is emitted directly
         # as a constant — no marker needed.
+        # `_baked_view_source` carries the provenance of a view-result
+        # Var: a `(root_var, dims_consumed)` tuple where ``root_var``
+        # is the kernel/wp.func arg the view chain originated from
+        # and ``dims_consumed`` is the total number of dims consumed
+        # back to that root.  Used inside templated wp.func bodies to
+        # rewrite ``slice.shape[K]`` to
+        # ``Config::<root.label>_shape_<dims_consumed + K>`` rather
+        # than baking the first caller's literal into the shared body.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_is_view_result: builtins.bool = False
         self._baked_in_templated_func: builtins.bool = False
         self._baked_attr_of: "tuple[Var, str] | None" = None
+        self._baked_view_source: "tuple[Var, int] | None" = None
 
     def emit_for_truthiness(self) -> str:
         """C++ expression for this Var in a boolean context.
@@ -1902,6 +1911,20 @@ class Adjoint:
                     )
                     output.baked_value = _sub
                     output._baked_is_view_result = True
+                    # Track provenance for view-result shape/stride access
+                    # inside templated wp.func bodies.  The body needs
+                    # ``Config::<root>_shape_<offset+K>`` references so
+                    # different Config instantiations resolve to their own
+                    # caller's values — without this, the literal from the
+                    # first caller's baking gets hardcoded into the shared
+                    # template body.  Chains through nested views: if the
+                    # source is itself a view-result, sum its consumed
+                    # count with the new one and inherit its root.
+                    if _src_arr._baked_view_source is not None:
+                        _root, _prev_consumed = _src_arr._baked_view_source
+                        output._baked_view_source = (_root, _prev_consumed + _consumed)
+                    else:
+                        output._baked_view_source = (_src_arr, _consumed)
 
         # Scheme B: specialize selected array-access builtins when the array
         # arg is baked.  Emits a `static __device__ __forceinline__` helper
@@ -2694,36 +2717,56 @@ class Adjoint:
         is referenced inside templated wp.func bodies
         (``Config::<label>_shape_K`` vs ``Config::<label>_stride_K``).
 
-        Three cases:
+        The lookup target depends on context:
 
-          1. ``K`` is a Python literal **and** we're in a kernel body
-             or view-result subarray (the literal value is the actual
-             value): return ``Var(int32, constant=literal)`` so Warp's
-             constant Var emission produces ``const wp::int32 var_X = 17;``.
-             The constant is also visible to Warp's loop unroller, so
-             ``for k in range(arr.shape[0]):`` unrolls at the Python
-             level.
+          - **Kernel body / view-result outside a templated wp.func**:
+            literal values from ``arr_var.baked_value``.  Emitted as
+            a Python constant Var (literal K) or as
+            ``wp::baked_shape_extract<...>(k)`` with literal template
+            args (runtime K).
 
-          2. ``K`` is a Python literal **and** we're inside a templated
-             wp.func body (the body is shared across Config
-             instantiations): emit ``const wp::int32 var_X =
-             Config::<label>_<shape|stride>_K;`` so the same body
-             resolves to a different literal per instantiation.
+          - **Kernel-arg array inside a templated wp.func body**:
+            ``Config::<arr_var.label>_<stem>_K`` so the shared body
+            resolves correctly per Config instantiation.
 
-          3. ``K`` is runtime: emit
-             ``wp::baked_shape_extract<V0, V1, V2, V3>(k)`` — a
-             templated free function whose template args carry the
-             static values (shape or strides).  Runtime ternary
-             collapses to a compare-select chain over compile-time
-             constants; no struct materialisation, no SROA dependency.
-             Rare — happens only when the index is non-literal (e.g.
-             inside a non-unrollable loop).
+          - **View-result inside a templated wp.func body**: route
+            through provenance.  ``arr_var._baked_view_source`` gives
+            ``(root_arr, dims_consumed)`` — the kernel-arg the view
+            chain originated from and how many dims have been
+            consumed.  ``slice.shape[K]`` becomes
+            ``Config::<root_arr.label>_<stem>_<dims_consumed + K>``,
+            so kernel A and kernel B (which call the same wp.func
+            with arrays of different shapes) get their own values
+            from their own Configs without ever baking a literal
+            into the shared body.
         """
         # 4-int sequence and Config:: stem differ between shape and strides.
         seq = arr_var.baked_value.shape if attr == "shape" else arr_var.baked_value.strides
         config_stem = "shape" if attr == "shape" else "stride"
         ndim = int(arr_var.baked_value.ndim)
-        use_config = adj.is_user_function and not arr_var._baked_is_view_result
+
+        # Decide where the values come from:
+        #   templated_kernel_arg → Config::<arr_var.label>_<stem>_K
+        #   templated_view       → Config::<root.label>_<stem>_<offset+K>
+        #   else                 → literal seq[K]
+        templated_kernel_arg = adj.is_user_function and not arr_var._baked_is_view_result
+        templated_view = (
+            adj.is_user_function
+            and arr_var._baked_is_view_result
+            and arr_var._baked_view_source is not None
+        )
+        if templated_view:
+            root, offset = arr_var._baked_view_source
+
+        def value_for(k):
+            """C++ expression for the K-th element of the metadata sequence."""
+            if templated_kernel_arg:
+                return f"Config::{arr_var.label}_{config_stem}_{k}"
+            if templated_view:
+                # Map view-result position k back to root position offset+k.
+                # Only valid for k < view-result.ndim (== ndim here).
+                return f"Config::{root.label}_{config_stem}_{offset + k}"
+            return str(int(seq[k]))
 
         idx_const = idx_var.constant if isinstance(idx_var, Var) else None
         if idx_const is None:
@@ -2731,26 +2774,30 @@ class Adjoint:
             # so the static values flow through C++ template args without
             # going through a materialised struct.  The function body is
             # a generic 4-int select — works for shape or stride values.
-            template_args = [
-                (f"Config::{arr_var.label}_{config_stem}_{k}" if use_config else str(int(seq[k])))
-                if k < ndim else "0"
-                for k in range(4)
-            ]
+            # Emit as plain assignment (not ``const``) so we don't
+            # collide with the prologue's auto-declaration of the Var
+            # at function-body scope.  NVRTC still propagates the
+            # template-arg constants through the assignment.
+            template_args = [value_for(k) if k < ndim else "0" for k in range(4)]
             out = adj.add_var(int32)
             adj.add_forward(
-                f"const wp::int32 {out.emit()} = wp::baked_shape_extract<{', '.join(template_args)}>({idx_var.emit()});"
+                f"{out.emit()} = wp::baked_shape_extract<{', '.join(template_args)}>({idx_var.emit()});"
             )
             return out
+
         K = int(idx_const)
-        if use_config:
+        if templated_kernel_arg or templated_view:
+            # Templated wp.func body — the value is a per-Config
+            # template-arg reference, not a Python literal.  Emit a
+            # plain assignment to the prologue-declared Var (no
+            # ``const`` redeclaration) so this works at any scope.
             out = adj.add_var(int32)
-            adj.add_forward(
-                f"const wp::int32 {out.emit()} = Config::{arr_var.label}_{config_stem}_{K};"
-            )
+            adj.add_forward(f"{out.emit()} = {value_for(K)};")
             return out
-        # Kernel body / view-result subarray: the literal value IS the
-        # value.  Emit a Python constant Var so loop unrolling and
-        # downstream constant propagation fire automatically.
+        # Kernel body / view-result outside templated wp.func: the
+        # literal value IS the value.  Emit a Python constant Var so
+        # loop unrolling and downstream constant propagation fire
+        # automatically.
         return adj.add_var(int32, constant=int(seq[K]))
 
     def emit_Attribute(adj, node, aggregate=None):
@@ -5061,14 +5108,22 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["// primal vars\n"]
 
     # View-result baked sub-arrays declared as ``wp::baked_array_t<...>``
-    # carry their static shape/stride template args through the kernel
-    # body — without this, the assignment from ``wp::view(baked, ...)``
-    # would slice the templated return type to plain ``array_t<T>`` and
+    # carry their static shape/stride template args through the body —
+    # without this, the assignment from ``wp::view(baked, ...)`` would
+    # slice the templated return type to plain ``array_t<T>`` and
     # downstream consumers (``wp::tile_load``, ``wp::tile_store``, ...)
     # would only see the inherited fields (read OK via NVRTC fold of
     # the constexpr-init values, but no longer type-encoded).  The Var
     # carries its own ``baked_value`` and ``_baked_is_view_result``
     # flag, set by ``add_call`` when a view fires on a baked source.
+    #
+    # Inside a templated wp.func body, the body is shared across
+    # ``Config`` instantiations — so if the view-result Var has
+    # provenance back to a kernel-arg (``_baked_view_source`` set),
+    # emit the template args as ``Config::<root.label>_<stem>_<offset+k>``
+    # references rather than the first caller's literal.  Each Config
+    # instantiation resolves to its own values; the body's source-
+    # level type expression is shared.
     def _baked_view_ctype(var):
         if not (var._baked_is_view_result and isinstance(var.baked_value, array_t)):
             return None
@@ -5077,8 +5132,19 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
         sub = var.baked_value
         ndim = int(sub.ndim)
         elem = Var.type_to_ctype(strip_reference(var.type).dtype)
-        shape = [str(int(sub.shape[i])) if i < ndim else "0" for i in range(4)]
-        strides = [str(int(sub.strides[i])) if i < ndim else "0" for i in range(4)]
+        if adj.is_user_function and var._baked_view_source is not None:
+            root, offset = var._baked_view_source
+            shape = [
+                f"Config::{root.label}_shape_{offset + i}" if i < ndim else "0"
+                for i in range(4)
+            ]
+            strides = [
+                f"Config::{root.label}_stride_{offset + i}" if i < ndim else "0"
+                for i in range(4)
+            ]
+        else:
+            shape = [str(int(sub.shape[i])) if i < ndim else "0" for i in range(4)]
+            strides = [str(int(sub.strides[i])) if i < ndim else "0" for i in range(4)]
         return f"wp::baked_array_t<{elem}, {ndim}, {', '.join(shape)}, {', '.join(strides)}>"
 
     for var in adj.variables:
