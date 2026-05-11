@@ -4928,6 +4928,61 @@ def constant_str(value):
         return str(value)
 
 
+def format_baked_nttps(label, value, warp_type=None):
+    """Return ``(template_param_decls, instantiation_literals)`` for one
+    baked-arg slot.  Single source of truth for the C++ literal format
+    used at three sites:
+
+      - ``codegen_kernel`` spec branch (kernel template params)
+      - ``register_specialized_function`` (wp.func template params)
+      - ``_launch_specialized`` (NVRTC name expression at launch time)
+
+    Drift between these silently breaks NVRTC lowered-name lookup —
+    the launch-time expression must match the codegen-time signature
+    character-for-character.  Routing all three through this helper
+    eliminates that class of bug.
+
+    Returns 6 entries for ``launch_bounds_t`` (shape_0..3, ndim, size),
+    9 for ``array_t`` (shape_0..3, stride_0..3, ndim), 1 for a scalar.
+    ``warp_type`` is required only for scalars (drives the C++ NTTP
+    type).
+    """
+    from warp._src.types import launch_bounds_t  # noqa: PLC0415
+
+    if isinstance(value, launch_bounds_t):
+        decls = [f"int {label}_shape_{k}" for k in range(4)]
+        decls.append(f"int {label}_ndim")
+        decls.append(f"size_t {label}_size")
+        lits = [str(int(value.shape[k])) for k in range(4)]
+        lits.append(str(int(value.ndim)))
+        lits.append(str(int(value.size)))
+        return decls, lits
+    if isinstance(value, array_t):
+        ndim = int(value.ndim)
+        decls = [f"int {label}_shape_{k}" for k in range(4)]
+        decls += [f"int {label}_stride_{k}" for k in range(4)]
+        decls.append(f"int {label}_ndim")
+        lits = [str(int(value.shape[k])) if k < ndim else "0" for k in range(4)]
+        lits += [str(int(value.strides[k])) if k < ndim else "0" for k in range(4)]
+        lits.append(str(ndim))
+        return decls, lits
+    if isinstance(value, ctypes._SimpleCData):
+        if warp_type is None:
+            raise ValueError(f"warp_type required for scalar baked value '{label}'")
+        ctype_str = Var.type_to_ctype(warp_type)
+        raw = value.value
+        if ctype_str == "bool":
+            lit = "true" if raw else "false"
+        elif ctype_str in ("wp::float32", "float"):
+            lit = f"{raw!r}f"
+        elif "float" in ctype_str or ctype_str == "double":
+            lit = repr(raw)
+        else:
+            lit = str(int(raw))
+        return [f"{ctype_str} {label}"], [lit]
+    raise ValueError(f"unsupported baked value for '{label}': {type(value).__name__}")
+
+
 def bake_scalar(ctype_str, var_name, label, pad="    "):
     """Generate ``const T var_X = label;`` for a baked scalar inside a
     templated body — the RHS is the bare template-arg name (kernel and
@@ -5620,13 +5675,9 @@ def codegen_kernel(kernel, device, options):
         # and we look up the lowered (mangled) name from the .symbols
         # file post-compile.
         bounds = baked_args["dim"]
-        for k in range(4):
-            kernel_template_params.append(f"int dim_shape_{k}")
-            kernel_template_values.append(str(int(bounds.shape[k])))
-        kernel_template_params.append("int dim_ndim")
-        kernel_template_values.append(str(int(bounds.ndim)))
-        kernel_template_params.append("size_t dim_size")
-        kernel_template_values.append(str(int(bounds.size)))
+        dim_decls, dim_lits = format_baked_nttps("dim", bounds)
+        kernel_template_params.extend(dim_decls)
+        kernel_template_values.extend(dim_lits)
         baked_decls_outer = (
             "    wp::launch_bounds_t dim;\n"
             "    dim.shape[0] = dim_shape_0;\n"
@@ -5643,15 +5694,9 @@ def codegen_kernel(kernel, device, options):
             if isinstance(value, array_t):
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
-                ndim = int(value.ndim)
-                for k in range(4):
-                    kernel_template_params.append(f"int {arg.label}_shape_{k}")
-                    kernel_template_values.append(str(int(value.shape[k])) if k < ndim else "0")
-                for k in range(4):
-                    kernel_template_params.append(f"int {arg.label}_stride_{k}")
-                    kernel_template_values.append(str(int(value.strides[k])) if k < ndim else "0")
-                kernel_template_params.append(f"int {arg.label}_ndim")
-                kernel_template_values.append(str(ndim))
+                decls, lits = format_baked_nttps(arg.label, value)
+                kernel_template_params.extend(decls)
+                kernel_template_values.extend(lits)
                 if arg.is_used_by_value:
                     baked_decls_inner += bake_array_struct_decl(
                         elem_ctype,
@@ -5662,18 +5707,10 @@ def codegen_kernel(kernel, device, options):
                         pad="        ",
                     )
             elif isinstance(value, ctypes._SimpleCData):
+                decls, lits = format_baked_nttps(arg.label, value, warp_type=arg.type)
+                kernel_template_params.extend(decls)
+                kernel_template_values.extend(lits)
                 ctype_str = Var.type_to_ctype(arg.type)
-                raw = value.value
-                if ctype_str == "bool":
-                    literal = "true" if raw else "false"
-                elif ctype_str in ("wp::float32", "float"):
-                    literal = f"{raw!r}f"
-                elif "float" in ctype_str or ctype_str == "double":
-                    literal = repr(raw)
-                else:
-                    literal = str(int(raw))
-                kernel_template_params.append(f"{ctype_str} {arg.label}")
-                kernel_template_values.append(literal)
                 baked_decls_inner += f"        const {ctype_str} var_{arg.label} = {arg.label};\n"
             else:
                 # Anything else (structs, vectors, matrices, tuples, textures, ...)

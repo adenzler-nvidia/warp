@@ -2281,19 +2281,11 @@ class ModuleBuilder:
         data/grad pointers are excluded so reallocations with identical
         layout share a single compiled instantiation.
         """
-        from warp._src.codegen import Var  # noqa: PLC0415
+        from warp._src.codegen import format_baked_nttps  # noqa: PLC0415
 
-        # Hash baked label set + kinds (drives template_name).  Two
-        # bakings sharing labels can share one template declaration;
-        # different values live entirely in the per-call template-arg
-        # instantiation.  Different label sets get different
-        # template_names.  The label hash is the *only* discriminator
-        # the registry needs: the codegen emission pass dedups on the
-        # ``mangled_name`` derived from this hash, so a separate
-        # value-hash would not produce additional uniqueness.  The
-        # body's codegen depends only on which args are baked + their
-        # element types (label-set properties), not on the specific
-        # baked values.
+        # Hash baked label set + kinds (drives dict key).  Two bakings
+        # sharing labels share one template body; different values live
+        # entirely in the per-call instantiation args.
         labels_h = hashlib.sha256()
         labels_h.update(base_func_name.encode())
         for param_name in sorted(baked_params):
@@ -2304,51 +2296,23 @@ class ModuleBuilder:
         # The templated wp.func has the same C++ name as the (popped)
         # generic — different signature (NTTPs + raw T* instead of
         # ``array_t<T>``), so C++ overload resolution picks it
-        # unambiguously at the call site.  No legacy ``_baked_<hash>``
-        # naming convention required: now that everything is a template,
-        # the "baked variant" is just the templated overload.  The
-        # labels_hash stays as a dict key (to dedup emissions when
-        # multiple callers happen to bake the same label set with
-        # different values), but does not appear in the symbol name.
+        # unambiguously at the call site.  ``labels_hash`` stays as a
+        # dict key (to dedup emissions when multiple callers bake the
+        # same label set), but does not appear in the symbol name.
         template_name = base_func_name
 
-        # Build the template signature (param decls) and the call-site
-        # instantiation (literal values), in the same order.  Array
-        # params use 4-padded ``shape``/``stride`` slots so the
-        # signature is the same regardless of the actual ndim.
-        template_params = []  # signature: ["int a_shape_0", ..., "float alpha"]
-        template_values = []  # call site: ["17", ..., "2.0f"]
+        # Build the template signature + call-site instantiation values
+        # via the shared formatter so the literal format matches what
+        # ``_launch_specialized`` will use to build the NVRTC name
+        # expression at launch time.
+        template_params = []
+        template_values = []
         for label in sorted(baked_params):
             val = baked_params[label]
-            if isinstance(val, array_t):
-                for k in range(4):
-                    template_params.append(f"int {label}_shape_{k}")
-                    template_values.append(str(int(val.shape[k])) if k < val.ndim else "0")
-                for k in range(4):
-                    template_params.append(f"int {label}_stride_{k}")
-                    template_values.append(str(int(val.strides[k])) if k < val.ndim else "0")
-                template_params.append(f"int {label}_ndim")
-                template_values.append(str(int(val.ndim)))
-            elif isinstance(val, ctypes._SimpleCData):
-                # The Warp type drives both the C++ NTTP type and the
-                # literal format — single source of truth via
-                # ``Var.type_to_ctype``.  No isinstance dispatch on the
-                # Python value.
-                warp_type = func.input_types[label]
-                ctype_str = Var.type_to_ctype(warp_type)
-                raw = val.value
-                if ctype_str == "bool":
-                    literal = "true" if raw else "false"
-                elif ctype_str in ("wp::float32", "float"):
-                    literal = f"{raw!r}f"
-                elif "float" in ctype_str or ctype_str == "double":
-                    literal = repr(raw)
-                else:
-                    literal = str(int(raw))
-                template_params.append(f"{ctype_str} {label}")
-                template_values.append(literal)
-            else:
-                raise ValueError(f"unsupported baked value for '{label}': {type(val).__name__}")
+            warp_type = func.input_types[label] if isinstance(val, ctypes._SimpleCData) else None
+            decls, lits = format_baked_nttps(label, val, warp_type=warp_type)
+            template_params.extend(decls)
+            template_values.extend(lits)
 
         # One entry per (func, labels) — same labels different values
         # share the body, per-call values ride through the
@@ -9523,33 +9487,19 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     module = get_module(module_name)
     module.options["enable_backward"] = False
 
-    # Phase AA: build the C++ name expression for this baked instantiation.
-    # NVRTC compiles the template instance and exposes its mangled symbol
-    # via ``nvrtcGetLoweredName``; the launch path looks up the lowered
-    # name from ``ModuleExec.lowered_names`` and uses it for
-    # ``cuModuleGetFunction``.  Order must match codegen (codegen_kernel).
-    name_expr_values = [str(int(bounds.shape[k])) for k in range(4)]
-    name_expr_values.append(str(int(bounds.ndim)))
-    name_expr_values.append(str(int(bounds.size)))
+    # Phase AA: build the C++ name expression for this baked
+    # instantiation.  NVRTC compiles the template instance and exposes
+    # its mangled symbol via ``nvrtcGetLoweredName``; the launch path
+    # looks up the lowered name from ``ModuleExec.lowered_names`` and
+    # uses it for ``cuModuleGetFunction``.  Format must match what
+    # ``codegen_kernel``'s spec branch emits — routed through the same
+    # ``format_baked_nttps`` helper to keep both sides in lockstep.
+    name_expr_values = list(warp._src.codegen.format_baked_nttps("dim", bounds)[1])
     for arg in kernel.adj.args:
         v = baked_args[arg.label]
-        if isinstance(v, array_t):
-            ndim = int(v.ndim)
-            name_expr_values += [str(int(v.shape[k])) if k < ndim else "0" for k in range(4)]
-            name_expr_values += [str(int(v.strides[k])) if k < ndim else "0" for k in range(4)]
-            name_expr_values.append(str(ndim))
-        elif isinstance(v, ctypes._SimpleCData):
-            ctype_str = warp._src.codegen.Var.type_to_ctype(arg.type)
-            raw = v.value
-            if ctype_str == "bool":
-                lit = "true" if raw else "false"
-            elif ctype_str in ("wp::float32", "float"):
-                lit = f"{raw!r}f"
-            elif "float" in ctype_str or ctype_str == "double":
-                lit = repr(raw)
-            else:
-                lit = str(int(raw))
-            name_expr_values.append(lit)
+        warp_type = arg.type if isinstance(v, ctypes._SimpleCData) else None
+        _decls, lits = warp._src.codegen.format_baked_nttps(arg.label, v, warp_type=warp_type)
+        name_expr_values.extend(lits)
     spec_name_expression = (
         f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(name_expr_values)}>"
     )
