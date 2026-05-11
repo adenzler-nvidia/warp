@@ -242,11 +242,17 @@ class TestKernelSpecialize(unittest.TestCase):
         # Baked array ABI: kernel receives `T* __restrict__` directly.
         self.assertRegex(source, r"wp::float32\* __restrict__ var_y_data")
         self.assertRegex(source, r"wp::float32\* __restrict__ var_x_data")
-        # scheme-B address helpers receive shape/stride as template-arg
-        # refs, not literals — NVRTC instantiates with the right values
-        # for this baking via nvrtcAddNameExpression.
-        self.assertRegex(source, r"wp::wp_address_baked_1d<x_shape_0, x_stride_0>\(var_x_data,")
-        self.assertRegex(source, r"\*wp::wp_address_baked_1d<y_shape_0, y_stride_0>\(var_y_data,")
+        # Array access goes through ``wp::address(var_x, ...)`` and
+        # ``wp::array_store(var_y, ...)``; C++ overload resolution picks
+        # the templated ``baked_array_t<...>`` overload, which delegates
+        # to the shape/stride-templated address helpers in ``array.h``.
+        self.assertRegex(source, r"wp::address\(var_x, ")
+        self.assertRegex(source, r"wp::array_store\(var_y, ")
+        # The materialized baked_array_t locals carry the NTTPs in
+        # their type, so the address helpers see them via overload
+        # resolution rather than Python emitting them explicitly.
+        self.assertRegex(source, r"wp::baked_array_t<wp::float32, x_ndim, x_shape_0,")
+        self.assertRegex(source, r"wp::baked_array_t<wp::float32, y_ndim, y_shape_0,")
 
     def test_codegen_baked_shape_local(self):
         """Verify `arr.shape[K]` on a baked array uses a bare

@@ -2330,35 +2330,6 @@ class ModuleBuilder:
 
         return f"wp::{template_name}<{', '.join(template_values)}>"
 
-    def register_specialized_address_helper(self, arr_val, config_label=None):
-        """Format the scheme-B address helper call-site for a baked array.
-
-        The helper templates (``wp::wp_address_baked_<N>d<S..., St..., T>(data, i...)``)
-        live as static templates in ``warp/native/array.h`` — one template per
-        ndim, instantiated per (shape, stride, T) at every call site.  This
-        method just formats the per-call instantiation prefix:
-
-            wp::wp_address_baked_2d<17, 32, 128, 4>
-
-        With ``config_label`` set (templated wp.func body), the template
-        args are bare-name refs (``<label>_shape_K``, ``<label>_stride_K``)
-        so the body is shared across instantiations.  Higher-level
-        operations (``array_store``, ``atomic_*``) reuse this helper —
-        the codegen wraps the call site inline (``*addr = v`` for store,
-        ``wp::atomic_X(addr, v)`` for atomics).
-        """
-        ndim = arr_val.ndim
-        if config_label is None:
-            shape = tuple(int(arr_val.shape[i]) for i in range(ndim))
-            strides = tuple(int(arr_val.strides[i]) for i in range(ndim))
-            tparam_values = ", ".join(str(x) for x in (*shape, *strides))
-        else:
-            tparam_values = ", ".join(
-                [f"{config_label}_shape_{k}" for k in range(ndim)]
-                + [f"{config_label}_stride_{k}" for k in range(ndim)]
-            )
-        return f"wp::wp_address_baked_{ndim}d<{tparam_values}>"
-
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []
 

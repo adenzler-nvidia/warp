@@ -1874,71 +1874,6 @@ class Adjoint:
                     # type follows).  No Python-side provenance needed.
                     output.baked_view_of = _src_arr
 
-        # Scheme B: specialize selected array-access builtins when the array
-        # arg is baked.  Emits a `static __device__ __forceinline__` helper
-        # at module scope that takes the raw data pointer and embeds the
-        # baked shape/stride/ndim as immediates.  The call site is rewritten
-        # to invoke the helper with `arr.data` in place of `arr`.
-        #
-        # In scope (matches `array.h` naming):
-        #   address                          — returns T*
-        #   array_store                      — stores T into *addr
-        #   atomic_add/sub/min/max/and/or/xor/cas/exch — returns T
-        #
-        # The helper delegates to the scalar primitive for atomics; for
-        # address/array_store it does the pointer arithmetic directly.
-        BAKED_BUILTINS = {
-            "address",
-            "array_store",
-            "atomic_add",
-            "atomic_sub",
-            "atomic_min",
-            "atomic_max",
-            "atomic_and",
-            "atomic_or",
-            "atomic_xor",
-            "atomic_cas",
-            "atomic_exch",
-        }
-        # Scheme-B dispatch: when an `address`/`array_store`/`atomic_*`
-        # builtin is called on a baked array, register a templated
-        # address helper and let the call-site emission below wrap it
-        # appropriately:
-        #   address     → wp::wp_address_baked_<N>d<...>(data, i, j)
-        #   array_store → *wp::wp_address_baked_<N>d<...>(data, i, j) = value
-        #   atomic_X    → wp::atomic_X(wp::wp_address_baked_<N>d<...>(data, i, j), ...)
-        # Set ``scheme_b_op`` to the original builtin name and
-        # ``scheme_b_addr_call`` to the templated address helper
-        # instantiation; the forward-call construction below uses these
-        # to emit the right pattern instead of going through the
-        # generic ``func_name(args)`` path.
-        scheme_b_op = None
-        scheme_b_addr_call = None
-        baked_builtin_arr_idx = None
-        if func.is_builtin() and adj.builder is not None and func.key in BAKED_BUILTINS:
-            arr_var = bound_args.get("arr") if "arr" in bound_args else next(iter(bound_args.values()))
-            if (
-                isinstance(arr_var, Var)
-                and is_array(arr_var.type)
-                and isinstance(arr_var.baked_value, array_t)
-                # View-results are typed `baked_array_t<...>` locals; their
-                # element access is routed via overload resolution to the
-                # baked address overloads in array.h.  Only the kernel/wp.func
-                # arg path needs Python-side scheme-B (raw `T*` + explicit
-                # template args at the call site).
-                and arr_var.baked_view_of is None
-            ):
-                baked_arr = arr_var.baked_value
-                idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
-                if baked_arr.ndim == len(idx_keys):
-                    config_label = arr_var.label if (adj.is_user_function or adj.in_spec_kernel) else None
-                    scheme_b_addr_call = adj.builder.register_specialized_address_helper(baked_arr, config_label)
-                    scheme_b_op = func.key
-                    for i, fa in enumerate(func_args):
-                        if isinstance(fa, Var) and fa.label == arr_var.label:
-                            baked_builtin_arr_idx = i
-                            break
-
         # Register a baked variant and rewrite the call name.
         # Baked param names were already propagated to baked_args above
         # (before build_function) to enable nested specialization.
@@ -1995,20 +1930,6 @@ class Adjoint:
         # Reverse and replay calls keep the unbaked ABI — they invoke the
         # generic ``adj_``/``replay_`` symbols which aren't specialized.
         def _format_fwd_args(args, init_list):
-            # Scheme-B baked builtin: rewrite the single array arg to its
-            # data-pointer name.
-            if baked_builtin_arr_idx is not None:
-                parts = []
-                for i, a in enumerate(args):
-                    if i == baked_builtin_arr_idx:
-                        parts.append(a.baked_data_name(adj))
-                    else:
-                        parts.extend(adj.format_args("var", [a]))
-                arg_str = ", ".join(parts)
-                if init_list:
-                    arg_str = f"{{{arg_str}}}"
-                return arg_str
-
             if baked_call_info is None:
                 return adj.format_forward_call_args(args, init_list)
             param_names, _baked_params = baked_call_info
@@ -2028,27 +1949,7 @@ class Adjoint:
                 arg_str = f"{{{arg_str}}}"
             return arg_str
 
-        if scheme_b_op is not None:
-            # Scheme-B: build the call site directly from the address
-            # helper.  args = [arr, i0, ..., i{ndim-1}, value_args...].
-            # The array slot is rewritten to its data-pointer name.
-            arr_var = fwd_args[baked_builtin_arr_idx]
-            n_idx = bound_args["arr"].baked_value.ndim if "arr" in bound_args else next(iter(bound_args.values())).baked_value.ndim
-            data_name = arr_var.baked_data_name(adj)
-            idx_strs = [a.emit() for a in fwd_args[1 : 1 + n_idx]]
-            tail_strs = [a.emit() for a in fwd_args[1 + n_idx :]]
-            addr_expr = f"{scheme_b_addr_call}({data_name}, {', '.join(idx_strs)})"
-            if scheme_b_op == "address":
-                forward_call = f"var_{output} = {addr_expr};"
-            elif scheme_b_op == "array_store":
-                forward_call = f"*{addr_expr} = {tail_strs[0]};"
-            elif scheme_b_op == "atomic_cas":
-                forward_call = f"var_{output} = wp::atomic_cas({addr_expr}, {tail_strs[0]}, {tail_strs[1]});"
-            else:  # atomic_add/sub/min/max/and/or/xor/exch
-                forward_call = f"var_{output} = wp::{scheme_b_op}({addr_expr}, {tail_strs[0]});"
-            replay_call = forward_call
-
-        elif return_type is None:
+        if return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
             forward_call = f"{func.namespace}{func_name}({_format_fwd_args(fwd_args, use_initializer_list)});"
             replay_call = forward_call
