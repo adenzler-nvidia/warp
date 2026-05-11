@@ -316,6 +316,11 @@ class TestKernelSpecialize(unittest.TestCase):
         to the literal at codegen time without going through any struct
         field access.  Without the spec hook, codegen would emit
         `var_a.ndim` which fails compile under T*-ABI (no `var_a`).
+
+        ndim is type-level (fixed by the Warp annotation), so we emit
+        the literal directly — the bare-NTTP-ref form used for
+        shape/stride NTTPs would resolve to the same value at every
+        instantiation anyway.
         """
         N, M = 17, 32
         device = "cuda:0"
@@ -330,8 +335,8 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Templated kernel: ndim ref points to the template arg, not a literal.
-        self.assertRegex(source, r"var_\d+ = a_ndim;")
+        # arr.ndim emits as a const literal (2 for ``wp.array2d``).
+        self.assertRegex(source, r"const wp::int32 var_\d+ = 2;")
         # No struct-field access on var_a.
         self.assertNotIn("var_a.ndim", source)
 

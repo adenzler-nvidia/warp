@@ -734,7 +734,7 @@ class Var:
         # literal at codegen time (or `<label>_<shape|stride>_K`
         # inside templated wp.funcs).  `arr.ndim` is emitted directly
         # as a constant — no marker needed.
-        # `_baked_view_source` is the immediate source Var of a
+        # `baked_view_of` is the immediate source Var of a
         # view-result; non-None iff this Var is a view-result.  Used by
         # codegen to emit the local's type as
         # ``decltype(wp::view(<src>, 0...))``, letting C++ template
@@ -743,7 +743,7 @@ class Var:
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self.is_used_by_value: builtins.bool = False
         self._baked_attr_of: "tuple[Var, str] | None" = None
-        self._baked_view_source: "Var | None" = None
+        self.baked_view_of: "Var | None" = None
 
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
@@ -770,7 +770,7 @@ class Var:
         The third reads the ``data`` field of the ``baked_array_t<...>``
         local emitted by a preceding ``wp::view`` call.
         """
-        if self._baked_view_source is not None:
+        if self.baked_view_of is not None:
             return f"var_{self.label}.data"
         if adj.is_user_function:
             return f"_wp_baked_var_{self.label}_data"
@@ -810,11 +810,11 @@ class Var:
             marker._baked_attr_of = (self, attr)
             return marker
         if attr == "ndim":
-            use_config = (adj.is_user_function or adj.in_spec_kernel) and self._baked_view_source is None
-            if use_config:
-                out = adj.add_var(int32)
-                adj.add_forward(f"const wp::int32 {out.emit()} = {self.label}_ndim;")
-                return out
+            # ndim is type-level — determined by the Warp annotation
+            # (e.g. ``wp.array2d`` → 2) and invariant across every
+            # instantiation of the same kernel template.  Emit the
+            # literal directly; the bare-NTTP-ref form (``<label>_ndim``)
+            # used for shape/stride doesn't add anything here.
             return adj.add_var(int32, constant=int(self.baked_value.ndim))
         return None
 
@@ -1877,7 +1877,7 @@ class Adjoint:
                     # correctness inside body-shared wp.funcs (the source's
                     # type carries the right template args; the view return
                     # type follows).  No Python-side provenance needed.
-                    output._baked_view_source = _src_arr
+                    output.baked_view_of = _src_arr
 
         # Scheme B: specialize selected array-access builtins when the array
         # arg is baked.  Emits a `static __device__ __forceinline__` helper
@@ -1931,7 +1931,7 @@ class Adjoint:
                 # baked address overloads in array.h.  Only the kernel/wp.func
                 # arg path needs Python-side scheme-B (raw `T*` + explicit
                 # template args at the call site).
-                and arr_var._baked_view_source is None
+                and arr_var.baked_view_of is None
             ):
                 baked_arr = arr_var.baked_value
                 idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
@@ -2710,7 +2710,7 @@ class Adjoint:
         config_stem = "shape" if attr == "shape" else "stride"
         ndim = int(arr_var.baked_value.ndim)
 
-        is_view_result = arr_var._baked_view_source is not None
+        is_view_result = arr_var.baked_view_of is not None
         out = adj.add_var(int32)
 
         # All baked-array attribute access happens inside a templated body
@@ -5126,7 +5126,7 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     # type already carries the wp.func's template args; the deduced view
     # return type follows naturally per instantiation.
     def _baked_view_ctype(var):
-        src = var._baked_view_source
+        src = var.baked_view_of
         if src is None or not isinstance(var.baked_value, array_t):
             return None
         if not is_array(strip_reference(var.type)):
