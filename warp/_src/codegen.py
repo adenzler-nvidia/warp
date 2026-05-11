@@ -721,18 +721,22 @@ class Var:
         # Used to associate the variable with the Python statement that resulted in it being created.
         self.relative_lineno = relative_lineno
 
-        # Spec-feature metadata.  When `enable_kernel_specialize` is on
-        # and this Var is a kernel/wp.func arg with a baked value,
-        # `baked_value` holds the array_t (shape/strides/ndim) or
-        # _SimpleCData scalar.  ``_baked_attr_of`` is set on a marker
-        # Var returned by `emit_for_attribute` for `arr.shape` or
-        # `arr.strides`; carries `(array_var, attr_name)` so
-        # `emit_indexing` can constant-fold `arr.shape[K]` /
-        # `arr.strides[K]`.  ``baked_view_of`` is the immediate source
-        # Var of a view-result; non-None iff this Var is a view-result.
-        # Used by codegen to emit the local's type as
-        # ``decltype(wp::view(<src>, 0...))``, letting C++ template
-        # deduction handle per-instantiation correctness.
+        # Spec-feature metadata.  Three independent, single-purpose
+        # tags:
+        #
+        #   - ``baked_value``: holds the baked ``array_t`` (shape /
+        #     strides / ndim) or _SimpleCData scalar.  This is the
+        #     core "is this Var baked?" tag; consulted by every spec
+        #     codegen pass.
+        #   - ``_baked_attr_of``: set on a marker Var returned by
+        #     ``emit_for_attribute`` for ``arr.shape`` / ``arr.strides``;
+        #     carries ``(array_var, attr_name)`` so ``emit_indexing``
+        #     can constant-fold ``arr.shape[K]`` / ``arr.strides[K]``.
+        #   - ``baked_view_of``: source Var of a view-result; non-None
+        #     iff this Var came from ``wp::view`` on a baked source.
+        #     Drives the view-result local's C++ type emission as
+        #     ``decltype(wp::view(<src>, 0...))`` so deduction picks
+        #     up the post-view ``baked_array_t<...>`` shape.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self._baked_attr_of: "tuple[Var, str] | None" = None
         self.baked_view_of: "Var | None" = None
@@ -740,30 +744,13 @@ class Var:
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
 
-        For baked-array kernel/func args under the T*-ABI, the struct
-        identifier (`var_X`) doesn't exist — only `var_X_data` is in
-        scope.  Return the raw-pointer truthiness check so `if (arr):`,
-        `while (arr):`, and `arr1 and arr2` all compile.
+        Baked arrays materialize to ``baked_array_t<...>`` locals (or
+        flow through wp.func templates as deduced typename params);
+        both inherit ``array_t<T>::operator T*()`` so ``if (var_X)``
+        implicitly converts to a raw-pointer check.  No special case
+        needed.
         """
-        if isinstance(self.baked_value, array_t):
-            return self.baked_data_name(adj)
         return self.emit()
-
-    def baked_data_name(self, adj: "Adjoint") -> str:
-        """C++ expression for this Var's data pointer.
-
-        Two contexts:
-          - kernel arg                 -> ``var_<label>_data`` (raw ``T* __restrict__``)
-          - view-result baked subarray -> ``var_<label>.data`` (typed local from ``decltype(wp::view(...))``)
-
-        Inside wp.func template bodies, array args are passed by value
-        as deduced typename parameters — ``var_<label>.data`` (the
-        struct member) is the canonical access, but ``baked_data_name``
-        isn't called there (no T*-ABI in wp.funcs anymore).
-        """
-        if self.baked_view_of is not None:
-            return f"var_{self.label}.data"
-        return f"var_{self.label}_data"
 
     def emit_for_attribute(self, attr: str, adj: "Adjoint") -> "Var | None":
         """Return a Var for ``self.<attr>`` when the access can be
@@ -4812,11 +4799,16 @@ def bake_scalar(ctype_str, var_name, label, pad="    "):
     return f"{pad}const {ctype_str} {var_name} = {label};\n"
 
 
-def bake_array_struct_decl(elem_ctype, var_name, value, data_param, label, pad="    "):
-    """Generate a ``wp::baked_array_t<T, ...> var_X{data_param};`` local
-    for a baked array's by-value materialization (kernel-arg passed to a
-    non-baked builtin like ``wp::view`` or ``wp::store``).  Template args
-    are bare template-arg references on the enclosing kernel/wp.func
+def bake_array_struct_decl(elem_ctype, value, label, pad="    "):
+    """Generate the kernel-entry adapter line for a baked array:
+    ``wp::baked_array_t<T, NTTPs...> var_<label>{var_<label>_data};``.
+
+    The raw ``T* __restrict__`` cmem param is named ``var_<label>_data``
+    by convention; the struct local is ``var_<label>``.  Both reach the
+    same memory through a single canonical alias path (``var_X.data ==
+    var_X_data``), so the kernel signature can stay T*-ABI for NVRTC's
+    alias analysis while the body uses the struct uniformly.  Template
+    args are bare template-arg references on the enclosing kernel
     template.
     """
     ndim_arg = f"{label}_ndim"
@@ -4825,7 +4817,7 @@ def bake_array_struct_decl(elem_ctype, var_name, value, data_param, label, pad="
     return (
         f"{pad}wp::baked_array_t<{elem_ctype}, {ndim_arg}, "
         f"{', '.join(shape_args)}, {', '.join(stride_args)}> "
-        f"{var_name}{{{data_param}}};\n"
+        f"var_{label}{{var_{label}_data}};\n"
     )
 
 
@@ -5443,14 +5435,7 @@ def codegen_kernel(kernel, device, options):
                 decls, lits = format_baked_nttps(arg.label, value)
                 kernel_template_params.extend(decls)
                 kernel_template_values.extend(lits)
-                baked_decls_inner += bake_array_struct_decl(
-                    elem_ctype,
-                    f"var_{arg.label}",
-                    value,
-                    f"var_{arg.label}_data",
-                    arg.label,
-                    pad="        ",
-                )
+                baked_decls_inner += bake_array_struct_decl(elem_ctype, value, arg.label, pad="        ")
             elif isinstance(value, ctypes._SimpleCData):
                 decls, lits = format_baked_nttps(arg.label, value, warp_type=arg.type)
                 kernel_template_params.extend(decls)
