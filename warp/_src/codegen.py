@@ -5075,7 +5075,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
     return "".join(l.lstrip() if l.lstrip().startswith("#line") else indent_block + l for l in lines)
 
 
-def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only=False, reverse_only=False, func=None):
+def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only=False, reverse_only=False):
     if options is None:
         options = {}
 
@@ -5135,25 +5135,16 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     # No separate "baked variant" of the wp.func is emitted — the
     # template IS the unified form.
     #
-    # EXCEPTION: generic wp.funcs (with ``dtype=Any``) instantiate
-    # multiple concrete clones that all share the same C++ ``native_func``
-    # name (see ``Function.get_overload``).  Pre-Phase-2, those clones
-    # had distinct concrete ``array_t<T>`` parameter types — C++
-    # overload resolution picked the right one by argument type.  If we
-    # templatize the array arg, all clones get identical ``(array_t_arg,
-    # int)`` signatures differing only by return type, which C++
-    # rejects.  So for clones (``func.generic_parent is not None``),
-    # keep the concrete ``array_t<T>``; baked arrays slice cleanly to
-    # the base ``array_t<T>`` via inheritance.  Spec NTTPs don't flow
-    # into the wp.func body in that case, but NVRTC's constant
-    # propagation through inlining recovers the values in practice.
-    templatize_arrays = func is None or func.generic_parent is None
+    # Generic wp.funcs (``dtype=Any``) work uniformly: each concrete
+    # clone gets a unique ``native_func`` name (assigned in
+    # ``Function.get_overload``), so the template per clone is its own
+    # C++ symbol — no overload-resolution ambiguity.
     for i, arg in enumerate(adj.args):
         if is_tile(arg.type) or is_tile_stack(arg.type):
             tname = f"tile_{arg.label}"
             template_params.append(tname)
             s = f"{tname}& {arg.emit()}"
-        elif is_array(arg.type) and templatize_arrays:
+        elif is_array(arg.type):
             tname = f"array_t_{arg.label}"
             template_params.append(tname)
             s = f"{tname} {arg.emit()}"

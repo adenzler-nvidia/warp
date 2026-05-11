@@ -466,6 +466,14 @@ class Function:
                 ovl.input_types = overload_annotations
                 ovl.value_func = None
                 ovl.generic_parent = f
+                # Each clone gets its own native_func name so its emitted
+                # C++ body is uniquely addressable.  Without this, all
+                # concrete instantiations of a generic wp.func share one
+                # name, and array args templated as deduced typenames
+                # would make C++ overloads ambiguous (differ only by
+                # return type).  Per-clone names let codegen_func emit
+                # array args as templated typenames uniformly.
+                ovl.native_func = generate_unique_function_identifier(self.key)
 
                 sig = warp._src.types.get_signature(arg_types, func_name=self.key)
                 self.user_overloads[sig] = ovl
@@ -2336,7 +2344,6 @@ class ModuleBuilder:
                     options=self.options,
                     forward_only=forward_only,
                     reverse_only=reverse_only,
-                    func=func,
                 )
             else:
                 source += warp._src.codegen.codegen_snippet(
