@@ -5710,8 +5710,9 @@ def codegen_kernel(kernel, device, options):
                 decls, lits = format_baked_nttps(arg.label, value, warp_type=arg.type)
                 kernel_template_params.extend(decls)
                 kernel_template_values.extend(lits)
-                ctype_str = Var.type_to_ctype(arg.type)
-                baked_decls_inner += f"        const {ctype_str} var_{arg.label} = {arg.label};\n"
+                baked_decls_inner += bake_scalar(
+                    Var.type_to_ctype(arg.type), f"var_{arg.label}", arg.label, pad="        "
+                )
             else:
                 # Anything else (structs, vectors, matrices, tuples, textures, ...)
                 # passes through as a normal kernel param.
