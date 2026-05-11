@@ -553,7 +553,7 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertEqual(int(out.numpy()[1]), M2, "second call saw wrong shape from view-result")
 
     def test_codegen_nested_func_variants(self):
-        """Verify baked function variants are generated for nested wp.func calls."""
+        """Each wp.func is emitted ONCE as a template; nested calls deduce types."""
         N = 64
         device = "cuda:0"
         a = wp.array(np.ones(N, dtype=np.float32), device=device)
@@ -567,19 +567,26 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Both outer and inner should have templated overloads (same C++
-        # name as the generic; C++ overload resolution distinguishes by
-        # signature — generic takes ``array_t<T>``, spec takes ``T*``).
-        # Detect by the ``T* _wp_baked_var_*_data`` parameter that only
-        # the templated form has.
-        self.assertRegex(source, r"outer_scale_0\([^)]*_wp_baked_var_arr_data")
-        self.assertRegex(source, r"inner_add_0\([^)]*_wp_baked_var_arr_data")
-        # The baked outer body should call the baked inner (call site
-        # passes raw data pointer, which resolves to the templated
-        # overload).
-        import re
-
-        self.assertRegex(source, re.compile(r"outer_scale_0\([^)]*_wp_baked_var_arr_data.*?inner_add_0<[^>]+>\([^)]*_wp_baked_var_arr_data", re.DOTALL))
+        # Both wp.funcs are emitted as function templates with their
+        # array arg as a deduced typename parameter (the same template
+        # serves array_t<T> and baked_array_t<T,...> call sites).
+        self.assertRegex(
+            source,
+            r"template<typename array_t_arr>\s*\n\s*\n?\s*//[^\n]*\n\s*static CUDA_CALLABLE wp::float32 inner_add_0\(",
+        )
+        self.assertRegex(
+            source,
+            r"template<typename array_t_arr>\s*\n\s*\n?\s*//[^\n]*\n\s*static CUDA_CALLABLE wp::float32 outer_scale_0\(",
+        )
+        # outer body calls inner with no explicit template args (deduced
+        # from the array arg type at the call site).
+        self.assertIn("inner_add_0(var_arr, var_i)", source)
+        # Kernel materializes ``var_a`` as baked_array_t and passes it
+        # by value to outer_scale_0 (typename deduces to baked_array_t).
+        self.assertIn("outer_scale_0(var_a, var_0, var_1)", source)
+        # And the kernel constructs the baked array struct from the raw
+        # __restrict__ pointer.
+        self.assertRegex(source, r"wp::baked_array_t<wp::float32, a_ndim,[^>]*>\s+var_a\{var_a_data\}")
 
     # ---- Correctness (parametrized: specialized vs generic) ----
 
@@ -749,23 +756,23 @@ class TestKernelSpecialize(unittest.TestCase):
         new_specs = _run_specialized(scalar_through_func, dim=N, inputs=[a, out, 5.0], device=device)
         self.assertTrue(len(new_specs) > 0)
 
-        # Verify the templated wp.func overload exists (same C++ name as
-        # the generic ``scale_func_0`` — C++ overload resolution
-        # distinguishes by signature; the spec form takes the scalar as
-        # an NTTP rather than a runtime arg).  Templated kernel: the
-        # kernel calls the wp.func template instantiated with the scalar.
+        # Scalar baking flows through a *single* wp.func definition:
+        # ``scale_func_0`` is emitted once (no separate templated
+        # overload).  The kernel template has ``s`` as an NTTP; the
+        # kernel body declares ``const float var_s = s;`` and passes
+        # ``var_s`` as a runtime arg to ``scale_func_0``.  NVRTC
+        # inlines ``scale_func_0`` and constant-propagates ``var_s``
+        # through the inlined body.
         cu_path = _find_spec_cu("scalar_through_func")
         self.assertIsNotNone(cu_path)
         with open(cu_path) as f:
             source = f.read()
-        # Templated overload declaration.
-        self.assertRegex(source, r"template<float s>\s+static CUDA_CALLABLE wp::float32 scale_func_0\(")
-        # The kernel body references the scalar via the template arg `s`
-        # (NVRTC instantiates per baking via nvrtcAddNameExpression).
+        # Single (un-templated) wp.func definition for scale_func_0.
+        self.assertRegex(source, r"static CUDA_CALLABLE wp::float32 scale_func_0\(")
+        # Kernel materializes ``var_s`` from the NTTP and passes it as a
+        # normal runtime arg.
         self.assertIn("var_s = s;", source)
-        # And the wp.func template instantiation in the body uses the
-        # scalar value as a template arg.
-        self.assertIn("scale_func_0<5.0f>", source)
+        self.assertIn("scale_func_0(var_3, var_s)", source)
 
         np.testing.assert_allclose(out.numpy(), a.numpy() * 5.0, rtol=1e-5)
 

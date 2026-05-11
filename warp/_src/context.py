@@ -2230,7 +2230,6 @@ class ModuleBuilder:
         self.options = options
         self.module = module
         self.deferred_functions = []
-        self.specialized_functions = {}  # (func_key, labels_hash) -> (func, mangled_name, baked_params, template_params)
         # Phase AA: NVRTC name expressions for templated spec kernels.
         # Codegen appends ``"<kernel_name>_cuda_kernel_forward<args...>"`` strings
         # here; the build path passes them to NVRTC and reads back the lowered
@@ -2252,83 +2251,6 @@ class ModuleBuilder:
         # build deferred functions
         for func in self.deferred_functions:
             self.build_function(func)
-
-    def register_specialized_function(self, func, base_func_name, baked_params):
-        """Register a specialized wp.func as a C++ function template.
-
-        With C++20 NTTPs, baked values become bare non-type template
-        parameters of the wp.func directly:
-
-            template<int a_shape_0, int a_shape_1, int a_shape_2, int a_shape_3,
-                     int a_stride_0, int a_stride_1, int a_stride_2, int a_stride_3,
-                     int a_ndim, float alpha>
-            static <ret> <fn>_baked_<labels_hash>(T* a_data, ...)
-            {
-                // body uses bare names: a_shape_0, alpha, etc.
-            }
-
-        One template per ``base_func_name`` + label set; multiple
-        callers with different baked values instantiate it with their
-        own values.
-
-        Returns the call-site instantiation string with the values
-        filled in, e.g. ``wp::funcname_baked_<labels_hash><17, 32, ..., 2.0f>``.
-
-        Array signature uses 4-padded shape and stride slots so the
-        template signature is independent of ``ndim`` — different
-        bakings of arrays with different ``ndim`` share one template.
-        Array values are hashed by metadata only (shape/stride/ndim);
-        data/grad pointers are excluded so reallocations with identical
-        layout share a single compiled instantiation.
-        """
-        from warp._src.codegen import format_baked_nttps  # noqa: PLC0415
-
-        # Hash baked label set + kinds (drives dict key).  Two bakings
-        # sharing labels share one template body; different values live
-        # entirely in the per-call instantiation args.
-        labels_h = hashlib.sha256()
-        labels_h.update(base_func_name.encode())
-        for param_name in sorted(baked_params):
-            labels_h.update(param_name.encode())
-            val = baked_params[param_name]
-            labels_h.update(b"A" if isinstance(val, array_t) else b"S")
-        labels_hash = labels_h.hexdigest()[:8]
-        # The templated wp.func has the same C++ name as the (popped)
-        # generic — different signature (NTTPs + raw T* instead of
-        # ``array_t<T>``), so C++ overload resolution picks it
-        # unambiguously at the call site.  ``labels_hash`` stays as a
-        # dict key (to dedup emissions when multiple callers bake the
-        # same label set), but does not appear in the symbol name.
-        template_name = base_func_name
-
-        # Build the template signature + call-site instantiation values
-        # via the shared formatter so the literal format matches what
-        # ``_launch_specialized`` will use to build the NVRTC name
-        # expression at launch time.
-        template_params = []
-        template_values = []
-        for label in sorted(baked_params):
-            val = baked_params[label]
-            warp_type = func.input_types[label] if isinstance(val, ctypes._SimpleCData) else None
-            decls, lits = format_baked_nttps(label, val, warp_type=warp_type)
-            template_params.extend(decls)
-            template_values.extend(lits)
-
-        # One entry per (func, labels) — same labels different values
-        # share the body, per-call values ride through the
-        # instantiation args.  The codegen emission pass already dedups
-        # on ``mangled_name`` (= ``template_name``), which is derived
-        # solely from the labels, so the value-hash gives no extra
-        # uniqueness.
-        config_key = (base_func_name, labels_hash)
-        if config_key not in self.specialized_functions:
-            self.specialized_functions[config_key] = (func, template_name, baked_params, template_params)
-
-        # Drop generic body — every caller in the spec module is
-        # rewritten to the baked variant.
-        self.functions.pop(func, None)
-
-        return f"wp::{template_name}<{', '.join(template_values)}>"
 
     def build_struct_recursive(self, struct: warp._src.codegen.Struct):
         structs = []
@@ -2414,6 +2336,7 @@ class ModuleBuilder:
                     options=self.options,
                     forward_only=forward_only,
                     reverse_only=reverse_only,
+                    func=func,
                 )
             else:
                 source += warp._src.codegen.codegen_snippet(
@@ -2450,32 +2373,8 @@ class ModuleBuilder:
         # Pass 2: All adjoint functions (custom grads before auto-adjoints)
         # Pass 3: Forward functions that use wp.grad() (these call adjoints, so must come after pass 2)
         #         Note: Functions using wp.grad() don't have adjoints generated.
-
-        # `register_specialized_function` removes a wp.func from
-        # `self.functions` once a baked variant is emitted, so this loop
-        # only sees generic functions.
         grad_functions = [f for f in self.functions.keys() if f.adj.uses_grad_call]
         non_grad_functions = [f for f in self.functions.keys() if not f.adj.uses_grad_call]
-
-        # Emit forward declarations for baked function variants before any
-        # function bodies.  The adjoint build (in __init__) rewrites function
-        # names to baked variants in ALL function bodies within the specialized
-        # module, including generic functions emitted in Pass 1.
-        #
-        # Multiple `specialized_functions` entries for the same user wp.func
-        # share one `mangled_name` (one template declaration shared by all
-        # bakings of the same label set).  Dedup by name so the template is
-        # emitted exactly once.
-        _emitted_template_names = set()
-        for (_key, _hash), (func, mangled_name, baked_params, template_params) in self.specialized_functions.items():
-            if mangled_name in _emitted_template_names:
-                continue
-            _emitted_template_names.add(mangled_name)
-            decl, _ = warp._src.codegen.codegen_func_specialized(
-                func.adj, mangled_name, device=device, options=self.options,
-                baked_params=baked_params, template_params=template_params,
-            )
-            source += decl
 
         # Pass 1: Forward functions that don't use grad()
         source += self._codegen_functions(non_grad_functions, device, forward_only=True)
@@ -2499,20 +2398,6 @@ class ModuleBuilder:
         # Pass 3: Forward functions that use wp.grad()
         # These must come after pass 2 because they call adjoint functions
         source += self._codegen_functions(grad_functions, device, forward_only=True)
-
-        # Pass 4: Specialized function variant bodies (forward decls already
-        # emitted above).  Same dedup as the forward-decl pass — one
-        # template body per `mangled_name`.
-        _emitted_template_bodies = set()
-        for (_key, _hash), (func, mangled_name, baked_params, template_params) in self.specialized_functions.items():
-            if mangled_name in _emitted_template_bodies:
-                continue
-            _emitted_template_bodies.add(mangled_name)
-            _, body = warp._src.codegen.codegen_func_specialized(
-                func.adj, mangled_name, device=device, options=self.options,
-                baked_params=baked_params, template_params=template_params,
-            )
-            source += body
 
         for kernel in self.kernels:
             kernel_source, name_expression = warp._src.codegen.codegen_kernel(

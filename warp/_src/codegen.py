@@ -752,24 +752,17 @@ class Var:
     def baked_data_name(self, adj: "Adjoint") -> str:
         """C++ expression for this Var's data pointer.
 
-        Three contexts, three identifiers:
-          - kernel arg in kernel body         -> ``var_<label>_data``
-          - kernel arg in templated wp.func   -> ``_wp_baked_var_<label>_data``
-          - view-result baked subarray        -> ``var_<label>.data``
+        Two contexts:
+          - kernel arg                 -> ``var_<label>_data`` (raw ``T* __restrict__``)
+          - view-result baked subarray -> ``var_<label>.data`` (typed local from ``decltype(wp::view(...))``)
 
-        Kernel and wp.func args use the raw ``T* __restrict__`` param
-        so NVRTC can prove no aliasing and unroll the inner loops.
-        The ``baked_array_t<T, ...>`` struct local is materialized from
-        this raw pointer (so ``var_X.data == var_X_data`` always) —
-        generic builtins like ``wp::view`` consume the struct, scheme-B
-        helpers use the raw pointer, both reach the same memory through
-        a single canonical path.  View-results read ``.data`` off the
-        typed local emitted via ``decltype(wp::view(...))``.
+        Inside wp.func template bodies, array args are passed by value
+        as deduced typename parameters — ``var_<label>.data`` (the
+        struct member) is the canonical access, but ``baked_data_name``
+        isn't called there (no T*-ABI in wp.funcs anymore).
         """
         if self.baked_view_of is not None:
             return f"var_{self.label}.data"
-        if adj.is_user_function:
-            return f"_wp_baked_var_{self.label}_data"
         return f"var_{self.label}_data"
 
     def emit_for_attribute(self, attr: str, adj: "Adjoint") -> "Var | None":
@@ -1743,28 +1736,17 @@ class Adjoint:
             if adj.used_by_backward_kernel:
                 func.adj.used_by_backward_kernel = True
 
-            # Propagate baked metadata explicitly to the callee's build.
-            # The caller-side Var carries baked_value; map it onto the
-            # callee's parameter name.  Type guard: only propagate when
-            # the caller-side type matches the baked-value kind, so a
-            # label collision (e.g. an array-typed kernel arg sharing a
-            # name with a struct-typed callee param) doesn't poison
-            # the callee.
-            propagated_baked_params = {}
-            for param_name, arg_var in bound_args.items():
-                if not isinstance(arg_var, Var) or arg_var.baked_value is None:
-                    continue
-                caller_val = arg_var.baked_value
-                if isinstance(caller_val, array_t) and not is_array(arg_var.type):
-                    continue
-                if isinstance(caller_val, ctypes._SimpleCData) and not type_is_value(arg_var.type):
-                    continue
-                propagated_baked_params[param_name] = caller_val
-
+            # No baked-param propagation to wp.func builds: the wp.func
+            # is emitted once as a function template with templated
+            # array arg types (see codegen_func), and C++ template
+            # deduction handles the spec-vs-generic dispatch at the
+            # call site.  Scalars flow through as runtime args; NVRTC
+            # propagates the NTTP value from the kernel-template
+            # instantiation through the inlined wp.func body.
             if adj.builder is None:
-                func.build(None, baked_params=propagated_baked_params)
+                func.build(None)
             elif func not in adj.builder.functions:
-                adj.builder.build_function(func, baked_params=propagated_baked_params)
+                adj.builder.build_function(func)
                 # add custom grad, replay functions to the list of functions
                 # to be built later (invalid code could be generated if we built them now)
                 # so that they are not missed when only the forward function is imported
@@ -1874,36 +1856,14 @@ class Adjoint:
                     # type follows).  No Python-side provenance needed.
                     output.baked_view_of = _src_arr
 
-        # Register a baked variant and rewrite the call name.
-        # Baked param names were already propagated to baked_args above
-        # (before build_function) to enable nested specialization.
-        #
-        # Skip baking for functions with custom replay or custom grad: the
-        # replay/adjoint symbols are codegen'd against the unbaked name, so a
-        # rewritten call site would reference a nonexistent replay_<baked>.
-        baked_call_info = None  # (param_names, baked_params) when call targets a baked variant
-        if (
-            not func.is_builtin()
-            and adj.builder is not None
-            and func.custom_replay_func is None
-            and func.custom_grad_func is None
-            and func.replay_snippet is None
-        ):
-            baked_params = {}
-            for param_name, arg_var in bound_args.items():
-                if not isinstance(arg_var, Var) or arg_var.baked_value is None:
-                    continue
-                # Guard against name-collision false aliases (see the
-                # propagation block above): the baked-value kind must
-                # match the caller-side Var type.
-                val = arg_var.baked_value
-                if isinstance(val, array_t) and is_array(arg_var.type):
-                    baked_params[param_name] = val
-                elif isinstance(val, ctypes._SimpleCData) and type_is_value(arg_var.type):
-                    baked_params[param_name] = val
-            if baked_params:
-                func_name = adj.builder.register_specialized_function(func, func_name, baked_params)
-                baked_call_info = (list(bound_args.keys()), baked_params)
+        # No per-call rewrite for spec'd wp.funcs.  Each wp.func is
+        # emitted once as a function template with its array args as
+        # deduced typename parameters (see ``codegen_func``); the same
+        # template body serves both ``array_t<T>`` and
+        # ``baked_array_t<T, ...>`` call sites via C++ template
+        # deduction.  Scalars flow through as runtime args; NVRTC
+        # constant-propagates the NTTP values from the kernel-template
+        # instantiation through the inlined wp.func body.
 
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
@@ -1924,30 +1884,8 @@ class Adjoint:
             fwd_args.append(strip_reference(func_arg_var))
 
         # When the forward call targets a baked variant, rewrite the arg
-        # list: baked scalars are dropped (emitted as ``const`` inside the
-        # callee), and baked arrays are passed as raw data pointers (the
-        # callee reconstructs a const ``array_t`` with baked shape/stride/ndim).
-        # Reverse and replay calls keep the unbaked ABI — they invoke the
-        # generic ``adj_``/``replay_`` symbols which aren't specialized.
         def _format_fwd_args(args, init_list):
-            if baked_call_info is None:
-                return adj.format_forward_call_args(args, init_list)
-            param_names, _baked_params = baked_call_info
-            parts = []
-            # Output args (tail of ``args``) have no matching param name — keep as-is.
-            n_params = len(param_names)
-            for i, a in enumerate(args):
-                if i < n_params and param_names[i] in _baked_params:
-                    val = _baked_params[param_names[i]]
-                    if isinstance(val, array_t):
-                        parts.append(a.baked_data_name(adj))
-                    # scalar: dropped from the call
-                else:
-                    parts.extend(adj.format_args("var", [a]))
-            arg_str = ", ".join(parts)
-            if init_list:
-                arg_str = f"{{{arg_str}}}"
-            return arg_str
+            return adj.format_forward_call_args(args, init_list)
 
         if return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
@@ -4814,15 +4752,14 @@ def constant_str(value):
 def format_baked_nttps(label, value, warp_type=None):
     """Return ``(template_param_decls, instantiation_literals)`` for one
     baked-arg slot.  Single source of truth for the C++ literal format
-    used at three sites:
+    used at two sites:
 
       - ``codegen_kernel`` spec branch (kernel template params)
-      - ``register_specialized_function`` (wp.func template params)
       - ``_launch_specialized`` (NVRTC name expression at launch time)
 
     Drift between these silently breaks NVRTC lowered-name lookup —
     the launch-time expression must match the codegen-time signature
-    character-for-character.  Routing all three through this helper
+    character-for-character.  Routing both through this helper
     eliminates that class of bug.
 
     Returns 6 entries for ``launch_bounds_t`` (shape_0..3, ndim, size),
@@ -5138,7 +5075,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
     return "".join(l.lstrip() if l.lstrip().startswith("#line") else indent_block + l for l in lines)
 
 
-def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only=False, reverse_only=False):
+def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only=False, reverse_only=False, func=None):
     if options is None:
         options = {}
 
@@ -5188,11 +5125,38 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     template_params = []
 
     # forward args
+    #
+    # Array args are emitted as templated typename parameters (like
+    # tiles) so the SAME wp.func template can be called with either
+    # ``array_t<T>`` (generic kernel context) or ``baked_array_t<T,
+    # NTTPs...>`` (spec kernel context).  C++ template deduction picks
+    # the type at the call site; ``wp::address(arr, i)`` etc. inside the
+    # body dispatches to the right overload based on the deduced type.
+    # No separate "baked variant" of the wp.func is emitted — the
+    # template IS the unified form.
+    #
+    # EXCEPTION: generic wp.funcs (with ``dtype=Any``) instantiate
+    # multiple concrete clones that all share the same C++ ``native_func``
+    # name (see ``Function.get_overload``).  Pre-Phase-2, those clones
+    # had distinct concrete ``array_t<T>`` parameter types — C++
+    # overload resolution picked the right one by argument type.  If we
+    # templatize the array arg, all clones get identical ``(array_t_arg,
+    # int)`` signatures differing only by return type, which C++
+    # rejects.  So for clones (``func.generic_parent is not None``),
+    # keep the concrete ``array_t<T>``; baked arrays slice cleanly to
+    # the base ``array_t<T>`` via inheritance.  Spec NTTPs don't flow
+    # into the wp.func body in that case, but NVRTC's constant
+    # propagation through inlining recovers the values in practice.
+    templatize_arrays = func is None or func.generic_parent is None
     for i, arg in enumerate(adj.args):
         if is_tile(arg.type) or is_tile_stack(arg.type):
             tname = f"tile_{arg.label}"
             template_params.append(tname)
             s = f"{tname}& {arg.emit()}"
+        elif is_array(arg.type) and templatize_arrays:
+            tname = f"array_t_{arg.label}"
+            template_params.append(tname)
+            s = f"{tname} {arg.emit()}"
         else:
             s = f"{arg.ctype()} {arg.emit()}"
         forward_args.append(s)
@@ -5288,110 +5252,6 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
         )
 
     return s
-
-
-def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, baked_params=None, template_params=None):
-    """Emit a specialized wp.func as a C++ function template.
-
-    With C++20 NTTPs, baked values are bare non-type template
-    parameters of the function:
-
-        namespace wp {
-        template<int a_shape_0, int a_shape_1, ..., int a_ndim, float alpha>
-        static CUDA_CALLABLE <ret> <fn>_baked(<T>* a_data, ...) {
-            // body uses bare names: a_shape_0, alpha, etc.
-        }
-        }
-
-    Baked scalars drop from the ABI (their values come through the
-    template arg list).  Baked arrays drop from the ABI too — the
-    callee receives only the raw data pointer ``<T>* _wp_baked_var_<label>_data``.
-    The body references that pointer directly at scheme-B call sites
-    (rewritten by ``add_call._format_fwd_args`` at adj.build() time).
-    ``arr.shape[K]`` reads are constant-folded at codegen time via
-    ``_emit_baked_metadata_subscript`` to bare references like
-    ``a_shape_K`` (the wp.func's template parameter).
-
-    Multiple bakings of the same wp.func share one template
-    declaration; per-baking values come through the template arg list
-    at instantiation.  ``template_params`` carries the signature
-    decls (e.g. ``["int a_shape_0", "float alpha"]``) — built by
-    ``ModuleBuilder.register_specialized_function``.
-    """
-    return_type = adj.return_var[0].ctype() if adj.return_var and len(adj.return_var) == 1 else "void"
-
-    baked_params = baked_params or {}
-    template_params = template_params or []
-
-    def _array_elem_ctype(array_ctype_str):
-        """Extract T from an `array_t<T>` / `wp::array_t<T>` ctype string."""
-        lt = array_ctype_str.find("<")
-        gt = array_ctype_str.rfind(">")
-        if lt >= 0 and gt > lt:
-            return array_ctype_str[lt + 1 : gt].strip()
-        return "void"
-
-    forward_body = codegen_func_forward(adj, func_type="function", device=device)
-
-    forward_args = []
-    baked_decls = ""
-
-    for arg in adj.args:
-        var_name = "var_" + arg.label
-        if arg.label in baked_params:
-            value = baked_params[arg.label]
-            if isinstance(value, array_t):
-                # Baked array: raw data pointer ABI, no struct, no prologue
-                # — except when the body passes the array by value, in
-                # which case materialize the full struct with bare
-                # template-param refs so the copy is correct per
-                # instantiation.
-                elem_ctype = _array_elem_ctype(arg.ctype())
-                data_param = f"_wp_baked_{var_name}_data"
-                forward_args.append(f"{elem_ctype}* {data_param}")
-                # Always materialize the baked_array_t struct local
-                # from the raw pointer.  Single canonical alias path:
-                # ``var_X.data == _wp_baked_var_X_data`` always.
-                baked_decls += bake_array_struct_decl(
-                    elem_ctype, var_name, value, data_param, arg.label, pad="    "
-                )
-            elif isinstance(value, ctypes._SimpleCData):
-                baked_decls += bake_scalar(arg.ctype(), var_name, arg.label, pad="    ")
-            else:
-                # Unknown baked type — fall back to keeping as an ordinary param.
-                forward_args.append(arg.ctype() + " " + var_name)
-        else:
-            forward_args.append(arg.ctype() + " " + var_name)
-
-    if adj.return_var and len(adj.return_var) != 1:
-        forward_args += [arg.ctype() + " & ret_" + str(i) for i, arg in enumerate(adj.return_var)]
-
-    template_str = ", ".join(template_params)
-
-    forward_decl = (
-        f"namespace wp {{\n"
-        f"template<{template_str}>\n"
-        f"static CUDA_CALLABLE {return_type} {mangled_name}({indent(forward_args)});\n"
-        f"}}\n"
-    )
-
-    func_line_directive = ""
-    if line_directive := adj.get_line_directive("", adj.fun_def_lineno - 1):
-        func_line_directive = f"{line_directive}\n"
-
-    body_inner = cuda_forward_function_template.format(
-        name=mangled_name,
-        return_type=return_type,
-        forward_args=indent(forward_args),
-        forward_body=baked_decls + forward_body,
-        filename=adj.filename,
-        lineno=adj.fun_lineno,
-        line_directive=func_line_directive,
-    )
-
-    body = f"namespace wp {{\ntemplate<{template_str}>\n{body_inner}}}\n"
-
-    return forward_decl, body
 
 
 def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_only=False, reverse_only=False):
