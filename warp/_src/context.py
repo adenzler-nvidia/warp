@@ -2230,7 +2230,7 @@ class ModuleBuilder:
         self.options = options
         self.module = module
         self.deferred_functions = []
-        self.specialized_functions = {}  # (func_key, spec_hash) -> (func, mangled_name, baked_params)
+        self.specialized_functions = {}  # (func_key, labels_hash) -> (func, mangled_name, baked_params, template_params)
         # Phase AA: NVRTC name expressions for templated spec kernels.
         # Codegen appends ``"<kernel_name>_cuda_kernel_forward<args...>"`` strings
         # here; the build path passes them to NVRTC and reads back the lowered
@@ -2287,7 +2287,13 @@ class ModuleBuilder:
         # bakings sharing labels can share one template declaration;
         # different values live entirely in the per-call template-arg
         # instantiation.  Different label sets get different
-        # template_names.
+        # template_names.  The label hash is the *only* discriminator
+        # the registry needs: the codegen emission pass dedups on the
+        # ``mangled_name`` derived from this hash, so a separate
+        # value-hash would not produce additional uniqueness.  The
+        # body's codegen depends only on which args are baked + their
+        # element types (label-set properties), not on the specific
+        # baked values.
         labels_h = hashlib.sha256()
         labels_h.update(base_func_name.encode())
         for param_name in sorted(baked_params):
@@ -2296,21 +2302,6 @@ class ModuleBuilder:
             labels_h.update(b"A" if isinstance(val, array_t) else b"S")
         labels_hash = labels_h.hexdigest()[:8]
         template_name = f"{base_func_name}_baked_{labels_hash}"
-
-        # Hash baked values (for spec_hash → unique instantiation key).
-        h = hashlib.sha256()
-        h.update(labels_hash.encode())
-        for param_name in sorted(baked_params):
-            val = baked_params[param_name]
-            h.update(param_name.encode())
-            if isinstance(val, array_t):
-                h.update(val.ndim.to_bytes(4, "little", signed=True))
-                for i in range(val.ndim):
-                    h.update(val.shape[i].to_bytes(4, "little", signed=True))
-                    h.update(val.strides[i].to_bytes(4, "little", signed=True))
-            else:
-                h.update(bytes(val))
-        spec_hash = h.hexdigest()[:8]
 
         # Build the template signature (param decls) and the call-site
         # instantiation (literal values), in the same order.  Array
@@ -2350,11 +2341,13 @@ class ModuleBuilder:
             else:
                 raise ValueError(f"unsupported baked value for '{label}': {type(val).__name__}")
 
-        # Track per-(func, value-hash) so codegen emits one template
-        # body per unique ``template_name`` (deduped), and per-(func,
-        # spec_hash) so multiple bakings with the same labels but
-        # different values aren't double-counted.
-        config_key = (base_func_name, spec_hash)
+        # One entry per (func, labels) — same labels different values
+        # share the body, per-call values ride through the
+        # instantiation args.  The codegen emission pass already dedups
+        # on ``mangled_name`` (= ``template_name``), which is derived
+        # solely from the labels, so the value-hash gives no extra
+        # uniqueness.
+        config_key = (base_func_name, labels_hash)
         if config_key not in self.specialized_functions:
             self.specialized_functions[config_key] = (func, template_name, baked_params, template_params)
 
