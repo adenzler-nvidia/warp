@@ -9562,6 +9562,9 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
         if isinstance(baked, ctypes._SimpleCData):
             continue
         if isinstance(baked, array_t):
+            # T*-ABI: pass only the raw data pointer.  The kernel body
+            # materializes the ``baked_array_t<T, ...>`` struct local
+            # from this pointer (constexpr fields from NTTPs).
             holder = ctypes.c_uint64(int(baked.data))
             _baked_ptr_holders.append(holder)
             kernel_args.append(ctypes.c_void_p(ctypes.addressof(holder)))

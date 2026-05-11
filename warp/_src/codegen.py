@@ -721,27 +721,19 @@ class Var:
         # Used to associate the variable with the Python statement that resulted in it being created.
         self.relative_lineno = relative_lineno
 
-        # Spec-feature metadata.  When `enable_kernel_specialize` is on and
-        # this Var is a kernel/wp.func arg with a baked value, `baked_value`
-        # holds the array_t (with shape/strides/ndim) or _SimpleCData scalar.
-        # `is_used_by_value` is set true if a baked array is passed by value
-        # to a callee that doesn't get rewritten — see `Adjoint.add_call`
-        # and `codegen_func_specialized` for the materialization fallback.
-        # ``_baked_attr_of`` is set on a marker Var returned by
-        # `emit_for_attribute` for `arr.shape` or `arr.strides`; it
-        # carries `(array_var, attr_name)` so `emit_indexing` can
-        # constant-propagate `arr.shape[K]` / `arr.strides[K]` into a
-        # literal at codegen time (or `<label>_<shape|stride>_K`
-        # inside templated wp.funcs).  `arr.ndim` is emitted directly
-        # as a constant — no marker needed.
-        # `baked_view_of` is the immediate source Var of a
-        # view-result; non-None iff this Var is a view-result.  Used by
-        # codegen to emit the local's type as
+        # Spec-feature metadata.  When `enable_kernel_specialize` is on
+        # and this Var is a kernel/wp.func arg with a baked value,
+        # `baked_value` holds the array_t (shape/strides/ndim) or
+        # _SimpleCData scalar.  ``_baked_attr_of`` is set on a marker
+        # Var returned by `emit_for_attribute` for `arr.shape` or
+        # `arr.strides`; carries `(array_var, attr_name)` so
+        # `emit_indexing` can constant-fold `arr.shape[K]` /
+        # `arr.strides[K]`.  ``baked_view_of`` is the immediate source
+        # Var of a view-result; non-None iff this Var is a view-result.
+        # Used by codegen to emit the local's type as
         # ``decltype(wp::view(<src>, 0...))``, letting C++ template
-        # deduction handle per-instantiation correctness across
-        # body-shared wp.funcs (no Python-side root/offset provenance).
+        # deduction handle per-instantiation correctness.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
-        self.is_used_by_value: builtins.bool = False
         self._baked_attr_of: "tuple[Var, str] | None" = None
         self.baked_view_of: "Var | None" = None
 
@@ -765,10 +757,14 @@ class Var:
           - kernel arg in templated wp.func   -> ``_wp_baked_var_<label>_data``
           - view-result baked subarray        -> ``var_<label>.data``
 
-        The first two reference the raw ``T* __restrict__`` parameter
-        emitted by ``codegen_kernel`` / ``codegen_func_specialized``.
-        The third reads the ``data`` field of the ``baked_array_t<...>``
-        local emitted by a preceding ``wp::view`` call.
+        Kernel and wp.func args use the raw ``T* __restrict__`` param
+        so NVRTC can prove no aliasing and unroll the inner loops.
+        The ``baked_array_t<T, ...>`` struct local is materialized from
+        this raw pointer (so ``var_X.data == var_X_data`` always) —
+        generic builtins like ``wp::view`` consume the struct, scheme-B
+        helpers use the raw pointer, both reach the same memory through
+        a single canonical path.  View-results read ``.data`` off the
+        typed local emitted via ``decltype(wp::view(...))``.
         """
         if self.baked_view_of is not None:
             return f"var_{self.label}.data"
@@ -1300,7 +1296,6 @@ class Adjoint:
         # baking (or with a different baking) starts clean.
         for a in adj.args:
             a.baked_value = None
-            a.is_used_by_value = False
         if isinstance(baked_params, dict):
             for a in adj.args:
                 value = baked_params.get(a.label)
@@ -1992,19 +1987,6 @@ class Adjoint:
                 adj.builder.build_function(func_arg_var)
 
             fwd_args.append(strip_reference(func_arg_var))
-
-        # If we're inside a templated wp.func and a baked array is being
-        # passed by value to a call that *won't* be rewritten to use its
-        # raw pointer (i.e. neither a scheme-B baked builtin nor a baked
-        # wp.func call), the callee reads the whole ``array_t<T>``
-        # struct.  Mark the Var so ``codegen_func_specialized``
-        # materializes the struct at function entry — otherwise the
-        # struct name exists in the body text but has no declaration
-        # and NVRTC errors out.
-        if baked_builtin_arr_idx is None and baked_call_info is None:
-            for a in fwd_args:
-                if isinstance(a, Var) and is_array(a.type) and isinstance(a.baked_value, array_t):
-                    a.is_used_by_value = True
 
         # When the forward call targets a baked variant, rewrite the arg
         # list: baked scalars are dropped (emitted as ``const`` inside the
@@ -5466,10 +5448,12 @@ def codegen_func_specialized(adj, mangled_name, device="cuda", options=None, bak
                 elem_ctype = _array_elem_ctype(arg.ctype())
                 data_param = f"_wp_baked_{var_name}_data"
                 forward_args.append(f"{elem_ctype}* {data_param}")
-                if arg.is_used_by_value:
-                    baked_decls += bake_array_struct_decl(
-                        elem_ctype, var_name, value, data_param, arg.label, pad="    "
-                    )
+                # Always materialize the baked_array_t struct local
+                # from the raw pointer.  Single canonical alias path:
+                # ``var_X.data == _wp_baked_var_X_data`` always.
+                baked_decls += bake_array_struct_decl(
+                    elem_ctype, var_name, value, data_param, arg.label, pad="    "
+                )
             elif isinstance(value, ctypes._SimpleCData):
                 baked_decls += bake_scalar(arg.ctype(), var_name, arg.label, pad="    ")
             else:
@@ -5692,20 +5676,29 @@ def codegen_kernel(kernel, device, options):
         for arg in adj.args:
             value = baked_args[arg.label]
             if isinstance(value, array_t):
+                # T*-ABI: kernel takes ``T* __restrict__`` only.  The
+                # ``baked_array_t<T, ...>`` struct local is materialized
+                # below from the raw pointer (constexpr fields from
+                # NTTPs, data pointer from the kernel arg) so generic
+                # builtins like ``wp::view`` / ``wp::where`` have a
+                # struct to consume — but the struct's data field is
+                # the same ``__restrict__`` pointer, so NVRTC's alias
+                # analysis sees a single canonical path to the memory.
+                # Unconditional materialization (no ``is_used_by_value``
+                # gate): NVRTC DCEs when the struct is unused.
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
                 decls, lits = format_baked_nttps(arg.label, value)
                 kernel_template_params.extend(decls)
                 kernel_template_values.extend(lits)
-                if arg.is_used_by_value:
-                    baked_decls_inner += bake_array_struct_decl(
-                        elem_ctype,
-                        f"var_{arg.label}",
-                        value,
-                        f"var_{arg.label}_data",
-                        arg.label,
-                        pad="        ",
-                    )
+                baked_decls_inner += bake_array_struct_decl(
+                    elem_ctype,
+                    f"var_{arg.label}",
+                    value,
+                    f"var_{arg.label}_data",
+                    arg.label,
+                    pad="        ",
+                )
             elif isinstance(value, ctypes._SimpleCData):
                 decls, lits = format_baked_nttps(arg.label, value, warp_type=arg.type)
                 kernel_template_params.extend(decls)
