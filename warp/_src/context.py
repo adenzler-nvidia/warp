@@ -2301,7 +2301,16 @@ class ModuleBuilder:
             val = baked_params[param_name]
             labels_h.update(b"A" if isinstance(val, array_t) else b"S")
         labels_hash = labels_h.hexdigest()[:8]
-        template_name = f"{base_func_name}_baked_{labels_hash}"
+        # The templated wp.func has the same C++ name as the (popped)
+        # generic — different signature (NTTPs + raw T* instead of
+        # ``array_t<T>``), so C++ overload resolution picks it
+        # unambiguously at the call site.  No legacy ``_baked_<hash>``
+        # naming convention required: now that everything is a template,
+        # the "baked variant" is just the templated overload.  The
+        # labels_hash stays as a dict key (to dedup emissions when
+        # multiple callers happen to bake the same label set with
+        # different values), but does not appear in the symbol name.
+        template_name = base_func_name
 
         # Build the template signature (param decls) and the call-site
         # instantiation (literal values), in the same order.  Array

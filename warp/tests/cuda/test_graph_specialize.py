@@ -556,13 +556,19 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Both outer and inner should have baked variants
-        self.assertIn("outer_scale_0_baked_", source)
-        self.assertIn("inner_add_0_baked_", source)
-        # The baked outer body should call the baked inner (not generic)
+        # Both outer and inner should have templated overloads (same C++
+        # name as the generic; C++ overload resolution distinguishes by
+        # signature — generic takes ``array_t<T>``, spec takes ``T*``).
+        # Detect by the ``T* _wp_baked_var_*_data`` parameter that only
+        # the templated form has.
+        self.assertRegex(source, r"outer_scale_0\([^)]*_wp_baked_var_arr_data")
+        self.assertRegex(source, r"inner_add_0\([^)]*_wp_baked_var_arr_data")
+        # The baked outer body should call the baked inner (call site
+        # passes raw data pointer, which resolves to the templated
+        # overload).
         import re
 
-        self.assertRegex(source, re.compile(r"outer_scale_0_baked_\w+.*?inner_add_0_baked_\w+", re.DOTALL))
+        self.assertRegex(source, re.compile(r"outer_scale_0\([^)]*_wp_baked_var_arr_data.*?inner_add_0<[^>]+>\([^)]*_wp_baked_var_arr_data", re.DOTALL))
 
     # ---- Correctness (parametrized: specialized vs generic) ----
 
@@ -732,21 +738,23 @@ class TestKernelSpecialize(unittest.TestCase):
         new_specs = _run_specialized(scalar_through_func, dim=N, inputs=[a, out, 5.0], device=device)
         self.assertTrue(len(new_specs) > 0)
 
-        # Verify the baked function variant exists (a wp.func template
-        # is emitted with `s` as an NTTP).  Templated kernel: the
+        # Verify the templated wp.func overload exists (same C++ name as
+        # the generic ``scale_func_0`` — C++ overload resolution
+        # distinguishes by signature; the spec form takes the scalar as
+        # an NTTP rather than a runtime arg).  Templated kernel: the
         # kernel calls the wp.func template instantiated with the scalar.
         cu_path = _find_spec_cu("scalar_through_func")
         self.assertIsNotNone(cu_path)
         with open(cu_path) as f:
             source = f.read()
-        self.assertIn("scale_func_0_baked_", source)
+        # Templated overload declaration.
+        self.assertRegex(source, r"template<float s>\s+static CUDA_CALLABLE wp::float32 scale_func_0\(")
         # The kernel body references the scalar via the template arg `s`
         # (NVRTC instantiates per baking via nvrtcAddNameExpression).
         self.assertIn("var_s = s;", source)
         # And the wp.func template instantiation in the body uses the
         # scalar value as a template arg.
-        self.assertIn("scale_func_0_baked_", source)
-        self.assertIn("<5.0f>", source)
+        self.assertIn("scale_func_0<5.0f>", source)
 
         np.testing.assert_allclose(out.numpy(), a.numpy() * 5.0, rtol=1e-5)
 
