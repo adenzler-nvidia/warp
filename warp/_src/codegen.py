@@ -732,14 +732,17 @@ class Var:
         #     ``emit_for_attribute`` for ``arr.shape`` / ``arr.strides``;
         #     carries ``(array_var, attr_name)`` so ``emit_indexing``
         #     can constant-fold ``arr.shape[K]`` / ``arr.strides[K]``.
-        #   - ``baked_view_of``: source Var of a view-result; non-None
-        #     iff this Var came from ``wp::view`` on a baked source.
-        #     Drives the view-result local's C++ type emission as
-        #     ``decltype(wp::view(<src>, 0...))`` so deduction picks
-        #     up the post-view ``baked_array_t<...>`` shape.
+        #   - ``baked_view_ctype``: precomputed C++ type-override string
+        #     for view-result locals (e.g. ``decltype(wp::view(var_src,
+        #     0))``).  Set in ``add_call`` when ``wp::view`` fires on a
+        #     baked source; read at primal-vars emission to declare the
+        #     local with the right type so deduction carries the
+        #     post-view ``baked_array_t<...>`` shape through.  Doubles
+        #     as the "is this Var a view-result?" signal for
+        #     ``_emit_baked_metadata_subscript``.
         self.baked_value: array_t | ctypes._SimpleCData | None = None
         self._baked_attr_of: "tuple[Var, str] | None" = None
-        self.baked_view_of: "Var | None" = None
+        self.baked_view_ctype: str | None = None
 
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
@@ -1835,13 +1838,15 @@ class Adjoint:
                         strides=tuple(_src_strides[_consumed:]),
                     )
                     output.baked_value = _sub
-                    # Record the immediate source so codegen can emit the
-                    # view-result local's type via ``decltype(wp::view(<src>, 0...))``
-                    # — C++ template deduction handles per-instantiation
-                    # correctness inside body-shared wp.funcs (the source's
-                    # type carries the right template args; the view return
-                    # type follows).  No Python-side provenance needed.
-                    output.baked_view_of = _src_arr
+                    # Precompute the view-result local's C++ type so
+                    # primal-vars emission can declare it with the right
+                    # post-view ``baked_array_t<...>`` shape via C++
+                    # template deduction (``decltype`` of the same
+                    # ``wp::view`` call shape).  Doubles as the
+                    # is-view-result signal for
+                    # ``_emit_baked_metadata_subscript``.
+                    _zeros = ", ".join(["0"] * _consumed)
+                    output.baked_view_ctype = f"decltype(wp::view(var_{_src_arr.label}, {_zeros}))"
 
         # No per-call rewrite for spec'd wp.funcs.  Each wp.func is
         # emitted once as a function template with its array args as
@@ -2518,7 +2523,7 @@ class Adjoint:
         config_stem = "shape" if attr == "shape" else "stride"
         ndim = int(arr_var.baked_value.ndim)
 
-        is_view_result = arr_var.baked_view_of is not None
+        is_view_result = arr_var.baked_view_ctype is not None
         out = adj.add_var(int32)
 
         # All baked-array attribute access happens inside a templated body
@@ -4930,31 +4935,17 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     lines += ["// primal vars\n"]
 
     # View-result baked sub-arrays carry their static shape/stride/ndim
-    # via the C++ type of the local — set by ``add_call`` when ``wp::view``
-    # fires on a baked source.  Emit the local's type as
-    # ``decltype(wp::view(<src>, 0...))`` so C++ template deduction picks
-    # the post-view ``baked_array_t<...>`` type without Python-side
-    # provenance computation.  Inside body-shared wp.funcs, the source's
-    # type already carries the wp.func's template args; the deduced view
-    # return type follows naturally per instantiation.
-    def _baked_view_ctype(var):
-        src = var.baked_view_of
-        if src is None or not isinstance(var.baked_value, array_t):
-            return None
-        if not is_array(strip_reference(var.type)):
-            return None
-        consumed = int(src.baked_value.ndim) - int(var.baked_value.ndim)
-        zeros = ", ".join(["0"] * consumed)
-        return f"decltype(wp::view(var_{src.label}, {zeros}))"
-
+    # via the C++ type of the local — ``add_call`` precomputes the
+    # ``decltype(wp::view(<src>, 0...))`` string and stashes it on the
+    # Var as ``baked_view_ctype``.  C++ template deduction handles
+    # per-instantiation correctness inside body-shared wp.funcs.
     for var in adj.variables:
         if is_tile(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
         elif is_tile_stack(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
         elif var.constant is None:
-            override = _baked_view_ctype(var)
-            ctype = override if override is not None else var.ctype()
+            ctype = var.baked_view_ctype or var.ctype()
             lines += [f"{ctype} {var.emit()};\n"]
         else:
             lines += [f"const {var.ctype()} {var.emit()} = {constant_str(var.constant)};\n"]
