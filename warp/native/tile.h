@@ -2660,11 +2660,18 @@ inline CUDA_CALLABLE auto tile_load(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, 
     return tile_global_t<T, tile_shape_t<Shape...>, BoundsCheck, Aligned, Src>(src, tile_coord(offset...));
 }
 
-// used for indexed loads and stores
-template <typename T, typename IndicesTile, typename Coord>
+// used for indexed loads and stores.  Templated on the source array
+// type so the same body serves `array_t<T>` (runtime shape/strides
+// fields) and `baked_array_t<T, NTTPs...>` (compile-time NTTPs).
+// `tile_shape_at` / `tile_strides_at` overloads in array.h dispatch
+// per-type — baked sources collapse to template-arg constants via a
+// `WP_PRAGMA_UNROLL`'d ternary, generic sources read the runtime
+// fields unchanged.
+template <typename ArrT, typename IndicesTile, typename Coord>
 inline CUDA_CALLABLE bool
-compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coord c, int& out)
+compute_index(ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, int& out)
 {
+    using T = typename ArrT::Type;
     int index = 0;
 
     WP_PRAGMA_UNROLL
@@ -2674,19 +2681,19 @@ compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coo
             int index_along_axis = offset[i] + indices.data(c[i]);
 
             // handle out of bounds case
-            if (index_along_axis >= src.shape[i])
+            if (index_along_axis >= tile_shape_at(src, i))
                 return false;
             else
-                index += src.strides[i] * index_along_axis;
+                index += tile_strides_at(src, i) * index_along_axis;
         } else {
             // global = offset_coord + coord
             int g = offset[i] + c[i];
 
             // handle out of bounds case
-            if (g >= src.shape[i])
+            if (g >= tile_shape_at(src, i))
                 return false;
             else
-                index += src.strides[i] * g;
+                index += tile_strides_at(src, i) * g;
         }
     }
 
@@ -2696,9 +2703,14 @@ compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coo
 }
 
 
-template <unsigned... Shape, typename T, typename IndicesTile, typename... Offset>
-inline CUDA_CALLABLE auto tile_load_indexed(array_t<T>& src, IndicesTile& indices, int axis, Offset... offset)
+// Templated on the source array type — accepts both ``array_t<T>``
+// and ``baked_array_t<T, NTTPs...>``.  The latter routes through
+// ``compute_index`` (templated above) so the NTTPs flow into
+// shape/stride reads via ``tile_shape_at`` / ``tile_strides_at``.
+template <unsigned... Shape, typename ArrT, typename IndicesTile, typename... Offset>
+inline CUDA_CALLABLE auto tile_load_indexed(ArrT& src, IndicesTile& indices, int axis, Offset... offset)
 {
+    using T = typename ArrT::Type;
     auto out = tile_register_t<T, tile_layout_register_t<tile_shape_t<Shape...>>>();
     auto offset_coord = tile_coord(offset...);
 
@@ -2827,9 +2839,13 @@ tile_store(baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& dest, int
     );
 }
 
-template <typename T, int M, typename Tile, typename Coord>
+// Templated on the destination array type — accepts both ``array_t<T>``
+// and ``baked_array_t<T, NTTPs...>``.  ndim-wrapper variants below
+// follow the same generalization so codegen call sites resolve to the
+// right baked dispatch through ``compute_index``.
+template <int M, typename ArrT, typename Tile, typename Coord>
 inline CUDA_CALLABLE void tile_store_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     Coord offset,
@@ -2846,16 +2862,16 @@ inline CUDA_CALLABLE void tile_store_indexed(
 }
 
 // entry point for tile index store operations
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE void tile_store_indexed(
-    array_t<T>& dest, tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices, int axis, int x, Tile& src
+    ArrT& dest, tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices, int axis, int x, Tile& src
 )
 {
     tile_store_indexed(dest, indices, axis, tile_coord(x), src);
 }
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE void tile_store_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,
@@ -2865,9 +2881,9 @@ inline CUDA_CALLABLE void tile_store_indexed(
 {
     tile_store_indexed(dest, indices, axis, tile_coord(x, y), src);
 }
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE void tile_store_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,
@@ -2878,9 +2894,9 @@ inline CUDA_CALLABLE void tile_store_indexed(
 {
     tile_store_indexed(dest, indices, axis, tile_coord(x, y, z), src);
 }
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE void tile_store_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,
@@ -2894,41 +2910,50 @@ inline CUDA_CALLABLE void tile_store_indexed(
 }
 
 
+// Templated on the destination array type — accepts both ``array_t<T>``
+// and ``baked_array_t<T, NTTPs...>``.  For baked sources, the
+// ``tile_global_t`` is instantiated with ``Src=baked_array_t<...>`` so
+// the static shape/stride NTTPs flow through ``index_from_coord``'s
+// ``tile_strides_at`` dispatch.
 // compiler struggles with these if they are one line
-template <typename T, bool BoundsCheck, typename Tile>
-inline CUDA_CALLABLE auto tile_atomic_add(array_t<T>& dest, int x, Tile& src)
+template <typename T, bool BoundsCheck, typename Tile, typename ArrT>
+inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, Tile& src)
 {
-    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck> global(dest, tile_coord(x));
+    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, false, ArrT> global(dest, tile_coord(x));
     return src.atomic_add(global);
 }
-template <typename T, bool BoundsCheck, typename Tile>
-inline CUDA_CALLABLE auto tile_atomic_add(array_t<T>& dest, int x, int y, Tile& src)
+template <typename T, bool BoundsCheck, typename Tile, typename ArrT>
+inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, int y, Tile& src)
 {
-    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck> global(dest, tile_coord(x, y));
+    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, false, ArrT> global(dest, tile_coord(x, y));
     return src.atomic_add(global);
 }
-template <typename T, bool BoundsCheck, typename Tile>
-inline CUDA_CALLABLE auto tile_atomic_add(array_t<T>& dest, int x, int y, int z, Tile& src)
+template <typename T, bool BoundsCheck, typename Tile, typename ArrT>
+inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, int y, int z, Tile& src)
 {
-    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck> global(dest, tile_coord(x, y, z));
+    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, false, ArrT> global(dest, tile_coord(x, y, z));
     return src.atomic_add(global);
 }
-template <typename T, bool BoundsCheck, typename Tile>
-inline CUDA_CALLABLE auto tile_atomic_add(array_t<T>& dest, int x, int y, int z, int w, Tile& src)
+template <typename T, bool BoundsCheck, typename Tile, typename ArrT>
+inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, int y, int z, int w, Tile& src)
 {
-    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck> global(dest, tile_coord(x, y, z, w));
+    tile_global_t<T, typename Tile::Layout::Shape, BoundsCheck, false, ArrT> global(dest, tile_coord(x, y, z, w));
     return src.atomic_add(global);
 }
 
-template <typename T, int M, typename Tile, typename Coord>
+// Templated on the destination array type — accepts both ``array_t<T>``
+// and ``baked_array_t<T, NTTPs...>``.  ndim-wrapper variants below
+// follow the same generalization.
+template <int M, typename ArrT, typename Tile, typename Coord>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     Coord offset,
     Tile& src
 )
 {
+    using T = typename ArrT::Type;
     auto src_reg = src.copy_to_register();
     auto ret_reg = tile_register_like<Tile>();
 
@@ -2944,17 +2969,17 @@ inline CUDA_CALLABLE auto tile_atomic_add_indexed(
 }
 
 // entry point for tile index atomic add operations
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
-    array_t<T>& dest, tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices, int axis, int x, Tile& src
+    ArrT& dest, tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices, int axis, int x, Tile& src
 )
 {
     return tile_atomic_add_indexed(dest, indices, axis, tile_coord(x), src);
 }
 
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,
@@ -2965,9 +2990,9 @@ inline CUDA_CALLABLE auto tile_atomic_add_indexed(
     return tile_atomic_add_indexed(dest, indices, axis, tile_coord(x, y), src);
 }
 
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,
@@ -2979,9 +3004,9 @@ inline CUDA_CALLABLE auto tile_atomic_add_indexed(
     return tile_atomic_add_indexed(dest, indices, axis, tile_coord(x, y, z), src);
 }
 
-template <typename T, int M, typename Tile>
+template <int M, typename ArrT, typename Tile>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
-    array_t<T>& dest,
+    ArrT& dest,
     tile_shared_t<int, tile_layout_strided_t<tile_shape_t<M>>>& indices,
     int axis,
     int x,

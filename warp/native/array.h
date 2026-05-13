@@ -173,6 +173,8 @@ inline CUDA_CALLABLE void adj_print(shape_t s, shape_t& adj_s) { }
 
 
 template <typename T> struct array_t {
+    using Type = T;
+
     CUDA_CALLABLE inline array_t()
         : data(nullptr)
         , grad(nullptr)
