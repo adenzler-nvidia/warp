@@ -2238,10 +2238,10 @@ class ModuleBuilder:
         self.options = options
         self.module = module
         self.deferred_functions = []
-        # Phase AA: NVRTC name expressions for templated spec kernels.
-        # Codegen appends ``"<kernel_name>_cuda_kernel_forward<args...>"`` strings
-        # here; the build path passes them to NVRTC and reads back the lowered
-        # mangled symbols from ``<output>.symbols``.
+        # NVRTC name expressions for templated spec kernels.  Codegen
+        # appends ``"<kernel_name>_cuda_kernel_forward<args...>"`` strings
+        # here; the build path passes them to NVRTC and reads back the
+        # lowered mangled symbols from ``<output>.symbols``.
         self.name_expressions = []
         self.fatbins = {}  # map from <some identifier> to fatbins, to add at link time
         self.ltoirs = {}  # map from lto symbol to lto binary
@@ -2291,10 +2291,9 @@ class ModuleBuilder:
         # otherwise).  No need for the back channel through
         # ``module.options["baked_args"]``.
         baked = kernel.options.get("baked_args")
-        # Phase AA: spec kernel body emits with template-arg references
-        # (``<label>_shape_K`` etc.) so codegen branches that pick
-        # template-arg refs vs literals route through the same path
-        # used for templated wp.func bodies.
+        # Spec kernel body emits with template-arg references
+        # (``<label>_shape_K`` etc.) — the codegen branches that pick
+        # template-arg refs vs literals key off ``adj.in_spec_kernel``.
         if isinstance(baked, dict) and "dim" in baked:
             kernel.adj.in_spec_kernel = True
         kernel.adj.build(self, baked_params=baked)
@@ -2456,9 +2455,10 @@ class ModuleExec:
         self.device = device
         self.kernel_hooks = {}
         self.meta = meta
-        # Phase AA: maps name expressions (e.g. ``"axpy_HASH_cuda_kernel_forward<256, 4, ...>"``)
-        # to lowered (mangled) symbol names; populated from
-        # ``<binary>.symbols`` at module-load time for templated spec kernels.
+        # Maps NVRTC name expressions (e.g.
+        # ``"axpy_HASH_cuda_kernel_forward<256, 4, ...>"``) to lowered
+        # (mangled) symbol names; populated from ``<binary>.symbols``
+        # at module-load time for templated spec kernels.
         self.lowered_names = lowered_names or {}
 
     # release the loaded module
@@ -2490,10 +2490,10 @@ class ModuleExec:
 
         if self.device.is_cuda:
             forward_name = name + "_cuda_kernel_forward"
-            # Phase AA: spec kernels are templated and looked up by their
+            # Spec kernels are templated and looked up by their
             # NVRTC-computed mangled name.  ``kernel.spec_name_expression``
-            # is set in ``_launch_specialized``; the .symbols mapping was
-            # parsed at module-load time.
+            # is set in ``_launch_specialized``; the ``.symbols``
+            # mapping was parsed at module-load time.
             spec_expr = getattr(kernel, "spec_name_expression", None)
             if spec_expr is not None:
                 lookup_name = self.lowered_names.get(spec_expr, spec_expr)
@@ -3298,8 +3298,8 @@ class Module:
             elif device.is_cuda:
                 cuda_module = warp._src.build.load_cuda(binary_path, device)
                 if cuda_module is not None:
-                    # Phase AA: parse `<binary>.symbols` (written by NVRTC
-                    # via wp_cuda_compile_program when name expressions
+                    # Parse ``<binary>.symbols`` (written by NVRTC via
+                    # ``wp_cuda_compile_program`` when name expressions
                     # were registered) so the launch path can map a
                     # templated spec kernel's name expression to its
                     # lowered (mangled) symbol.
@@ -5599,7 +5599,7 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_char_p),  # ltoirs
                 ctypes.POINTER(ctypes.c_size_t),  # ltoir_sizes
                 ctypes.POINTER(ctypes.c_int),  # ltoir_input_types, each of type nvJitLinkInputType
-                ctypes.c_int,  # num_name_expressions (Phase AA)
+                ctypes.c_int,  # num_name_expressions
                 ctypes.POINTER(ctypes.c_char_p),  # name_expressions
             ]
             self.core.wp_cuda_compile_program.restype = ctypes.c_size_t
@@ -9350,11 +9350,11 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     module = get_module(module_name)
     module.options["enable_backward"] = False
 
-    # Phase AA: build the C++ name expression for this baked
-    # instantiation.  NVRTC compiles the template instance and exposes
-    # its mangled symbol via ``nvrtcGetLoweredName``; the launch path
-    # looks up the lowered name from ``ModuleExec.lowered_names`` and
-    # uses it for ``cuModuleGetFunction``.  Format must match what
+    # Build the C++ name expression for this baked instantiation.
+    # NVRTC compiles the template instance and exposes its mangled
+    # symbol via ``nvrtcGetLoweredName``; the launch path looks up the
+    # lowered name from ``ModuleExec.lowered_names`` and uses it for
+    # ``cuModuleGetFunction``.  Format must match what
     # ``codegen_kernel``'s spec branch emits — routed through the same
     # ``format_baked_nttps`` helper to keep both sides in lockstep.
     name_expr_values = list(warp._src.codegen.format_baked_nttps("dim", bounds)[1])

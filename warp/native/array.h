@@ -294,11 +294,9 @@ template <typename T> struct array_t {
 //     in the kernel body — the upcast is purely a type change.
 //   - The inherited shape / strides / ndim / flags fields are
 //     written exactly once at the baked_array_t ctor, from the
-//     compile-time template args.  NVRTC folds those writes the
-//     same way it does for the pre-Phase-F direct-field reconstruction
-//     pattern (Phase E baseline IR), and downstream `src.shape[i]` /
-//     `src.strides[i]` reads inside generic consumers fold to
-//     constants.
+//     compile-time template args.  NVRTC folds those writes via
+//     constexpr-init, so downstream ``src.shape[i]`` / ``src.strides[i]``
+//     reads inside generic consumers fold to constants.
 //
 // Templated overloads of `view` below fire ahead of the generic
 // `array_t<T>&` versions when the static baked type is preserved at
@@ -1417,11 +1415,12 @@ inline CUDA_CALLABLE void array_store(const A<T>& buf, int i, int j, int k, int 
     index(buf, i, j, k, l) = value;
 }
 
-// Phase X: scheme-B address helpers for baked arrays — one template
-// per ndim, instantiated per (shape, stride, T) by codegen call sites.
-// Codegen emits e.g. `wp::wp_address_baked_2d<S0, S1, St0, St1>(data,
-// i, j)` for a baked-array element access.  No JIT helper emission;
-// the templates live here statically.  array_store / atomic_X reuse
+// Scheme-B address helpers for baked arrays — one template per ndim,
+// instantiated per (shape, stride, T) by the dispatch wrappers below.
+// The dispatch wrappers ``address(baked_array_t<...>&, int...)`` read
+// the static shape/stride NTTPs off the baked source's type and pass
+// them as template args here, so the offset math is constexpr-folded
+// at instantiation time.  array_store / atomic_X reuse
 // these by wrapping the call site inline (`*addr = v`, `wp::atomic_X(addr, v)`).
 template <int S0, int St0, typename T>
 inline CUDA_CALLABLE T* wp_address_baked_1d(T* data, int i0)
@@ -1454,13 +1453,14 @@ inline CUDA_CALLABLE T* wp_address_baked_4d(T* data, int i0, int i1, int i2, int
         + ((i3 < 0 ? i3 + S3 : i3) * St3));
 }
 
-// Phase Z: views are "just retemplated arrays" — the view-result
-// `baked_array_t<...>` local carries all static info on its type.
-// Element access on view-results goes through standard wp::address /
-// wp::array_store / wp::atomic_* call sites; overload resolution picks
-// these baked-array overloads, deduces S0..., St0... from the type,
-// and delegates to wp_address_baked_<N>d above.  Identical SASS to the
-// scheme-B path used for raw-pointer kernel args.
+// Views on baked arrays return baked sub-arrays (see ``view``
+// overloads above), so the view-result local carries all static info
+// on its type.  Element access on view-results goes through standard
+// ``wp::address`` / ``wp::array_store`` / ``wp::atomic_*`` call sites;
+// overload resolution picks these baked-array overloads, deduces
+// S0..., St0... from the type, and delegates to wp_address_baked_<N>d
+// above.  Identical SASS to the scheme-B path used for raw-pointer
+// kernel args.
 #define WP_BAKED_TPL \
     template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 #define WP_BAKED_AT const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&
@@ -1508,14 +1508,14 @@ template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 }
 
 // Specific overload for storing a baked_array_t value into an
-// `array_t<T>*` slot (e.g. `geom1.vert = mesh_vert` where the
-// struct field is `array_t<vec3>` and the kernel arg `mesh_vert` is
-// declared as `baked_array_t<vec3, ...>` after Phase J).  Without
-// this, `wp::store(T*, T)` fails template deduction because the two
-// args' Ts (`array_t<vec3>` vs `baked_array_t<vec3, ...>`) don't
-// match — the implicit-conversion path can't be used during
-// deduction.  The slicing assignment to the base subobject is what
-// the array_t<T> case did before Phase J.
+// ``array_t<T>*`` slot (e.g. ``geom1.vert = mesh_vert`` where the
+// struct field is ``array_t<vec3>`` and the kernel arg ``mesh_vert``
+// is declared as ``baked_array_t<vec3, ...>``).  Without this,
+// ``wp::store(T*, T)`` fails template deduction because the two args'
+// Ts (``array_t<vec3>`` vs ``baked_array_t<vec3, ...>``) don't match
+// — implicit conversion isn't considered during deduction.  The
+// slicing assignment to the base subobject preserves data + the
+// inherited runtime fields populated by the baked ctor.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 inline CUDA_CALLABLE void
 store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& value)

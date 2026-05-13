@@ -1069,11 +1069,9 @@ class Adjoint:
         adj.func = func
 
         adj.is_user_function = is_user_function
-        # Phase AA: set true while emitting a templated spec kernel body
-        # so attribute access / scheme-B dispatch use bare template-arg
-        # references (``<label>_shape_K`` etc.) instead of the first
-        # caller's literals — same routing that templated wp.func bodies
-        # use, just applied to the kernel body too.
+        # Set while emitting a templated spec kernel body so attribute
+        # access / scheme-B dispatch use bare template-arg references
+        # (``<label>_shape_K`` etc.) instead of literal substitution.
         adj.in_spec_kernel = False
 
         # whether the generation of the forward code is skipped for this function
@@ -4539,12 +4537,12 @@ cuda_kernel_template_forward = """
 
 """
 
-# Phase AA: templated spec kernel.  Same body shape as the non-spec
-# template, but with a C++ template prefix carrying every baked value
-# as an NTTP and no `extern "C"` (templates can't have C linkage).
-# NVRTC instantiates the kernel via nvrtcAddNameExpression; the lowered
-# (mangled) symbol is looked up via nvrtcGetLoweredName.  At namespace
-# scope (no enclosing `extern "C"`).
+# Templated spec kernel.  Same body shape as the non-spec template,
+# but with a C++ template prefix carrying every baked value as an
+# NTTP and no ``extern "C"`` (templates can't have C linkage).  NVRTC
+# instantiates the kernel via ``nvrtcAddNameExpression``; the lowered
+# (mangled) symbol is looked up via ``nvrtcGetLoweredName``.  Emitted
+# at namespace scope (no enclosing ``extern "C"``).
 cuda_spec_kernel_template_forward = """
 
 {line_directive}template <{template_params}>
@@ -4797,9 +4795,9 @@ def format_baked_nttps(label, value, warp_type=None):
 
 def bake_scalar(ctype_str, var_name, label, pad="    "):
     """Generate ``const T var_X = label;`` for a baked scalar inside a
-    templated body — the RHS is the bare template-arg name (kernel and
-    wp.func bodies are both templates after Phase AA, so all baked
-    scalars resolve via NVRTC instantiation, never literal substitution).
+    templated kernel body — the RHS is the bare template-arg name so
+    the value resolves via NVRTC instantiation, never literal
+    substitution.
     """
     return f"{pad}const {ctype_str} {var_name} = {label};\n"
 
@@ -5346,7 +5344,8 @@ def codegen_kernel(kernel, device, options):
         template_forward = cpu_kernel_template_forward
         template_backward = cpu_kernel_template_backward
     elif device == "cuda":
-        # Spec mode: use the templated kernel form (Phase AA).
+        # Spec mode: emit a C++ template kernel with NTTPs for every
+        # baked value; non-spec uses the plain extern "C" form.
         baked_args = kernel.options.get("baked_args")
         is_spec_cuda = bool(isinstance(baked_args, dict) and "dim" in baked_args)
         template_forward = cuda_spec_kernel_template_forward if is_spec_cuda else cuda_kernel_template_forward
@@ -5382,17 +5381,19 @@ def codegen_kernel(kernel, device, options):
     baked_decls_outer = ""
     baked_decls_inner = ""
 
-    # Phase AA: collected for templated spec kernel emission
-    kernel_template_params = []   # signature: ["int dim_shape_0", ..., "float alpha"]
-    kernel_template_values = []   # instantiation: ["256", ..., "2.0f"]
+    # Collected for templated spec kernel emission: signature decls
+    # like ``"int dim_shape_0"``, ``"float alpha"`` and the parallel
+    # instantiation literals ``"256"``, ``"2.0f"``.
+    kernel_template_params = []
+    kernel_template_values = []
 
     if specialize:
-        # Phase AA: every baked value becomes an NTTP on the kernel
-        # template; the kernel body uses bare references to those
-        # template args (no Python literal substitution).  NVRTC
-        # instantiates the requested kernel via nvrtcAddNameExpression
-        # and we look up the lowered (mangled) name from the .symbols
-        # file post-compile.
+        # Every baked value becomes an NTTP on the kernel template; the
+        # kernel body uses bare references to those template args (no
+        # Python literal substitution).  NVRTC instantiates the
+        # requested kernel via ``nvrtcAddNameExpression`` and we look
+        # up the lowered (mangled) name from the ``.symbols`` file
+        # post-compile.
         bounds = baked_args["dim"]
         dim_decls, dim_lits = format_baked_nttps("dim", bounds)
         kernel_template_params.extend(dim_decls)
@@ -5419,8 +5420,8 @@ def codegen_kernel(kernel, device, options):
                 # struct to consume — but the struct's data field is
                 # the same ``__restrict__`` pointer, so NVRTC's alias
                 # analysis sees a single canonical path to the memory.
-                # Unconditional materialization (no ``is_used_by_value``
-                # gate): NVRTC DCEs when the struct is unused.
+                # Materialization is unconditional: NVRTC DCEs the
+                # struct when nothing reads it.
                 elem_ctype = Var.type_to_ctype(arg.type.dtype)
                 forward_args.append(f"{elem_ctype}* __restrict__ var_{arg.label}_data")
                 decls, lits = format_baked_nttps(arg.label, value)
@@ -5488,7 +5489,7 @@ def codegen_kernel(kernel, device, options):
         template += template_backward
 
     s = template.format(**template_fmt_args)
-    # Phase AA: spec mode emits a templated kernel — return the C++ name
+    # Spec mode emits a templated kernel — return the C++ name
     # expression so the caller can register it with NVRTC and look up
     # the lowered (mangled) symbol after compile.  Non-spec kernels
     # return None.

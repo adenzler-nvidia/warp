@@ -653,16 +653,13 @@ template <typename Shape> struct tile_coord_iter_t {
 // Aligned: when true, the caller guarantees: (1) base address at tile offset is 16-byte aligned,
 //   (2) array is contiguous (dense row-major strides), (3) outer-dimension strides are multiples of
 //   16 bytes, and (4) tile fits entirely within array bounds. Skips runtime checks in tile_can_vectorize().
-// Source-array type defaults to `array_t<T>` so existing instantiations
-// (`tile_global_t<T, Shape, BoundsCheck, Aligned>`) continue to work.
-// When a baked source is passed in (e.g. a `baked_array_t<...>` view-
-// result local), the corresponding `tile_load` overload below picks
-// `Src = baked_array_t<...>` so the static shape/stride template args
-// flow into `tile_global_t::data` rather than being slice-copied to a
-// plain `array_t<T>`.  Subsequent reads (`data.shape[i]`,
-// `data.strides[i]`) go through the inherited fields which are
-// constexpr-initialised, so NVRTC folds them to immediates either way
-// — but the C++ type signature remains template-encoded end-to-end.
+// Src is the source-array type — ``array_t<T>`` (the default, for
+// runtime-stride sources) or ``baked_array_t<T, NTTPs...>`` when the
+// call site knows the static shape/strides.  Passing the concrete
+// baked type keeps the static info on ``data`` so ``index_from_coord``
+// reads strides via ``tile_strides_at`` (per-type dispatch) instead of
+// slicing to a plain ``array_t<T>`` and losing the NTTPs at the C++
+// source level.
 template <typename T, typename Shape_, bool BoundsCheck = true, bool Aligned = false, typename Src = array_t<T>>
 struct tile_global_t {
     using Type = T;
@@ -693,9 +690,7 @@ struct tile_global_t {
             // for `Src = baked_array_t<...>` the ternary collapses to
             // a template-arg constant after WP_PRAGMA_UNROLL substitutes
             // a literal `i`; for `Src = array_t<T>` it reads the
-            // runtime field (NVRTC fold via constexpr-init still
-            // applies for spec kernels, this path is unchanged for
-            // non-baked sources).
+            // runtime field.
             index += tile_strides_at(data, i) * c;
         }
 
@@ -2632,9 +2627,7 @@ adj_tile_arange(T start, T stop, T step, T& adj_start, T& adj_stop, T& adj_step,
 // Templated on the source array type — accepts both ``array_t<T>``
 // and ``baked_array_t<T, NTTPs...>``.  ``Src=ArrT`` flows into
 // ``tile_global_t`` so the static shape/strides survive for baked
-// sources; for ``array_t<T>``, ``ArrT`` deduces to ``array_t<T>``
-// which matches ``tile_global_t``'s default ``Src`` — same behavior
-// as before.
+// sources.
 template <typename T, bool BoundsCheck, bool Aligned, unsigned... Shape, typename ArrT, typename... Offset>
 inline CUDA_CALLABLE auto tile_load(ArrT& src, Offset... offset)
 {
