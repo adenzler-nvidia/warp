@@ -686,6 +686,73 @@ def compute_type_str(base_name, template_params):
     return f"{base_name}<{', '.join(map(param2str, template_params))}>"
 
 
+# ---- Spec-feature binding-time tags ----
+#
+# A ``Var`` is either *dynamic* (``binding_time is None`` — value
+# known only at launch time) or carries one of the static-binding tags
+# below.  Every spec codegen pass dispatches on the tag type rather
+# than reading a soup of independent ``baked_*`` fields.
+#
+# Three variants:
+#
+#   ``StaticArray``       — kernel-arg baked array, or view-result.
+#                           Carries the post-view ``array_t`` metadata
+#                           (shape/strides/ndim) and an optional
+#                           ``cpp_ctype_override`` (set to
+#                           ``decltype(wp::view(...))`` for view
+#                           results so primal-vars emission types the
+#                           local correctly).
+#   ``StaticScalar``      — kernel-arg baked scalar.  Carries the
+#                           ``_SimpleCData`` value.
+#   ``StaticAttrMarker``  — placeholder Var returned by
+#                           ``Var.emit_for_attribute`` for
+#                           ``arr.shape`` / ``arr.strides``.  Carries
+#                           the source array Var and attribute name so
+#                           ``emit_indexing`` can fold ``arr.shape[K]``
+#                           at the subscript site.
+#
+# Future binding-time variants (``StaticDerived`` for scalar
+# arithmetic on baked values, ``StaticAttrMarker(attr="ndim")``, etc.)
+# slot in here without touching every read site — the dispatch is on
+# ``isinstance`` against the variant types.
+class _Static:
+    __slots__ = ()
+
+
+class StaticArray(_Static):
+    """Compile-time known ``array_t`` (shape/strides/ndim).
+    ``cpp_ctype_override`` is set when the Var came from
+    ``wp::view`` on a baked source so the local is declared with
+    ``decltype(wp::view(...))`` and C++ deduction carries the
+    post-view ``baked_array_t<...>`` shape through.
+    """
+    __slots__ = ("value", "cpp_ctype_override")
+
+    def __init__(self, value: array_t, cpp_ctype_override: str | None = None):
+        self.value = value
+        self.cpp_ctype_override = cpp_ctype_override
+
+
+class StaticScalar(_Static):
+    """Compile-time known scalar value."""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+class StaticAttrMarker(_Static):
+    """Placeholder for ``arr.shape`` / ``arr.strides`` — carries the
+    source array Var and the attribute name; resolved by
+    ``emit_indexing`` when the subscript ``[K]`` is seen.
+    """
+    __slots__ = ("source", "attr")
+
+    def __init__(self, source: "Var", attr: str):
+        self.source = source
+        self.attr = attr
+
+
 class Var:
     def __init__(
         self,
@@ -721,28 +788,12 @@ class Var:
         # Used to associate the variable with the Python statement that resulted in it being created.
         self.relative_lineno = relative_lineno
 
-        # Spec-feature metadata.  Three independent, single-purpose
-        # tags:
-        #
-        #   - ``baked_value``: holds the baked ``array_t`` (shape /
-        #     strides / ndim) or _SimpleCData scalar.  This is the
-        #     core "is this Var baked?" tag; consulted by every spec
-        #     codegen pass.
-        #   - ``_baked_attr_of``: set on a marker Var returned by
-        #     ``emit_for_attribute`` for ``arr.shape`` / ``arr.strides``;
-        #     carries ``(array_var, attr_name)`` so ``emit_indexing``
-        #     can constant-fold ``arr.shape[K]`` / ``arr.strides[K]``.
-        #   - ``baked_view_ctype``: precomputed C++ type-override string
-        #     for view-result locals (e.g. ``decltype(wp::view(var_src,
-        #     0))``).  Set in ``add_call`` when ``wp::view`` fires on a
-        #     baked source; read at primal-vars emission to declare the
-        #     local with the right type so deduction carries the
-        #     post-view ``baked_array_t<...>`` shape through.  Doubles
-        #     as the "is this Var a view-result?" signal for
-        #     ``_emit_baked_metadata_subscript``.
-        self.baked_value: array_t | ctypes._SimpleCData | None = None
-        self._baked_attr_of: "tuple[Var, str] | None" = None
-        self.baked_view_ctype: str | None = None
+        # Spec-feature binding-time tag.  ``None`` for dynamic Vars
+        # (value known only at launch); otherwise one of the variants
+        # defined above this class (``StaticArray`` / ``StaticScalar``
+        # / ``StaticAttrMarker``).  All spec codegen passes dispatch
+        # via ``isinstance`` on this single field.
+        self.binding_time: "_Static | None" = None
 
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
@@ -768,11 +819,12 @@ class Var:
 
         Three attributes are handled:
 
-          - ``"shape"`` / ``"strides"`` — returns a *marker* Var with
-            ``_baked_attr_of = (self, attr)``.  ``emit_indexing``
-            recognises the marker for ``arr.<attr>[K]`` and
-            constant-folds via the array's ``baked_value`` (literal K)
-            or emits ``wp::baked_shape_extract<...>(k)`` (runtime K).
+          - ``"shape"`` / ``"strides"`` — returns a marker Var whose
+            ``binding_time`` is ``StaticAttrMarker(self, attr)``.
+            ``emit_indexing`` recognises the marker for
+            ``arr.<attr>[K]`` and constant-folds via the array's
+            shape (literal K) or emits ``wp::baked_shape_extract<...>(k)``
+            (runtime K).
 
           - ``"ndim"`` — emits the constant value directly as a
             Python constant Var (kernel body / view-result) or
@@ -782,11 +834,11 @@ class Var:
         Anything else (``.data``, ``.grad``) — return None, fall
         through to generic.
         """
-        if not isinstance(self.baked_value, array_t):
+        if not isinstance(self.binding_time, StaticArray):
             return None
         if attr in ("shape", "strides"):
             marker = Var("", shape_t, prefix=False)
-            marker._baked_attr_of = (self, attr)
+            marker.binding_time = StaticAttrMarker(self, attr)
             return marker
         if attr == "ndim":
             # ndim is type-level — determined by the Warp annotation
@@ -794,7 +846,7 @@ class Var:
             # instantiation of the same kernel template.  Emit the
             # literal directly; the bare-NTTP-ref form (``<label>_ndim``)
             # used for shape/stride doesn't add anything here.
-            return adj.add_var(int32, constant=int(self.baked_value.ndim))
+            return adj.add_var(int32, constant=int(self.binding_time.value.ndim))
         return None
 
     def __str__(self):
@@ -1269,21 +1321,21 @@ class Adjoint:
         for a in adj.args:
             adj.symbols[a.label] = a
 
-        # Spec-feature: bind baked metadata onto arg Vars for the current
-        # build.  Every consumer (truthiness check, attribute access,
-        # data-pointer reference, scheme-B dispatch) reads from the Var
-        # rather than looking up `baked_args[label]` at the call site.
-        # Reset spec-feature flags first so a function rebuilt without
-        # baking (or with a different baking) starts clean.
+        # Spec-feature: bind ``binding_time`` tags onto arg Vars for
+        # the current build.  Every consumer (truthiness check,
+        # attribute access, data-pointer reference, scheme-B dispatch)
+        # reads from the Var rather than looking up ``baked_args[label]``
+        # at the call site.  Reset first so a rebuild without baking
+        # (or with a different baking) starts clean.
         for a in adj.args:
-            a.baked_value = None
+            a.binding_time = None
         if isinstance(baked_params, dict):
             for a in adj.args:
                 value = baked_params.get(a.label)
                 if isinstance(value, array_t) and is_array(a.type):
-                    a.baked_value = value
+                    a.binding_time = StaticArray(value)
                 elif isinstance(value, ctypes._SimpleCData) and type_is_value(a.type):
-                    a.baked_value = value
+                    a.binding_time = StaticScalar(value)
 
         # recursively evaluate function body
         try:
@@ -1820,8 +1872,8 @@ class Adjoint:
             if _src_arr is None:
                 _src_arr = next(iter(bound_args.values()), None)
             _src_baked = None
-            if isinstance(_src_arr, Var) and isinstance(_src_arr.baked_value, array_t):
-                _src_baked = _src_arr.baked_value
+            if isinstance(_src_arr, Var) and isinstance(_src_arr.binding_time, StaticArray):
+                _src_baked = _src_arr.binding_time.value
             if _src_baked is not None:
                 _idx_keys = [k for k in "ijkl" if k in bound_args and bound_args[k] is not None]
                 _consumed = len(_idx_keys)
@@ -1835,16 +1887,16 @@ class Adjoint:
                         shape=tuple(_src_shape[_consumed:]),
                         strides=tuple(_src_strides[_consumed:]),
                     )
-                    output.baked_value = _sub
                     # Precompute the view-result local's C++ type so
                     # primal-vars emission can declare it with the right
                     # post-view ``baked_array_t<...>`` shape via C++
                     # template deduction (``decltype`` of the same
-                    # ``wp::view`` call shape).  Doubles as the
-                    # is-view-result signal for
+                    # ``wp::view`` call shape).  ``cpp_ctype_override``
+                    # being set also signals "this is a view result" to
                     # ``_emit_baked_metadata_subscript``.
                     _zeros = ", ".join(["0"] * _consumed)
-                    output.baked_view_ctype = f"decltype(wp::view(var_{_src_arr.label}, {_zeros}))"
+                    _ctype = f"decltype(wp::view(var_{_src_arr.label}, {_zeros}))"
+                    output.binding_time = StaticArray(_sub, cpp_ctype_override=_ctype)
 
         # No per-call rewrite for spec'd wp.funcs.  Each wp.func is
         # emitted once as a function template with its array args as
@@ -2492,36 +2544,30 @@ class Adjoint:
         """Lower ``arr.shape[K]`` or ``arr.strides[K]`` on a baked array.
 
         ``attr`` is ``"shape"`` or ``"strides"`` — the lowering is
-        identical except for which 4-int sequence in
-        ``arr.baked_value`` is consulted, and which Config:: member
-        is referenced inside templated wp.func bodies
-        (``Config::<label>_shape_K`` vs ``Config::<label>_stride_K``).
+        identical except for which 4-int sequence on
+        ``arr_var.binding_time.value`` is consulted and which template
+        arg is referenced (``<label>_shape_K`` vs
+        ``<label>_stride_K``).
 
-        The lookup target depends on context:
+        Three contexts:
 
-          - **Kernel body / view-result outside a templated wp.func**:
-            literal values from ``arr_var.baked_value``.  Emitted as
-            a Python constant Var (literal K) or as
-            ``wp::baked_shape_extract<...>(k)`` with literal template
-            args (runtime K).
-
-          - **Kernel-arg array inside a templated wp.func body**:
-            ``<arr_var.label>_<stem>_K`` (bare template-arg ref) so
-            the shared body resolves correctly per instantiation.
-
+          - **Kernel body, kernel arg**: ``<label>_<stem>_K`` (bare
+            template-arg ref) for literal K, or
+            ``wp::baked_shape_extract<...>(k)`` for runtime K.
           - **View-result**: the Var is a typed ``baked_array_t<...>``
-            local.  Static info rides on its type, so attribute access
-            uses the static accessors (``baked_shape[K]`` / ``baked_strides[K]``)
-            for runtime K, or the literal for compile-time K.  No
-            provenance tracking needed — C++ template instantiation
-            handles per-caller correctness inside body-shared wp.funcs
-            (the local's type uses the wp.func's template args).
+            local; static accessors (``baked_shape[K]`` /
+            ``baked_strides[K]``) handle runtime K, literals for
+            compile-time K.
+          - **Templated wp.func body**: same as kernel arg but
+            template args come from the wp.func's typename param.
         """
         # template-arg stem differs between shape and strides.
         config_stem = "shape" if attr == "shape" else "stride"
-        ndim = int(arr_var.baked_value.ndim)
+        bt = arr_var.binding_time
+        assert isinstance(bt, StaticArray), "subscript target must be a StaticArray Var"
+        ndim = int(bt.value.ndim)
 
-        is_view_result = arr_var.baked_view_ctype is not None
+        is_view_result = bt.cpp_ctype_override is not None
         out = adj.add_var(int32)
 
         # All baked-array attribute access happens inside a templated body
@@ -3292,7 +3338,7 @@ class Adjoint:
                     # boundary.  Mixed int/slice still uses the variadic
                     # form; that path can't keep the metadata anyway.
                     has_slice = any(warp._src.types.is_slice(strip_reference(idx.type)) for idx in indices)
-                    target_is_baked = isinstance(target, Var) and isinstance(target.baked_value, array_t)
+                    target_is_baked = isinstance(target, Var) and isinstance(target.binding_time, StaticArray)
                     convert_to_slices = has_slice or not target_is_baked
                     if convert_to_slices:
                         new_indices = []
@@ -3329,17 +3375,18 @@ class Adjoint:
 
         else:
             # Spec hook: ``arr.shape[K]`` or ``arr.strides[K]`` on a
-            # baked array.  The target Var is a marker —
-            # ``_baked_attr_of`` carries ``(array_var, attr_name)``.
-            # The helper constant-folds at codegen time (literal K) or
-            # emits a templated baked_shape_extract call (runtime K).
+            # baked array.  The target Var is an attr marker whose
+            # ``binding_time`` is a ``StaticAttrMarker`` carrying the
+            # source array Var and the attr name.  The helper
+            # constant-folds at codegen time (literal K) or emits a
+            # templated ``baked_shape_extract`` call (runtime K).
             if (
                 isinstance(target, Var)
-                and target._baked_attr_of is not None
+                and isinstance(target.binding_time, StaticAttrMarker)
                 and len(indices) == 1
             ):
-                arr_var, attr_name = target._baked_attr_of
-                return adj._emit_baked_metadata_subscript(arr_var, attr_name, indices[0])
+                marker = target.binding_time
+                return adj._emit_baked_metadata_subscript(marker.source, marker.attr, indices[0])
 
             # handles non-array type indexing, e.g: vec3, mat33, etc
             out = adj.add_builtin_call("extract", [target, *indices])
@@ -4935,15 +4982,19 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
     # View-result baked sub-arrays carry their static shape/stride/ndim
     # via the C++ type of the local — ``add_call`` precomputes the
     # ``decltype(wp::view(<src>, 0...))`` string and stashes it on the
-    # Var as ``baked_view_ctype``.  C++ template deduction handles
-    # per-instantiation correctness inside body-shared wp.funcs.
+    # Var as ``binding_time.cpp_ctype_override``.  C++ template
+    # deduction handles per-instantiation correctness inside
+    # body-shared wp.funcs.
     for var in adj.variables:
         if is_tile(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
         elif is_tile_stack(var.type):
             lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
         elif var.constant is None:
-            ctype = var.baked_view_ctype or var.ctype()
+            ctype_override = None
+            if isinstance(var.binding_time, StaticArray):
+                ctype_override = var.binding_time.cpp_ctype_override
+            ctype = ctype_override or var.ctype()
             lines += [f"{ctype} {var.emit()};\n"]
         else:
             lines += [f"const {var.ctype()} {var.emit()} = {constant_str(var.constant)};\n"]
