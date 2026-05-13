@@ -9320,124 +9320,131 @@ def _hash_baked_args(baked_args, kernel_args, kernel_module_hash):
     return h.hexdigest()[:16]
 
 
-def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_blocks, graph=None):
-    """Compile and launch a specialized kernel.
-
-    Works both during graph capture and for regular launches.
-    If ``graph`` is provided, the module exec is retained by the graph.
+def _pack_baked_args(kernel, bounds, inputs, device):
+    """Build the ``baked_args`` dict mapping arg labels to packed values
+    (``launch_bounds_t`` for ``"dim"``, ``array_t`` for array args,
+    ``_SimpleCData`` for scalars).  Mirrors what ``codegen_kernel``'s
+    spec branch reads off ``kernel.options["baked_args"]``.
     """
-    from warp._src.types import launch_bounds_t  # noqa: PLC0415
-
-    if kernel.is_generic:
-        raise RuntimeError("Graph specialization does not support generic kernels")
-
-    bounds = launch_bounds_t(dim)
-    if bounds.size == 0:
-        return
-
-    if len(inputs) != len(kernel.adj.args):
-        raise RuntimeError(f"Graph specialize expected {len(kernel.adj.args)} inputs, got {len(inputs)}")
-
-    # Build baked args dict.  Note: this dict will be augmented with function
-    # param names during adj.build() to enable nested call propagation.
     baked_args = {"dim": bounds}
     for i, value in enumerate(inputs):
         arg = kernel.adj.args[i]
         baked_args[arg.label] = pack_arg(kernel, arg.type, arg.label, value, device, adjoint=False)
+    return baked_args
 
-    baked_hash = _hash_baked_args(baked_args, kernel.adj.args, kernel.module.get_module_hash())
-    module_name = f"{kernel.key}_spec_{baked_hash}"
-    module = get_module(module_name)
-    module.options["enable_backward"] = False
 
-    # Build the C++ name expression for this baked instantiation.
-    # NVRTC compiles the template instance and exposes its mangled
-    # symbol via ``nvrtcGetLoweredName``; the launch path looks up the
-    # lowered name from ``ModuleExec.lowered_names`` and uses it for
-    # ``cuModuleGetFunction``.  Format must match what
-    # ``codegen_kernel``'s spec branch emits — routed through the same
-    # ``format_baked_nttps`` helper to keep both sides in lockstep.
-    name_expr_values = list(warp._src.codegen.format_baked_nttps("dim", bounds)[1])
+def _build_spec_name_expression(kernel, baked_args):
+    """C++ name expression for NVRTC's ``nvrtcGetLoweredName`` lookup.
+    The format must match ``codegen_kernel``'s spec branch
+    character-for-character — both sides route through
+    ``format_baked_nttps`` for the literal spelling.
+    """
+    values = list(warp._src.codegen.format_baked_nttps("dim", baked_args["dim"])[1])
     for arg in kernel.adj.args:
         v = baked_args[arg.label]
         warp_type = arg.type if isinstance(v, ctypes._SimpleCData) else None
         _decls, lits = warp._src.codegen.format_baked_nttps(arg.label, v, warp_type=warp_type)
-        name_expr_values.extend(lits)
-    spec_name_expression = (
-        f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(name_expr_values)}>"
-    )
+        values.extend(lits)
+    return f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(values)}>"
 
-    # The spec module holds a single kernel with a stable identity across
-    # all launches that share this baked_hash.  Cache it on the module so
-    # repeated launches don't register a fresh Kernel each time: that used
-    # to churn `_live_kernels`, force `ModuleHasher` to recompute a
-    # different module hash on every call, trigger a rebuild + driver
-    # reload, and serialize against the stream.  Observable effect: ~8
-    # cache dirs per kernel, and per-kernel GPU-time regressions that were
-    # not from codegen (SASS is strictly smaller or equal vs generic).
-    # Cache the spec Kernel so repeated launches with the same baked_hash
-    # reuse it.  A module-level dict avoids `Module.__getattr__`'s
-    # deprecation-shim recursion on missing attributes.
+
+def _get_or_create_spec_kernel(module, module_name, kernel, baked_args):
+    """Module-level cache of the spec ``Kernel``.  Registering a fresh
+    Kernel per launch used to churn ``_live_kernels``, force
+    ``ModuleHasher`` to recompute a different hash each call, and
+    trigger a rebuild + driver reload that serialized against the
+    stream.  A stable cached identity keeps replay overhead flat.
+    """
     spec_kernel = _spec_kernel_cache.get(module_name)
     if spec_kernel is None:
-        # If ``kernel`` is a concrete overload of a generic factory (e.g.
-        # a kernel defined inside ``create_foo_kernel()`` that takes
-        # ``Any``-typed params), ``kernel.func`` still carries the
-        # generic annotations.  Pass the concrete arg types from the
-        # source kernel so the spec kernel's Adjoint is built against
-        # those — without this it would be flagged as generic, fail to
-        # produce a module hash, and crash ``get_mangled_name()``.
+        # If ``kernel`` is a concrete overload of a generic factory
+        # (e.g. defined inside ``create_foo_kernel()`` with ``Any``-typed
+        # params), ``kernel.func`` still carries the generic
+        # annotations.  Pass the concrete arg types so the spec kernel's
+        # Adjoint is built against those — without this it would be
+        # flagged as generic, fail to produce a module hash, and crash
+        # ``get_mangled_name()``.
         overload_annotations = dict(kernel.adj.arg_types) if not kernel.is_generic else None
+        # ``enable_backward=False`` is set on the spec module (above);
+        # Kernel inherits via ``module.options | kernel.options``.
         spec_kernel = Kernel(
             func=kernel.func,
             key=kernel.key,
             module=module,
-            options={"baked_args": baked_args, "enable_backward": False},
+            options={"baked_args": baked_args},
             source=kernel.adj.source,
             overload_annotations=overload_annotations,
         )
         _spec_kernel_cache[module_name] = spec_kernel
+    return spec_kernel
 
-    # Set the name expression every launch (cached path doesn't re-run
-    # codegen, so we can't rely on codegen_kernel's setter).
-    spec_kernel.spec_name_expression = spec_name_expression
 
-    module_exec = module.load(device, block_dim)
-    if graph is not None:
-        graph.retain_module_exec(module_exec)
-
-    hooks = module_exec.get_kernel_hooks(spec_kernel)
-    if hooks.forward is None:
-        raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
-
-    # Build kernel params.  Matches `codegen_kernel`'s specialize branch:
-    #   scalars (_SimpleCData) -> dropped from ABI (baked as const)
-    #   arrays   (array_t)     -> pass only `.data` as a raw `T*`
-    #   otherwise              -> pass unchanged (struct by value)
-    # For arrays we can't take `addressof(array_t_struct)` anymore because
-    # the kernel expects an 8-byte pointer in cmem, not the 56-byte struct.
-    # Stash the `.data` pointer value in a `c_uint64` holder and pass the
-    # holder's address to cudaLaunchKernel.
+def _pack_spec_kernel_params(kernel, baked_args):
+    """Build the cmem kernel-params array for the T*-ABI spec launch.
+    Mirrors what ``codegen_kernel``'s spec branch emits:
+      * scalars (``_SimpleCData``)  -> dropped from ABI (baked as const)
+      * arrays  (``array_t``)       -> pass only ``.data`` as a raw ``T*``
+      * otherwise                   -> pass unchanged (struct by value)
+    Arrays go through a ``c_uint64`` holder because the kernel expects
+    an 8-byte pointer in cmem, not the 56-byte ``array_t`` struct.
+    Returns ``(kernel_params, holders)`` — the caller must keep the
+    holders alive until ``wp_cuda_launch_kernel`` returns.
+    """
     kernel_args = []
-    _baked_ptr_holders = []  # keep alive for the launch
+    holders = []
     for a in kernel.adj.args:
         baked = baked_args[a.label]
         if isinstance(baked, ctypes._SimpleCData):
             continue
         if isinstance(baked, array_t):
-            # T*-ABI: pass only the raw data pointer.  The kernel body
-            # materializes the ``baked_array_t<T, ...>`` struct local
-            # from this pointer (constexpr fields from NTTPs).
             holder = ctypes.c_uint64(int(baked.data))
-            _baked_ptr_holders.append(holder)
+            holders.append(holder)
             kernel_args.append(ctypes.c_void_p(ctypes.addressof(holder)))
         else:
             kernel_args.append(ctypes.c_void_p(ctypes.addressof(baked)))
-    if kernel_args:
-        kernel_params = (ctypes.c_void_p * len(kernel_args))(*kernel_args)
-    else:
-        kernel_params = None
+    if not kernel_args:
+        return None, holders
+    return (ctypes.c_void_p * len(kernel_args))(*kernel_args), holders
 
+
+def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_blocks, graph=None):
+    """Compile and launch a specialized kernel.
+
+    Works both during graph capture and for regular launches.  If
+    ``graph`` is provided, the module exec is retained by the graph so
+    the captured launch survives the surrounding scope.
+    """
+    from warp._src.types import launch_bounds_t  # noqa: PLC0415
+
+    if kernel.is_generic:
+        raise RuntimeError("Graph specialization does not support generic kernels")
+    if len(inputs) != len(kernel.adj.args):
+        raise RuntimeError(f"Graph specialize expected {len(kernel.adj.args)} inputs, got {len(inputs)}")
+
+    bounds = launch_bounds_t(dim)
+    if bounds.size == 0:
+        return
+
+    baked_args = _pack_baked_args(kernel, bounds, inputs, device)
+    baked_hash = _hash_baked_args(baked_args, kernel.adj.args, kernel.module.get_module_hash())
+    module_name = f"{kernel.key}_spec_{baked_hash}"
+    module = get_module(module_name)
+    module.options["enable_backward"] = False
+
+    spec_kernel = _get_or_create_spec_kernel(module, module_name, kernel, baked_args)
+    # The name expression is set per launch even when the spec_kernel
+    # is cached (the cached path doesn't re-run codegen, so we can't
+    # rely on codegen_kernel's setter).
+    spec_kernel.spec_name_expression = _build_spec_name_expression(kernel, baked_args)
+
+    module_exec = module.load(device, block_dim)
+    if graph is not None:
+        graph.retain_module_exec(module_exec)
+    hooks = module_exec.get_kernel_hooks(spec_kernel)
+    if hooks.forward is None:
+        raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
+
+    kernel_params, _holders = _pack_spec_kernel_params(kernel, baked_args)
     runtime.core.wp_cuda_launch_kernel(
         device.context,
         hooks.forward,
