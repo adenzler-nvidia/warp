@@ -186,6 +186,12 @@ def axpy_no_spec(y: wp.array(dtype=float), x: wp.array(dtype=float), alpha: floa
     y[i] = alpha * x[i] + y[i]
 
 
+@wp.kernel
+def scale_for_ad(x: wp.array(dtype=float), out: wp.array(dtype=float), alpha: float):
+    i = wp.tid()
+    out[i] = alpha * x[i]
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -671,6 +677,41 @@ class TestKernelSpecialize(unittest.TestCase):
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(y.numpy(), 3.0, rtol=1e-5)
+
+    def test_autograd_under_spec(self):
+        """Forward+backward via wp.Tape works correctly under spec.
+
+        The spec path applies only to the forward launch (the dispatch
+        check has ``not adjoint``).  ``runtime.tape.record_launch``
+        records the ORIGINAL kernel reference, so ``tape.backward()``
+        replays through ``wp.launch(kernel, ..., adjoint=True)`` and
+        skips the spec branch.  The backward runs at baseline speed on
+        the original module (which has ``enable_backward=True`` by
+        default).  Gradients are correct because the backward sees the
+        same runtime ``shape`` / ``strides`` as the forward saw at
+        capture time.
+
+        Documents the contract: spec is a forward-only optimization
+        right now.  AD users still get correct gradients without
+        opting out — they just don't get spec speedup on backward.
+        """
+        N = 8
+        device = "cuda:0"
+        x_np = np.arange(N, dtype=np.float32)
+
+        x = wp.array(x_np, dtype=float, device=device, requires_grad=True)
+        out = wp.zeros(N, dtype=float, device=device, requires_grad=True)
+
+        tape = wp.Tape()
+        with tape:
+            wp.launch(scale_for_ad, dim=N, inputs=[x, out, 3.0], device=device)
+
+        out.grad.fill_(1.0)
+        tape.backward()
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(out.numpy(), 3.0 * x_np, rtol=1e-5)
+        np.testing.assert_allclose(x.grad.numpy(), 3.0 * np.ones(N, dtype=np.float32), rtol=1e-5)
 
     def test_eager_mode_warning_fires_once(self):
         """Spec launches outside graph capture should warn (once per
