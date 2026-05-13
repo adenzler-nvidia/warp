@@ -1277,6 +1277,7 @@ def kernel(
     launch_bounds: tuple[int, ...] | int | None = None,
     module: Module | Literal["unique"] | str | None = None,
     module_options: dict[str, Any] | None = None,
+    specialize: bool | None = None,
 ):
     """
     Decorator to register a Warp kernel from a Python function.
@@ -1319,6 +1320,16 @@ def kernel(
             tid = wp.tid()
             b[tid] = a[tid] + 1.0
 
+
+        @wp.kernel(specialize=False)
+        def my_kernel_no_spec(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+            # this kernel will never be specialized at launch time, even
+            # if ``wp.config.enable_kernel_specialize = True`` globally.
+            # Useful for kernels that regress under specialization or
+            # that have call patterns that don't benefit from baking.
+            tid = wp.tid()
+            b[tid] = a[tid] + 1.0
+
     Args:
         f: The function to be registered as a kernel.
         enable_backward: If False, the backward pass will not be
@@ -1342,6 +1353,14 @@ def kernel(
             For shared modules, use :func:`warp.set_module_options`
             instead. See :func:`warp.set_module_options` for the full
             list of supported options.
+        specialize: Per-kernel override for graph-specialization.  When
+            set, takes priority over the global
+            ``wp.config.enable_kernel_specialize`` flag.  ``False``
+            forces this kernel through the non-specialized launch path
+            (useful for kernels that regress under spec or whose
+            launch arg patterns don't benefit).  ``True`` forces
+            specialization on CUDA even if the global flag is off.
+            ``None`` (default) follows the global flag.
 
     Returns:
         The registered kernel.
@@ -1355,6 +1374,9 @@ def kernel(
 
         if launch_bounds is not None:
             kernel_options["launch_bounds"] = launch_bounds
+
+        if specialize is not None:
+            kernel_options["specialize"] = specialize
 
         # Resolve the module for this kernel
         if module is None:
@@ -8292,7 +8314,10 @@ def launch(
         # delay load modules, including new overload if needed
 
         # Auto-specialize: during graph capture or regular launches.
-        if warp.config.enable_kernel_specialize and device.is_cuda and not adjoint and not record_cmd:
+        # Per-kernel ``specialize`` option (set via @wp.kernel(specialize=...))
+        # overrides the global flag when present.
+        specialize_kernel = kernel.options.get("specialize", warp.config.enable_kernel_specialize)
+        if specialize_kernel and device.is_cuda and not adjoint and not record_cmd:
             if stream is None:
                 stream = device.stream
             # Detect graph capture context

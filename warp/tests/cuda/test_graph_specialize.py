@@ -178,6 +178,14 @@ def view_inner_shape_caller(
         out[1] = view_inner_shape(b)
 
 
+# Per-kernel opt-out — even when ``enable_kernel_specialize`` is True
+# globally, this kernel must NEVER take the spec path.
+@wp.kernel(specialize=False)
+def axpy_no_spec(y: wp.array(dtype=float), x: wp.array(dtype=float), alpha: float):
+    i = wp.tid()
+    y[i] = alpha * x[i] + y[i]
+
+
 def _find_spec_cu(kernel_key):
     """Find the generated .cu file for a specialized module."""
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
@@ -620,6 +628,49 @@ class TestKernelSpecialize(unittest.TestCase):
     def test_correctness_disabled(self):
         wp.config.enable_kernel_specialize = False
         self._assert_axpy(use_graph=True)
+
+    def test_per_kernel_opt_out(self):
+        """``@wp.kernel(specialize=False)`` must override the global flag
+        and prevent specialization for that kernel only."""
+        from warp._src.context import user_modules
+
+        N = 64
+        device = "cuda:0"
+        x = wp.array(np.ones(N, dtype=np.float32), device=device)
+        y = wp.array(np.ones(N, dtype=np.float32), device=device)
+
+        # Sanity: global flag is on (set in setUp).
+        self.assertTrue(wp.config.enable_kernel_specialize)
+
+        # Launch the opt-out kernel under graph capture.  Even though
+        # the spec path is globally enabled, this kernel must take the
+        # generic launch — no ``_spec_`` module should appear for it.
+        spec_before = {k for k in user_modules if "axpy_no_spec_spec_" in k}
+        with wp.ScopedCapture(device=device) as cap:
+            wp.launch(axpy_no_spec, dim=N, inputs=[y, x, 2.0], device=device)
+        wp.capture_launch(cap.graph)
+        wp.synchronize_device(device)
+        spec_after = {k for k in user_modules if "axpy_no_spec_spec_" in k}
+        self.assertEqual(spec_before, spec_after, "specialize=False kernel must not register a spec module")
+
+        # Result still correct: 2.0 * 1.0 + 1.0 == 3.0.
+        np.testing.assert_allclose(y.numpy(), 3.0, rtol=1e-5)
+
+    def test_per_kernel_opt_out_with_global_off(self):
+        """``specialize=False`` is a no-op when the global flag is also
+        off — kernel just runs through the generic path."""
+        wp.config.enable_kernel_specialize = False
+        N = 64
+        device = "cuda:0"
+        x = wp.array(np.ones(N, dtype=np.float32), device=device)
+        y = wp.array(np.ones(N, dtype=np.float32), device=device)
+
+        with wp.ScopedCapture(device=device) as cap:
+            wp.launch(axpy_no_spec, dim=N, inputs=[y, x, 2.0], device=device)
+        wp.capture_launch(cap.graph)
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(y.numpy(), 3.0, rtol=1e-5)
 
     def test_2d_kernel(self):
         device = "cuda:0"
