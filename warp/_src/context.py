@@ -1927,6 +1927,19 @@ user_modules: dict[str, Module] = {}
 # reuse one Kernel instance (and therefore a stable module hash).
 _spec_kernel_cache: dict[str, "Kernel"] = {}
 
+# One-shot flag so the eager-mode spec warning fires at most once per
+# process.  Spec outside graph capture is still correct, but loses the
+# replay-amortization that makes the feature worthwhile — eager-mode
+# spec launches run roughly 47% slower than baseline.  Reset only on
+# explicit call to ``_reset_spec_eager_warning`` (used by tests).
+_spec_eager_warned: bool = False
+
+
+def _reset_spec_eager_warning() -> None:
+    """Test hook: clear the once-per-process eager-spec warning flag."""
+    global _spec_eager_warned
+    _spec_eager_warned = False
+
 
 def get_module(name: str) -> Module:
     """Return or create the Warp module associated with a given name.
@@ -8325,6 +8338,24 @@ def launch(
             if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
                 capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 capture_graph = runtime.captures.get(capture_id)
+            # One-shot warning: spec runs correctly outside graph capture
+            # but loses the replay amortization that makes it worthwhile.
+            # Per-launch JIT + CPU dispatch overhead dominates; eager
+            # mode is roughly 47% slower than the non-spec baseline on
+            # typical workloads.  Wrap launches in ``wp.ScopedCapture``
+            # to amortize.  Spec still fires here — silently falling
+            # back would break debuggability (spec codegen issues
+            # couldn't be reproduced without capture).
+            global _spec_eager_warned
+            if capture_graph is None and not _spec_eager_warned:
+                _spec_eager_warned = True
+                warp._src.utils.warn(
+                    f"wp.launch of kernel '{kernel.key}' is taking the spec path outside graph "
+                    "capture.  Spec is correct here but ~47% slower than baseline due to per-launch "
+                    "JIT + dispatch overhead.  Wrap launches in wp.ScopedCapture to amortize, or set "
+                    "@wp.kernel(specialize=False) on individual kernels to opt out.  "
+                    "(Warning fires once per process.)"
+                )
             try:
                 all_inputs = list(inputs or []) + list(outputs or [])
                 _launch_specialized(kernel, dim, all_inputs, device, block_dim, stream, max_blocks, capture_graph)

@@ -672,6 +672,42 @@ class TestKernelSpecialize(unittest.TestCase):
 
         np.testing.assert_allclose(y.numpy(), 3.0, rtol=1e-5)
 
+    def test_eager_mode_warning_fires_once(self):
+        """Spec launches outside graph capture should warn (once per
+        process) — eager mode is correct but ~47% slower, so the user
+        deserves a heads-up.  Refusing to spec would break debuggability."""
+        import io
+        from contextlib import redirect_stdout
+
+        from warp._src import context
+
+        # Clear the one-shot flag so this test exercises the first-warn path.
+        context._reset_spec_eager_warning()
+
+        N = 64
+        device = "cuda:0"
+        x = wp.array(np.ones(N, dtype=np.float32), device=device)
+        y = wp.array(np.ones(N, dtype=np.float32), device=device)
+
+        # Eager launch (no ScopedCapture).
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            wp.launch(axpy, dim=N, inputs=[y, x, 2.0], device=device)
+            wp.synchronize_device(device)
+        msg = buf.getvalue()
+        self.assertIn("spec path outside graph capture", msg)
+        self.assertIn("ScopedCapture", msg)
+
+        # Second eager launch — warning must NOT fire again.
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            wp.launch(axpy, dim=N, inputs=[y, x, 2.0], device=device)
+            wp.synchronize_device(device)
+        self.assertNotIn("spec path outside graph capture", buf2.getvalue())
+
+        # Restore the flag for any subsequent tests / processes.
+        context._reset_spec_eager_warning()
+
     def test_2d_kernel(self):
         device = "cuda:0"
         a = wp.array(np.ones((32, 16), dtype=np.float32), device=device)
