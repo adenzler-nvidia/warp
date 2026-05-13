@@ -677,46 +677,45 @@ struct tile_global_t {
     {
     }
 
+private:
+    // Fold over the dimensions: each ``strides_at<I>(data)`` resolves
+    // at compile time for ``Src = baked_array_t<...>`` (returns the
+    // NTTP via ``if constexpr``) and to a runtime field read for
+    // ``Src = array_t<T>``.  No PRAGMA_UNROLL, no runtime ternary,
+    // no inlining-dependent constant folding — the ``I`` parameter
+    // pack is part of each call's identity, guaranteed by the C++
+    // standard to be a compile-time constant.
+    template <size_t... Is>
+    inline CUDA_CALLABLE int _offset_from_coord(const Coord& coord, wp::index_sequence<Is...>) const
+    {
+        return ((strides_at<Is>(data) * (offset[Is] + coord[Is])) + ...);
+    }
+
+    template <size_t... Is>
+    inline CUDA_CALLABLE bool _checked_offset(const Coord& coord, int& result, wp::index_sequence<Is...>) const
+    {
+        int idx = 0;
+        bool ok = (((offset[Is] + coord[Is]) < shape_at<Is>(data)
+                    ? (idx += strides_at<Is>(data) * (offset[Is] + coord[Is]), true)
+                    : false) && ...);
+        result = idx;
+        return ok;
+    }
+
+public:
     inline CUDA_CALLABLE int index_from_coord(const Coord& coord) const
     {
-        // element index
-        int index = 0;
-
-        WP_PRAGMA_UNROLL
-        for (int i = 0; i < Shape::N; ++i) {
-            // global = offset + coord
-            int c = offset[i] + coord[i];
-            // `tile_strides_at(data, i)` dispatches per source type:
-            // for `Src = baked_array_t<...>` the ternary collapses to
-            // a template-arg constant after WP_PRAGMA_UNROLL substitutes
-            // a literal `i`; for `Src = array_t<T>` it reads the
-            // runtime field.
-            index += tile_strides_at(data, i) * c;
-        }
-
-        return index / sizeof(T);
+        // Byte-offset sum, then convert to element index.
+        return _offset_from_coord(coord, wp::make_index_sequence<Shape::N>{}) / sizeof(T);
     }
 
     inline CUDA_CALLABLE bool index(const Coord& coord, int& out) const
     {
         if constexpr (BoundsCheck) {
-            // element index
-            int index = 0;
-
-            WP_PRAGMA_UNROLL
-            for (int i = 0; i < Shape::N; ++i) {
-                // global = offset + coord
-                int c = offset[i] + coord[i];
-
-                // handle out of bounds case
-                if (c >= tile_shape_at(data, i))
-                    return false;
-                else
-                    index += tile_strides_at(data, i) * c;
-            }
-
-            // array strides are in bytes so we convert to elements
-            out = index / sizeof(T);
+            int byte_off;
+            if (!_checked_offset(coord, byte_off, wp::make_index_sequence<Shape::N>{}))
+                return false;
+            out = byte_off / sizeof(T);
             return true;
         } else {
             out = index_from_coord(coord);
@@ -2634,46 +2633,50 @@ inline CUDA_CALLABLE auto tile_load(ArrT& src, Offset... offset)
     return tile_global_t<T, tile_shape_t<Shape...>, BoundsCheck, Aligned, ArrT>(src, tile_coord(offset...));
 }
 
-// used for indexed loads and stores.  Templated on the source array
-// type so the same body serves `array_t<T>` (runtime shape/strides
-// fields) and `baked_array_t<T, NTTPs...>` (compile-time NTTPs).
-// `tile_shape_at` / `tile_strides_at` overloads in array.h dispatch
-// per-type — baked sources collapse to template-arg constants via a
-// `WP_PRAGMA_UNROLL`'d ternary, generic sources read the runtime
-// fields unchanged.
+// Used for indexed loads and stores.  Templated on the source array
+// type so the same body serves ``array_t<T>`` and
+// ``baked_array_t<T, NTTPs...>``.  Per-axis stride/shape access goes
+// through ``strides_at<I>(src)`` / ``shape_at<I>(src)`` — compile-time
+// template indices, with ``if constexpr`` selecting the NTTP for
+// baked sources or the runtime field for generic.  No PRAGMA_UNROLL
+// and no runtime-i ternary; the C++ standard guarantees ``I`` is a
+// constant expression at each unrolled step.
+namespace detail {
+template <size_t I, typename ArrT, typename IndicesTile, typename Coord>
+inline CUDA_CALLABLE bool compute_index_step(
+    const ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, int& index)
+{
+    int g;
+    if (I == axis) {
+        g = offset[I] + indices.data(c[I]);
+    } else {
+        g = offset[I] + c[I];
+    }
+    if (g >= shape_at<I>(src))
+        return false;
+    index += strides_at<I>(src) * g;
+    return true;
+}
+
+template <typename ArrT, typename IndicesTile, typename Coord, size_t... Is>
+inline CUDA_CALLABLE bool compute_index_impl(
+    ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, int& out,
+    wp::index_sequence<Is...>)
+{
+    int index = 0;
+    bool ok = (compute_index_step<Is>(src, indices, axis, offset, c, index) && ...);
+    if (!ok) return false;
+    out = index / sizeof(typename ArrT::Type);
+    return true;
+}
+}  // namespace detail
+
 template <typename ArrT, typename IndicesTile, typename Coord>
 inline CUDA_CALLABLE bool
 compute_index(ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, int& out)
 {
-    using T = typename ArrT::Type;
-    int index = 0;
-
-    WP_PRAGMA_UNROLL
-    for (int i = 0; i < Coord::size(); ++i) {
-        if (i == axis) {
-            // global = offset_coord + index_mapped_coord
-            int index_along_axis = offset[i] + indices.data(c[i]);
-
-            // handle out of bounds case
-            if (index_along_axis >= tile_shape_at(src, i))
-                return false;
-            else
-                index += tile_strides_at(src, i) * index_along_axis;
-        } else {
-            // global = offset_coord + coord
-            int g = offset[i] + c[i];
-
-            // handle out of bounds case
-            if (g >= tile_shape_at(src, i))
-                return false;
-            else
-                index += tile_strides_at(src, i) * g;
-        }
-    }
-
-    // array strides are in bytes so we convert to elements
-    out = index / sizeof(T);
-    return true;
+    return detail::compute_index_impl(
+        src, indices, axis, offset, c, out, wp::make_index_sequence<Coord::size()>{});
 }
 
 

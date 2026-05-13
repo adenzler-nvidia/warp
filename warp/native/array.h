@@ -415,6 +415,58 @@ concept BakedArrayLike = ArrayLike<A> && requires {
 #endif
 
 
+// ---- Compile-time-indexed shape/stride access ----
+//
+// ``shape_at<I>(a)`` and ``strides_at<I>(a)`` are the
+// guaranteed-compile-time-resolved alternatives to ``tile_shape_at`` /
+// ``tile_strides_at`` (which take a runtime ``i``).  ``I`` is a
+// template parameter — the compiler MUST resolve at compile time.
+//
+// For ``BakedArrayLike`` (``baked_array_t<...>``), the ``if constexpr``
+// branch selects ``A::baked_shape[I]`` / ``A::baked_strides[I]``,
+// which are ``static constexpr`` array members.  The result is a
+// literal NTTP value at compile time — no runtime ternary, no
+// dependency on NVRTC inlining or unroll heuristics.
+//
+// For runtime arrays (``array_t<T>``), the read is ``a.shape[I]`` /
+// ``a.strides[I]`` at compile-time index — same as today, but the
+// index is now part of the function template's identity rather than
+// a runtime variable.
+//
+// Used by ``tile_global_t::index_from_coord``, ``compute_index``, and
+// the unified ``address`` / ``array_store`` / ``atomic_*`` paths
+// below to eliminate the runtime-ternary-then-trust-NVRTC pattern.
+// CPU build (C++17) only ever instantiates these for ``array_t<T>``;
+// the baked branch is gated behind C++20.
+#if __cplusplus >= 202002L
+template <int I, typename A>
+constexpr int shape_at(const A& a)
+{
+    if constexpr (BakedArrayLike<A>) {
+        return A::baked_shape[I];
+    } else {
+        return a.shape[I];
+    }
+}
+
+template <int I, typename A>
+constexpr int strides_at(const A& a)
+{
+    if constexpr (BakedArrayLike<A>) {
+        return A::baked_strides[I];
+    } else {
+        return a.strides[I];
+    }
+}
+#else
+template <int I, typename A>
+inline int shape_at(const A& a) { return a.shape[I]; }
+
+template <int I, typename A>
+inline int strides_at(const A& a) { return a.strides[I]; }
+#endif
+
+
 // Required when compiling adjoints.
 template <typename T> inline CUDA_CALLABLE array_t<T> add(const array_t<T>& a, const array_t<T>& b)
 {
@@ -1453,56 +1505,6 @@ inline CUDA_CALLABLE void array_store(const A<T>& buf, int i, int j, int k, int 
     index(buf, i, j, k, l) = value;
 }
 
-// Scheme-B address helpers for baked arrays — one template per ndim,
-// instantiated per (shape, stride, T) by the dispatch wrappers below.
-// The dispatch wrappers ``address(baked_array_t<...>&, int...)`` read
-// the static shape/stride NTTPs off the baked source's type and pass
-// them as template args here, so the offset math is constexpr-folded
-// at instantiation time.  array_store / atomic_X reuse
-// these by wrapping the call site inline (`*addr = v`, `wp::atomic_X(addr, v)`).
-template <int S0, int St0, typename T>
-inline CUDA_CALLABLE T* wp_address_baked_1d(T* data, int i0)
-{
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
-        + ((i0 < 0 ? i0 + S0 : i0) * St0));
-}
-template <int S0, int S1, int St0, int St1, typename T>
-inline CUDA_CALLABLE T* wp_address_baked_2d(T* data, int i0, int i1)
-{
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
-        + ((i0 < 0 ? i0 + S0 : i0) * St0)
-        + ((i1 < 0 ? i1 + S1 : i1) * St1));
-}
-template <int S0, int S1, int S2, int St0, int St1, int St2, typename T>
-inline CUDA_CALLABLE T* wp_address_baked_3d(T* data, int i0, int i1, int i2)
-{
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
-        + ((i0 < 0 ? i0 + S0 : i0) * St0)
-        + ((i1 < 0 ? i1 + S1 : i1) * St1)
-        + ((i2 < 0 ? i2 + S2 : i2) * St2));
-}
-template <int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, typename T>
-inline CUDA_CALLABLE T* wp_address_baked_4d(T* data, int i0, int i1, int i2, int i3)
-{
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(data)
-        + ((i0 < 0 ? i0 + S0 : i0) * St0)
-        + ((i1 < 0 ? i1 + S1 : i1) * St1)
-        + ((i2 < 0 ? i2 + S2 : i2) * St2)
-        + ((i3 < 0 ? i3 + S3 : i3) * St3));
-}
-
-// Views on baked arrays return baked sub-arrays (see ``view``
-// overloads above), so the view-result local carries all static info
-// on its type.  Element access on view-results goes through standard
-// ``wp::address`` / ``wp::array_store`` / ``wp::atomic_*`` call sites;
-// overload resolution picks these baked-array overloads, deduces
-// S0..., St0... from the type, and delegates to wp_address_baked_<N>d
-// above.  Identical SASS to the scheme-B path used for raw-pointer
-// kernel args.
-#define WP_BAKED_TPL \
-    template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-#define WP_BAKED_AT const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&
-
 // Contracts: ``array_t<T>`` must satisfy ``ArrayLike`` and
 // ``baked_array_t<T,...>`` must satisfy ``BakedArrayLike``.  Verified
 // once here so a future refactor that drops a required member fails
@@ -1515,40 +1517,98 @@ static_assert(BakedArrayLike<baked_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
               "baked_array_t must satisfy BakedArrayLike concept");
 #endif
 
-WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i)                       { return wp_address_baked_1d<S0, St0>(a.data, i); }
-WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j)                { return wp_address_baked_2d<S0, S1, St0, St1>(a.data, i, j); }
-WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j, int k)         { return wp_address_baked_3d<S0, S1, S2, St0, St1, St2>(a.data, i, j, k); }
-WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j, int k, int l)  { return wp_address_baked_4d<S0, S1, S2, S3, St0, St1, St2, St3>(a.data, i, j, k, l); }
 
-WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, T v)                       { *address(a, i) = v; }
-WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, T v)                { *address(a, i, j) = v; }
-WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, int k, T v)         { *address(a, i, j, k) = v; }
-WP_BAKED_TPL inline CUDA_CALLABLE void array_store(WP_BAKED_AT a, int i, int j, int k, int l, T v)  { *address(a, i, j, k, l) = v; }
+// ---- Unified address / array_store / atomic_* for ArrayLike sources ----
+//
+// One body per (op, ndim) handles both ``array_t<T>`` (runtime
+// shape/strides) and ``baked_array_t<T, NTTPs...>`` (compile-time
+// NTTPs).  Per-axis stride/shape access goes through ``shape_at<I>``
+// / ``strides_at<I>`` — template indices, with ``if constexpr``
+// selecting the NTTP for baked or the runtime field for generic.
+// Guaranteed compile-time resolution where applicable (no
+// PRAGMA_UNROLL, no NVRTC inlining assumption).
+//
+// Overload precedence: the ``ArrayLike``-constrained templates below
+// outrank the legacy ``template<template<typename> class A, typename T>``
+// overloads earlier in this file (C++20 partial ordering rules), so
+// ``array_t<T>`` and ``baked_array_t<T,...>`` both resolve here.
+// ``indexedarray_t<T>``, ``fabricarray_t<T>``, etc. don't satisfy
+// ``ArrayLike`` (no ``tile_shape_at`` / ``tile_strides_at`` overloads)
+// and fall through to the legacy path.
+#if __cplusplus >= 202002L
 
-#define WP_BAKED_ATOMIC(op) \
-WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, T v)                       { return op(address(a, i), v); } \
-WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, T v)                { return op(address(a, i, j), v); } \
-WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, int k, T v)         { return op(address(a, i, j, k), v); } \
-WP_BAKED_TPL inline CUDA_CALLABLE T op(WP_BAKED_AT a, int i, int j, int k, int l, T v)  { return op(address(a, i, j, k, l), v); }
+template <ArrayLike A>
+inline CUDA_CALLABLE auto* address(const A& a, int i)
+{
+    using T = typename A::Type;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a)));
+}
+template <ArrayLike A>
+inline CUDA_CALLABLE auto* address(const A& a, int i, int j)
+{
+    using T = typename A::Type;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
+        + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a)));
+}
+template <ArrayLike A>
+inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k)
+{
+    using T = typename A::Type;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
+        + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
+        + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a)));
+}
+template <ArrayLike A>
+inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k, int l)
+{
+    using T = typename A::Type;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
+        + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
+        + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a))
+        + ((l < 0 ? l + shape_at<3>(a) : l) * strides_at<3>(a)));
+}
 
-WP_BAKED_ATOMIC(atomic_add)
-WP_BAKED_ATOMIC(atomic_sub)
-WP_BAKED_ATOMIC(atomic_min)
-WP_BAKED_ATOMIC(atomic_max)
-WP_BAKED_ATOMIC(atomic_and)
-WP_BAKED_ATOMIC(atomic_or)
-WP_BAKED_ATOMIC(atomic_xor)
-WP_BAKED_ATOMIC(atomic_exch)
+template <ArrayLike A> inline CUDA_CALLABLE void array_store(const A& a, int i, typename A::Type v)                       { *address(a, i) = v; }
+template <ArrayLike A> inline CUDA_CALLABLE void array_store(const A& a, int i, int j, typename A::Type v)                { *address(a, i, j) = v; }
+template <ArrayLike A> inline CUDA_CALLABLE void array_store(const A& a, int i, int j, int k, typename A::Type v)         { *address(a, i, j, k) = v; }
+template <ArrayLike A> inline CUDA_CALLABLE void array_store(const A& a, int i, int j, int k, int l, typename A::Type v)  { *address(a, i, j, k, l) = v; }
 
-#undef WP_BAKED_ATOMIC
+// Atomic ops that forward to the pointer-level wp::<op>(T*, T) impl.
+// Body is mechanical (delegate to ``address`` + pointer-level op); the
+// macro just emits 4 ndim variants per op.
+#define WP_ARRAYLIKE_ATOMIC(op) \
+template <ArrayLike A> inline CUDA_CALLABLE auto op(const A& a, int i, typename A::Type v)                       { return op(address(a, i), v); } \
+template <ArrayLike A> inline CUDA_CALLABLE auto op(const A& a, int i, int j, typename A::Type v)                { return op(address(a, i, j), v); } \
+template <ArrayLike A> inline CUDA_CALLABLE auto op(const A& a, int i, int j, int k, typename A::Type v)         { return op(address(a, i, j, k), v); } \
+template <ArrayLike A> inline CUDA_CALLABLE auto op(const A& a, int i, int j, int k, int l, typename A::Type v)  { return op(address(a, i, j, k, l), v); }
 
-WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, T o, T n)                       { return atomic_cas(address(a, i), o, n); }
-WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, T o, T n)                { return atomic_cas(address(a, i, j), o, n); }
-WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, int k, T o, T n)         { return atomic_cas(address(a, i, j, k), o, n); }
-WP_BAKED_TPL inline CUDA_CALLABLE T atomic_cas(WP_BAKED_AT a, int i, int j, int k, int l, T o, T n)  { return atomic_cas(address(a, i, j, k, l), o, n); }
+WP_ARRAYLIKE_ATOMIC(atomic_add)
+WP_ARRAYLIKE_ATOMIC(atomic_min)
+WP_ARRAYLIKE_ATOMIC(atomic_max)
+WP_ARRAYLIKE_ATOMIC(atomic_and)
+WP_ARRAYLIKE_ATOMIC(atomic_or)
+WP_ARRAYLIKE_ATOMIC(atomic_xor)
+WP_ARRAYLIKE_ATOMIC(atomic_exch)
 
-#undef WP_BAKED_TPL
-#undef WP_BAKED_AT
+#undef WP_ARRAYLIKE_ATOMIC
+
+// atomic_sub is a special case: forwards to ``atomic_add`` with a
+// negated value (matches the legacy generic path's behavior).
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_sub(const A& a, int i, typename A::Type v)                       { return atomic_add(address(a, i), -v); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_sub(const A& a, int i, int j, typename A::Type v)                { return atomic_add(address(a, i, j), -v); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_sub(const A& a, int i, int j, int k, typename A::Type v)         { return atomic_add(address(a, i, j, k), -v); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_sub(const A& a, int i, int j, int k, int l, typename A::Type v)  { return atomic_add(address(a, i, j, k, l), -v); }
+
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, typename A::Type o, typename A::Type n)                       { return atomic_cas(address(a, i), o, n); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, int j, typename A::Type o, typename A::Type n)                { return atomic_cas(address(a, i, j), o, n); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, int j, int k, typename A::Type o, typename A::Type n)         { return atomic_cas(address(a, i, j, k), o, n); }
+template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, int j, int k, int l, typename A::Type o, typename A::Type n)  { return atomic_cas(address(a, i, j, k, l), o, n); }
+
+#endif  // __cplusplus >= 202002L
 
 template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 {
