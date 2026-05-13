@@ -377,6 +377,44 @@ CUDA_CALLABLE inline int tile_shape_at(const baked_array_t<T, Ndim, S0, S1, S2, 
 template <typename T> CUDA_CALLABLE inline int tile_shape_at(const array_t<T>& src, int i) { return src.shape[i]; }
 
 
+// ---- Concepts for array-like proxies ----
+//
+// ``ArrayLike``       — any Warp array proxy with shape/stride dispatch
+//                       via ``tile_shape_at`` / ``tile_strides_at``.
+// ``BakedArrayLike``  — refinement of ArrayLike that exposes the
+//                       spec-feature's static NTTPs (``baked_ndim`` /
+//                       ``baked_shape`` / ``baked_strides``).  Used as
+//                       a defensive ``static_assert`` near the
+//                       scheme-B overloads to catch contract drift
+//                       early — if ``baked_array_t`` ever loses one of
+//                       these members, compile fails at the struct,
+//                       not silently at every WP_BAKED_TPL call site.
+//
+// Gated on C++20: the JIT CUDA build uses ``--std=c++20`` so NVRTC
+// gets the concept check.  The CPU clang build is C++17 by default
+// and never instantiates ``baked_array_t`` anyway (spec is CUDA-only)
+// — concept definitions are skipped there to keep parsing clean.
+// Both concepts use bare existence checks (``requires { ... }``); no
+// ``<concepts>`` / ``<type_traits>`` dependencies (NVRTC's kernel
+// environment doesn't pull those in).
+#if __cplusplus >= 202002L
+template <typename A>
+concept ArrayLike = requires(A a, int i) {
+    typename A::Type;
+    a.data;
+    tile_shape_at(a, i);
+    tile_strides_at(a, i);
+};
+
+template <typename A>
+concept BakedArrayLike = ArrayLike<A> && requires {
+    A::baked_ndim;
+    A::baked_shape[0];
+    A::baked_strides[0];
+};
+#endif
+
+
 // Required when compiling adjoints.
 template <typename T> inline CUDA_CALLABLE array_t<T> add(const array_t<T>& a, const array_t<T>& b)
 {
@@ -1464,6 +1502,18 @@ inline CUDA_CALLABLE T* wp_address_baked_4d(T* data, int i0, int i1, int i2, int
 #define WP_BAKED_TPL \
     template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 #define WP_BAKED_AT const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&
+
+// Contracts: ``array_t<T>`` must satisfy ``ArrayLike`` and
+// ``baked_array_t<T,...>`` must satisfy ``BakedArrayLike``.  Verified
+// once here so a future refactor that drops a required member fails
+// compile right at the struct rather than silently mis-resolving
+// overloads at every call site.  CUDA-only (CPU build is C++17).
+#if __cplusplus >= 202002L
+static_assert(ArrayLike<array_t<float>>,
+              "array_t<T> must satisfy ArrayLike concept");
+static_assert(BakedArrayLike<baked_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
+              "baked_array_t must satisfy BakedArrayLike concept");
+#endif
 
 WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i)                       { return wp_address_baked_1d<S0, St0>(a.data, i); }
 WP_BAKED_TPL inline CUDA_CALLABLE T* address(WP_BAKED_AT a, int i, int j)                { return wp_address_baked_2d<S0, S1, St0, St1>(a.data, i, j); }
