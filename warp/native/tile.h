@@ -657,9 +657,9 @@ template <typename Shape> struct tile_coord_iter_t {
 // runtime-stride sources) or ``baked_array_t<T, NTTPs...>`` when the
 // call site knows the static shape/strides.  Passing the concrete
 // baked type keeps the static info on ``data`` so ``index_from_coord``
-// reads strides via ``tile_strides_at`` (per-type dispatch) instead of
-// slicing to a plain ``array_t<T>`` and losing the NTTPs at the C++
-// source level.
+// reads strides via ``strides_at<I>`` (compile-time-indexed, per-type
+// dispatch through ``if constexpr``) instead of slicing to a plain
+// ``array_t<T>`` and losing the NTTPs at the C++ source level.
 template <typename T, typename Shape_, bool BoundsCheck = true, bool Aligned = false, typename Src = array_t<T>>
 struct tile_global_t {
     using Type = T;
@@ -2683,7 +2683,7 @@ compute_index(ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, 
 // Templated on the source array type — accepts both ``array_t<T>``
 // and ``baked_array_t<T, NTTPs...>``.  The latter routes through
 // ``compute_index`` (templated above) so the NTTPs flow into
-// shape/stride reads via ``tile_shape_at`` / ``tile_strides_at``.
+// shape/stride reads via ``shape_at<I>`` / ``strides_at<I>``.
 template <unsigned... Shape, typename ArrT, typename IndicesTile, typename... Offset>
 inline CUDA_CALLABLE auto tile_load_indexed(ArrT& src, IndicesTile& indices, int axis, Offset... offset)
 {
@@ -2811,7 +2811,7 @@ inline CUDA_CALLABLE void tile_store_indexed(
 // and ``baked_array_t<T, NTTPs...>``.  For baked sources, the
 // ``tile_global_t`` is instantiated with ``Src=baked_array_t<...>`` so
 // the static shape/stride NTTPs flow through ``index_from_coord``'s
-// ``tile_strides_at`` dispatch.
+// ``strides_at<I>`` dispatch.
 // compiler struggles with these if they are one line
 template <typename T, bool BoundsCheck, typename Tile, typename ArrT>
 inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, Tile& src)

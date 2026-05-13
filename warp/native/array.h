@@ -351,59 +351,39 @@ struct baked_array_t : array_t<T> {
 };
 
 
-// Compile-time stride / shape lookup for a `baked_array_t<...>`.  The
-// ternary chain returns one of the template-arg values selected by a
-// runtime `i`; when called from inside a `WP_PRAGMA_UNROLL`'d loop the
-// `i` becomes a literal at each unrolled iteration and the ternary
-// collapses to the matching constant — no memory load, no dataflow-
-// analysis dependency.  Used by `tile_global_t::index` to drive its
-// offset math from the source's static template args when Src is
-// baked.  The generic `array_t<T>&` fallback below is selected when
-// the source isn't baked.
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline int tile_strides_at(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&, int i)
-{
-    return (i == 0) ? St0 : (i == 1) ? St1 : (i == 2) ? St2 : St3;
-}
-
-template <typename T> CUDA_CALLABLE inline int tile_strides_at(const array_t<T>& src, int i) { return src.strides[i]; }
-
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline int tile_shape_at(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>&, int i)
-{
-    return (i == 0) ? S0 : (i == 1) ? S1 : (i == 2) ? S2 : S3;
-}
-
-template <typename T> CUDA_CALLABLE inline int tile_shape_at(const array_t<T>& src, int i) { return src.shape[i]; }
-
-
 // ---- Concepts for array-like proxies ----
 //
-// ``ArrayLike``       — any Warp array proxy with shape/stride dispatch
-//                       via ``tile_shape_at`` / ``tile_strides_at``.
+// ``ArrayLike``       — any Warp array proxy with the inherited
+//                       ``array_t<T>`` shape/strides/data layout.
+//                       Witnessed by direct field access; both
+//                       ``array_t<T>`` and ``baked_array_t<T,...>``
+//                       (which derives from ``array_t<T>``) satisfy
+//                       it.  Other Warp array kinds
+//                       (``indexedarray_t``, ``fabricarray_t``, ...)
+//                       have different field layouts and do NOT
+//                       satisfy ArrayLike — they go through their
+//                       own ``index()`` overloads.
 // ``BakedArrayLike``  — refinement of ArrayLike that exposes the
 //                       spec-feature's static NTTPs (``baked_ndim`` /
-//                       ``baked_shape`` / ``baked_strides``).  Used as
-//                       a defensive ``static_assert`` near the
-//                       scheme-B overloads to catch contract drift
-//                       early — if ``baked_array_t`` ever loses one of
-//                       these members, compile fails at the struct,
-//                       not silently at every WP_BAKED_TPL call site.
+//                       ``baked_shape`` / ``baked_strides``).  Used
+//                       by the ``if constexpr`` branch in
+//                       ``shape_at<I>`` / ``strides_at<I>`` below
+//                       and a defensive ``static_assert`` to catch
+//                       contract drift.
 //
 // Gated on C++20: the JIT CUDA build uses ``--std=c++20`` so NVRTC
 // gets the concept check.  The CPU clang build is C++17 by default
 // and never instantiates ``baked_array_t`` anyway (spec is CUDA-only)
-// — concept definitions are skipped there to keep parsing clean.
-// Both concepts use bare existence checks (``requires { ... }``); no
-// ``<concepts>`` / ``<type_traits>`` dependencies (NVRTC's kernel
-// environment doesn't pull those in).
+// — concept definitions are skipped there.  No ``<concepts>`` /
+// ``<type_traits>`` dependencies (NVRTC's kernel environment doesn't
+// pull those in).
 #if __cplusplus >= 202002L
 template <typename A>
-concept ArrayLike = requires(A a, int i) {
+concept ArrayLike = requires(A a) {
     typename A::Type;
     a.data;
-    tile_shape_at(a, i);
-    tile_strides_at(a, i);
+    a.shape[0];
+    a.strides[0];
 };
 
 template <typename A>
@@ -417,10 +397,11 @@ concept BakedArrayLike = ArrayLike<A> && requires {
 
 // ---- Compile-time-indexed shape/stride access ----
 //
-// ``shape_at<I>(a)`` and ``strides_at<I>(a)`` are the
-// guaranteed-compile-time-resolved alternatives to ``tile_shape_at`` /
-// ``tile_strides_at`` (which take a runtime ``i``).  ``I`` is a
-// template parameter — the compiler MUST resolve at compile time.
+// ``shape_at<I>(a)`` and ``strides_at<I>(a)`` are the per-axis
+// accessors used by the unified ``address`` / ``array_store`` /
+// ``atomic_*`` path and by ``tile_global_t::index_from_coord`` /
+// ``compute_index``.  ``I`` is a template parameter — guaranteed
+// constant expression by the C++ standard.
 //
 // For ``BakedArrayLike`` (``baked_array_t<...>``), the ``if constexpr``
 // branch selects ``A::baked_shape[I]`` / ``A::baked_strides[I]``,
@@ -429,13 +410,7 @@ concept BakedArrayLike = ArrayLike<A> && requires {
 // dependency on NVRTC inlining or unroll heuristics.
 //
 // For runtime arrays (``array_t<T>``), the read is ``a.shape[I]`` /
-// ``a.strides[I]`` at compile-time index — same as today, but the
-// index is now part of the function template's identity rather than
-// a runtime variable.
-//
-// Used by ``tile_global_t::index_from_coord``, ``compute_index``, and
-// the unified ``address`` / ``array_store`` / ``atomic_*`` paths
-// below to eliminate the runtime-ternary-then-trust-NVRTC pattern.
+// ``a.strides[I]``: a runtime field access at a compile-time index.
 // CPU build (C++17) only ever instantiates these for ``array_t<T>``;
 // the baked branch is gated behind C++20.
 #if __cplusplus >= 202002L
@@ -1532,9 +1507,9 @@ static_assert(BakedArrayLike<baked_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
 // outrank the legacy ``template<template<typename> class A, typename T>``
 // overloads earlier in this file (C++20 partial ordering rules), so
 // ``array_t<T>`` and ``baked_array_t<T,...>`` both resolve here.
-// ``indexedarray_t<T>``, ``fabricarray_t<T>``, etc. don't satisfy
-// ``ArrayLike`` (no ``tile_shape_at`` / ``tile_strides_at`` overloads)
-// and fall through to the legacy path.
+// ``indexedarray_t<T>``, ``fabricarray_t<T>``, etc. have different
+// field layouts and don't satisfy ``ArrayLike`` — they fall through
+// to the legacy path's ``index()`` overloads.
 #if __cplusplus >= 202002L
 
 template <ArrayLike A>
