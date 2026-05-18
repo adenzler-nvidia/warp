@@ -718,36 +718,38 @@ class TestKernelSpecialize(unittest.TestCase):
         process) — eager mode is correct but ~47% slower, so the user
         deserves a heads-up.  Refusing to spec would break debuggability."""
         import io
-        from contextlib import redirect_stdout
+        from contextlib import redirect_stderr
 
-        from warp._src import context
+        from warp._src import logger as warp_logger
 
-        # Clear the one-shot flag so this test exercises the first-warn path.
-        context._reset_spec_eager_warning()
+        # ``log_warning(..., once=True)`` deduplicates via
+        # ``logger._warnings_seen``.  Clear so this test exercises the
+        # first-warn path.  Also clear Python's warnings registry so a
+        # prior identical warning from another test doesn't suppress
+        # ours via __warningregistry__.
+        warp_logger._warnings_seen.clear()
 
         N = 64
         device = "cuda:0"
         x = wp.array(np.ones(N, dtype=np.float32), device=device)
         y = wp.array(np.ones(N, dtype=np.float32), device=device)
 
-        # Eager launch (no ScopedCapture).
+        # The default LoggerBasic routes warnings to stderr via a
+        # custom ``showwarning``; ``warnings.catch_warnings(record=True)``
+        # doesn't intercept that — capture stderr directly.
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stderr(buf):
             wp.launch(axpy, dim=N, inputs=[y, x, 2.0], device=device)
             wp.synchronize_device(device)
-        msg = buf.getvalue()
-        self.assertIn("spec path outside graph capture", msg)
-        self.assertIn("ScopedCapture", msg)
+        first = buf.getvalue()
+        self.assertIn("spec path outside graph capture", first)
+        self.assertIn("ScopedCapture", first)
 
-        # Second eager launch — warning must NOT fire again.
         buf2 = io.StringIO()
-        with redirect_stdout(buf2):
+        with redirect_stderr(buf2):
             wp.launch(axpy, dim=N, inputs=[y, x, 2.0], device=device)
             wp.synchronize_device(device)
         self.assertNotIn("spec path outside graph capture", buf2.getvalue())
-
-        # Restore the flag for any subsequent tests / processes.
-        context._reset_spec_eager_warning()
 
     def test_2d_kernel(self):
         device = "cuda:0"
