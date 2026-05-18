@@ -226,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build Warp native libraries with optional CUDA, LLVM, and MathDx support",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
     )
 
     # General options
@@ -235,6 +236,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=["release", "debug"],
         default="release",
         help="Build configuration mode",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_const",
+        const="debug",
+        dest="mode",
+        default=argparse.SUPPRESS,
+        help="Shortcut for --mode debug",
     )
     try:
         available_cpus = len(os.sched_getaffinity(0))
@@ -316,10 +325,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Enable fast math optimizations (may reduce numerical accuracy)",
     )
     group_build.add_argument(
+        "--sanitize",
+        type=str,
+        default=None,
+        metavar="SANITIZER",
+        help="Enable a compiler sanitizer when building native libraries "
+        "(e.g. --sanitize=address). Only 'address' is currently supported; "
+        "'undefined', 'thread', and 'memory' are accepted by the parser for "
+        "future use but are not validated or guaranteed to build.",
+    )
+    group_build.add_argument(
         "--quick",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Fast build mode: compile for minimal GPU architectures (PTX-only for sm_75), disable CUDA forward compatibility",
+    )
+    group_build.add_argument(
+        "--use-dynamic-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Link against shared CUDA libraries instead of embedding them statically; the corresponding shared libraries must be present at runtime",
     )
 
     # Clang/LLVM options
@@ -372,6 +397,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if args.clang_build_toolchain:
             print("Error: --clang-build-toolchain requires CUDA (incompatible with --no-cuda).")
+            return 1
+        if args.use_dynamic_cuda:
+            print("Error: --use-dynamic-cuda requires CUDA (incompatible with --no-cuda).")
             return 1
 
     # Warn if building on Intel Mac (cross-compiling for ARM64)
@@ -469,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
         # build warp.dll
         cpp_sources = [
             "native/warp.cpp",
+            "native/bvh.cpp",
+            "native/scan.cpp",
             "native/apic.cpp",
             "native/alloc_tracker.cpp",
             "native/crt.cpp",

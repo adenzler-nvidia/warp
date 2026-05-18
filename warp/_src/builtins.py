@@ -12,6 +12,7 @@ from typing import Any
 import warp._src.build
 import warp._src.context
 from warp._src.codegen import Reference, Var, get_arg_value, strip_reference
+from warp._src.logger import log_warning
 from warp._src.types import *
 
 from .context import add_builtin
@@ -83,7 +84,11 @@ add_builtin(
     "min",
     input_types={"a": Scalar, "b": Scalar},
     value_func=sametypes_create_value_func(Scalar),
-    doc="""Compute the minimum value.""",
+    doc="""Compute the minimum value.
+
+    On float types, NaN is treated as missing (C ``fmin`` semantics): the
+    operation returns the non-NaN operand when exactly one is NaN, and NaN
+    only when both are NaN.""",
     group="Scalar Math",
 )
 
@@ -91,7 +96,11 @@ add_builtin(
     "max",
     input_types={"a": Scalar, "b": Scalar},
     value_func=sametypes_create_value_func(Scalar),
-    doc="""Compute the maximum value.""",
+    doc="""Compute the maximum value.
+
+    On float types, NaN is treated as missing (C ``fmax`` semantics): the
+    operation returns the non-NaN operand when exactly one is NaN, and NaN
+    only when both are NaN.""",
     group="Scalar Math",
 )
 
@@ -99,7 +108,11 @@ add_builtin(
     "clamp",
     input_types={"x": Scalar, "low": Scalar, "high": Scalar},
     value_func=sametypes_create_value_func(Scalar),
-    doc="Clamp the value of ``x`` to the range [low, high].",
+    doc="""Clamp the value of ``x`` to the range [low, high].
+
+    Equivalent to ``wp.min(wp.max(low, x), high)``. On float types this means
+    NaN values of ``x`` produce ``wp.min(low, high)`` rather than propagating
+    NaN.""",
     group="Scalar Math",
 )
 
@@ -120,6 +133,19 @@ add_builtin(
         -1 if ``x`` < 0 and 1 otherwise.""",
     group="Scalar Math",
     is_differentiable=False,
+)
+
+add_builtin(
+    "copysign",
+    input_types={"x": Float, "y": Float},
+    value_func=sametypes_create_value_func(Float),
+    doc="""Return a value with the magnitude of ``x`` and the sign of ``y``.
+
+    For example, ``wp.copysign(3.0, -1.0)`` returns ``-3.0`` and
+    ``wp.copysign(-3.0, 1.0)`` returns ``3.0``. Useful for forcing a
+    specific sign on a result whose signed-zero behavior is otherwise
+    implementation-defined (e.g. ``wp.min(-0.0, +0.0)``).""",
+    group="Scalar Math",
 )
 
 add_builtin(
@@ -632,6 +658,10 @@ add_builtin(
     value_func=scalar_sametypes_value_func,
     doc="""Compute the minimum value.
 
+    On float types, NaN elements are treated as missing (C ``fmin`` semantics);
+    the reduction returns the smallest non-NaN element, or NaN only if every
+    element is NaN.
+
     Returns:
         The minimum element of ``a``.""",
     group="Vector Math",
@@ -642,6 +672,10 @@ add_builtin(
     value_func=scalar_sametypes_value_func,
     doc="""Compute the maximum value.
 
+    On float types, NaN elements are treated as missing (C ``fmax`` semantics);
+    the reduction returns the largest non-NaN element, or NaN only if every
+    element is NaN.
+
     Returns:
         The maximum element of ``a``.""",
     group="Vector Math",
@@ -651,7 +685,10 @@ add_builtin(
     "argmin",
     input_types={"a": vector(length=Any, dtype=Scalar)},
     value_func=lambda arg_types, arg_values: warp.uint32,
-    doc="Compute the index of the minimum element of vector ``a``.",
+    doc="""Compute the index of the minimum element of vector ``a``.
+
+    On float types, NaN elements are skipped; the result is the index of the
+    smallest non-NaN element. If every element is NaN, returns ``0``.""",
     group="Vector Math",
     is_differentiable=False,
 )
@@ -659,7 +696,10 @@ add_builtin(
     "argmax",
     input_types={"a": vector(length=Any, dtype=Scalar)},
     value_func=lambda arg_types, arg_values: warp.uint32,
-    doc="Compute the index of the maximum element of vector ``a``.",
+    doc="""Compute the index of the maximum element of vector ``a``.
+
+    On float types, NaN elements are skipped; the result is the index of the
+    largest non-NaN element. If every element is NaN, returns ``0``.""",
     group="Vector Math",
     is_differentiable=False,
 )
@@ -2321,7 +2361,8 @@ def tile_zeros_dispatch_func(arg_types: Mapping[str, type], return_type: Any, ar
     if None in shape:
         raise ValueError("Tile functions require shape to be a compile time constant.")
 
-    dtype = arg_values["dtype"]
+    dtype_var = arg_values["dtype"]
+    dtype = dtype_var.constant if isinstance(dtype_var, Var) else dtype_var
 
     template_args = []
     template_args.append(dtype)
@@ -2397,7 +2438,8 @@ def tile_ones_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg
     if None in shape:
         raise ValueError("Tile functions require shape to be a compile time constant.")
 
-    dtype = arg_values["dtype"]
+    dtype_var = arg_values["dtype"]
+    dtype = dtype_var.constant if isinstance(dtype_var, Var) else dtype_var
 
     template_args = []
     template_args.append(dtype)
@@ -2441,6 +2483,95 @@ add_builtin(
 )
 
 
+def tile_empty_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str, Any]):
+    # return generic type (for doc builds)
+    if arg_types is None:
+        return tile(dtype=Any, shape=tuple[int, ...])
+
+    shape = extract_tuple(arg_values["shape"], as_constant=True)
+
+    if None in shape:
+        raise ValueError("Tile functions require shape to be a compile time constant.")
+
+    if "dtype" not in arg_values:
+        raise TypeError("tile_empty() missing required keyword argument 'dtype'")
+
+    if "storage" not in arg_values:
+        raise TypeError("tile_empty() missing required keyword argument 'storage'")
+
+    if arg_values["storage"] not in {"shared", "register"}:
+        raise ValueError(f"Invalid value for 'storage': {arg_values['storage']!r}. Expected 'shared' or 'register'.")
+
+    dtype = arg_values["dtype"]
+
+    return tile(dtype=dtype, shape=shape, storage=arg_values["storage"])
+
+
+def tile_empty_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg_values: Mapping[str, Var]):
+    shape = extract_tuple(arg_values["shape"], as_constant=True)
+
+    if None in shape:
+        raise ValueError("Tile functions require shape to be a compile time constant.")
+
+    dtype_var = arg_values["dtype"]
+    dtype = dtype_var.constant if isinstance(dtype_var, Var) else dtype_var
+
+    template_args = []
+    template_args.append(dtype)
+    template_args.extend(shape)
+
+    return ([], template_args)
+
+
+add_builtin(
+    "tile_empty",
+    input_types={"shape": tuple[int, ...], "dtype": Any, "storage": str},
+    defaults={"storage": "register", "dtype": float},
+    value_func=tile_empty_value_func,
+    dispatch_func=tile_empty_dispatch_func,
+    variadic=False,
+    is_differentiable=False,
+    doc="""Allocate a tile of uninitialized items.
+
+    The tile's contents are undefined; the caller is responsible for overwriting
+    every element before any read. This matches the semantics of ``numpy.empty``.
+
+    Because it skips initialization, ``tile_empty`` can avoid unnecessary stores
+    when every element will be overwritten, especially for ``"shared"`` tiles.
+
+    For accumulator patterns (``a += ...``), use :func:`tile_zeros` instead -
+    accumulation reads the prior value and would propagate uninitialized data.
+    Use ``tile_empty`` only when the first operation after construction is a
+    full overwrite (a ``tile_load``, a tile-typed assignment, or a complete
+    element-wise fill).
+
+    Args:
+        shape: Shape of the output tile
+        dtype: Data type of output tile's elements (default float)
+        storage: The storage location for the tile: ``"register"`` for registers
+            (default) or ``"shared"`` for shared memory.
+
+    Returns:
+        An uninitialized tile with the requested shape and data type.""",
+    group="Tile Primitives",
+    export=False,
+)
+
+# overload for scalar shape
+add_builtin(
+    "tile_empty",
+    input_types={"shape": int, "dtype": Any, "storage": str},
+    defaults={"storage": "register", "dtype": float},
+    value_func=tile_empty_value_func,
+    dispatch_func=tile_empty_dispatch_func,
+    variadic=False,
+    is_differentiable=False,
+    doc="""Allocate a tile of uninitialized items.""",
+    group="Tile Primitives",
+    export=False,
+)
+
+
 def tile_full_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str, Any]):
     # return generic type (for doc builds)
     if arg_types is None:
@@ -2474,7 +2605,8 @@ def tile_full_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg
     if None in shape:
         raise ValueError("Tile functions require shape to be a compile time constant.")
 
-    dtype = arg_values["dtype"]
+    dtype_var = arg_values["dtype"]
+    dtype = dtype_var.constant if isinstance(dtype_var, Var) else dtype_var
     value = arg_values["value"]
 
     func_args = [value]
@@ -3134,16 +3266,12 @@ def tile_load_tuple_value_func(arg_types: Mapping[str, type], arg_values: Mappin
 
     if arg_values.get("aligned"):
         if arg_values["storage"] == "register":
-            from warp._src.utils import warn  # noqa: PLC0415
-
-            warn(
+            log_warning(
                 "tile_load() with aligned=True has no effect for storage='register'. "
                 "The aligned parameter only affects shared memory tiles."
             )
         elif arg_values["storage"] == "shared" and len(shape) < 2:
-            from warp._src.utils import warn  # noqa: PLC0415
-
-            warn(
+            log_warning(
                 "tile_load() with aligned=True has no effect for 1D shared tiles. "
                 "The vectorized path requires 2D+ tiles."
             )
@@ -3413,16 +3541,12 @@ def tile_store_value_func(arg_types, arg_values):
 
     if arg_values.get("aligned"):
         if t.storage == "register":
-            from warp._src.utils import warn  # noqa: PLC0415
-
-            warn(
+            log_warning(
                 "tile_store() with aligned=True has no effect for register tiles. "
                 "The aligned parameter only affects shared memory tiles."
             )
         elif t.storage == "shared" and len(t.shape) < 2:
-            from warp._src.utils import warn  # noqa: PLC0415
-
-            warn(
+            log_warning(
                 "tile_store() with aligned=True has no effect for 1D shared tiles. "
                 "The vectorized path requires 2D+ tiles."
             )
@@ -4758,7 +4882,7 @@ add_builtin(
         .. code-block:: python
 
             @wp.kernel
-            def histogram(data: wp.array(dtype=float), out: wp.array(dtype=float)):
+            def histogram(data: wp.array[float], out: wp.array[float]):
 
                 bins = wp.tile_zeros(dtype=float, shape=4, storage="shared")
                 i = wp.tid()
@@ -5337,13 +5461,17 @@ add_builtin(
     value_func=tile_dot_value_func,
     doc="""Compute the dot product of two tiles.
 
-    Computes a full contraction (tensordot) between corresponding elements
-    and sums the results. For scalar tiles this is the standard dot product;
-    for vector or matrix tiles each element pair is fully contracted
-    (e.g., ``wp.dot(a[i], b[i])`` for ``vec3`` elements).
+    Computes a full contraction between corresponding elements and sums
+    the results. For scalar tiles this is the standard dot product; for
+    vector tiles each pair is contracted via ``wp.dot``; for matrix tiles
+    it is the Frobenius inner product (the sum of element-wise products
+    over all axes).
 
-    Equivalent to ``wp.tile_sum(wp.tile_map(wp.tensordot, a, b))``
-    but without any intermediate tiles or shared-memory round trips.
+    Equivalent in Python to ``wp.tile_sum(a * b)`` for scalar tiles,
+    ``wp.tile_sum(wp.tile_map(wp.dot, a, b))`` for vector tiles, and
+    ``wp.tile_sum(wp.tile_map(wp.ddot, a, b))`` for matrix tiles, but
+    without the intermediate tile and shared-memory round trip the
+    explicit forms would require.
 
     Args:
         a: First tile operand.
@@ -7018,7 +7146,7 @@ add_builtin(
             CAP = wp.constant(8)
 
             @wp.kernel
-            def compact_kernel(data: wp.array(dtype=int), out: wp.array(dtype=int), out_count: wp.array(dtype=int)):
+            def compact_kernel(data: wp.array[int], out: wp.array[int], out_count: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
 
@@ -7098,7 +7226,7 @@ add_builtin(
             CAP = wp.constant(8)
 
             @wp.kernel
-            def push_kernel(out_idx: wp.array(dtype=int)):
+            def push_kernel(out_idx: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 idx = wp.tile_stack_push(s, j * 10, j < 4)
@@ -7166,7 +7294,7 @@ add_builtin(
             CAP = wp.constant(8)
 
             @wp.kernel
-            def pop_kernel(out: wp.array(dtype=int)):
+            def pop_kernel(out: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j * 10, j < 4)
@@ -7226,7 +7354,7 @@ add_builtin(
             CAP = wp.constant(8)
 
             @wp.kernel
-            def clear_kernel(before: wp.array(dtype=int), after: wp.array(dtype=int)):
+            def clear_kernel(before: wp.array[int], after: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j, True)
@@ -7297,7 +7425,7 @@ add_builtin(
             CAP = wp.constant(8)
 
             @wp.kernel
-            def count_kernel(out_count: wp.array(dtype=int)):
+            def count_kernel(out_count: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j, j % 2 == 0)
@@ -8091,15 +8219,17 @@ def _add_hash_grid_query_builtins(vec_type, scalar_type, query_type, precision_d
         group="Geometry",
         doc="""Move to the next point in the hash grid query.
 
-    The index of the current neighbor is stored in ``index``, returns ``False`` if there are no more neighbors.""",
+    Supports query objects returned by :func:`wp.hash_grid_query() <warp.hash_grid_query>` for all hash grid
+    coordinate precisions. The index of the current neighbor is stored in ``index``; returns ``False`` if there are no
+    more neighbors.""",
         export=False,
         is_differentiable=False,
     )
 
 
-_add_hash_grid_query_builtins(vec3, float, HashGridQuery)
-_add_hash_grid_query_builtins(vec3h, float16, HashGridQueryH, "float16")
-_add_hash_grid_query_builtins(vec3d, float64, HashGridQueryD, "float64")
+_add_hash_grid_query_builtins(vec3, float, hash_grid_query_type(float32))
+_add_hash_grid_query_builtins(vec3h, float16, hash_grid_query_type(float16), "float16")
+_add_hash_grid_query_builtins(vec3d, float64, hash_grid_query_type(float64), "float64")
 
 add_builtin(
     "hash_grid_point_id",
@@ -8247,7 +8377,11 @@ add_builtin(
     hidden=True,
     is_differentiable=False,
 )
-for query_type in (HashGridQuery, HashGridQueryH, HashGridQueryD):
+for query_type in (
+    hash_grid_query_type(float16),
+    hash_grid_query_type(float32),
+    hash_grid_query_type(float64),
+):
     add_builtin(
         "iter_next",
         input_types={"query": query_type},
@@ -9187,7 +9321,6 @@ add_builtin(
     doc="""Divergence-free vector field based on Perlin noise.
 
     Use the gradient of a Perlin noise function.""",
-    is_differentiable=False,
 )
 add_builtin(
     "curlnoise",
@@ -9198,7 +9331,6 @@ add_builtin(
     doc="""Divergence-free vector field based on Perlin noise.
 
     Use the curl of three Perlin noise functions.""",
-    is_differentiable=False,
 )
 add_builtin(
     "curlnoise",
@@ -9209,7 +9341,6 @@ add_builtin(
     doc="""Divergence-free vector field based on Perlin noise.
 
     Use the curl of three Perlin noise functions.""",
-    is_differentiable=False,
 )
 
 
@@ -12887,6 +13018,25 @@ def tile_matmul_lto_dispatch_func(
             "tile_matmul() arguments must be tiles of float16, bfloat16, float32 or float64, vec2h, vec2f, vec2d entries"
         )
 
+    # Reject bfloat16 as the accumulator precision uniformly across all backends. cuBLASDx
+    # disallows bf16 accumulators (a static_assert since cuBLASDx 0.6.0), and the scalar
+    # matmul fallback was silently lossy for the same reason. The K-loop reduction precision
+    # is derived from 'out's dtype regardless of which calling form is used. If backward is
+    # enabled, 'a' and 'b' are also accumulators (for adjA, adjB).
+    if out.type.dtype == bfloat16:
+        raise TypeError(
+            "tile_matmul() does not support a bfloat16 'out' tile. "
+            "Allowed 'out' dtypes are float16, float32, and float64."
+        )
+    if options["enable_backward"] and (a.type.dtype == bfloat16 or b.type.dtype == bfloat16):
+        raise TypeError(
+            "tile_matmul() does not support bfloat16 'a' or 'b' tiles when the backward pass is enabled. "
+            "Allowed accumulator dtypes are float16, float32, and float64 (the backward pass uses 'a' "
+            "and 'b' as accumulators for adjA and adjB). If gradients are not needed, set "
+            "`enable_backward=False` on the kernel's module, e.g. "
+            "`wp.set_module_options({'enable_backward': False})`."
+        )
+
     if (
         (a.type.shape[1] != b.type.shape[0])
         or (a.type.shape[0] != out.type.shape[0])
@@ -13133,39 +13283,52 @@ def tile_fft_generic_lto_dispatch_func(
     arch = options["output_arch"]
     ept = size // num_threads
 
-    if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
-        # CPU/no-MathDx dispatch
-        return ([], [], [], 0)
-    else:
-        # Validate elements per thread (ept) - cuFFTDx requires ept >= 2
-        if ept < 2:
-            func_name = "tile_fft" if direction == "forward" else "tile_ifft"
-            raise ValueError(
-                f"{func_name}() requires at least 2 elements per thread, but got ept={ept} "
-                f"(fft_size={size}, block_dim={num_threads}). "
-                f"Reduce block_dim to at most {size // 2} for this FFT size."
-            )
+    func_name = "tile_fft" if direction == "forward" else "tile_ifft"
+    use_mathdx = (
+        arch is not None
+        and warp._src.context.runtime.core.wp_is_mathdx_enabled()
+        and options.get("enable_mathdx_fft", True)
+    )
 
-        # generate the forward LTO
-        lto_symbol_fwd, lto_code_data_fwd, shared_memory_bytes = warp._src.build.build_lto_fft(
-            arch, size, ept, direction, fwd_dir, precision, builder
-        )
-
-        if options["enable_backward"]:
-            # generate the backward LTO (inverse direction for adjoint)
-            # shared memory requirements are identical since tile sizes match
-            lto_symbol_bwd, lto_code_data_bwd, _ = warp._src.build.build_lto_fft(
-                arch, size, ept, bwd_direction, bwd_dir, precision, builder
-            )
+    if not use_mathdx:
+        # CPU sequential or GPU cooperative scalar path. Both go through
+        # `wp::tile_fft_entry` with a literal `0` for the LTO function name;
+        # `wp_is_null_func<int>::value` selects the scalar branch at template
+        # instantiation, mirroring how `tile_matmul` handles the same case.
+        if arch is not None:
+            # GPU cooperative path requires power-of-two FFT size (cooperative
+            # mixed-radix would mean reimplementing cuFFTDx) and ept >= 1 so
+            # every thread participates in at least one butterfly per stage.
+            if size <= 0 or (size & (size - 1)) != 0:
+                raise ValueError(
+                    f"{func_name}() on GPU without libmathdx requires a power-of-two FFT size, "
+                    f"got {size}. Build Warp with libmathdx (cuFFTDx) for arbitrary sizes, "
+                    f"or run on CPU."
+                )
+            if size % num_threads != 0:
+                raise ValueError(
+                    f"{func_name}() on GPU without libmathdx requires fft_size to be divisible "
+                    f"by block_dim (got fft_size={size}, block_dim={num_threads})."
+                )
+            # Shared scratch holds one batch worth of complex data; reused
+            # across batches inside `tile_fft_gpu_impl`.
+            dtype_size = 2 * (4 if precision == 5 else 8)
+            shared_memory_bytes = size * dtype_size
         else:
-            # adjoints aren't computed, so we reuse forward symbol as a dummy arg
-            lto_symbol_bwd = lto_symbol_fwd
-            lto_code_data_bwd = None
+            # CPU path: non-power-of-two sizes use an O(n^2) DFT with fixed
+            # stack buffers capped at WP_FFT_CPU_MAX_DFT_SIZE (4096).
+            if (size & (size - 1)) != 0 and size > 4096:
+                raise ValueError(
+                    f"{func_name}() on CPU with a non-power-of-two FFT size is limited to "
+                    f"4096 elements, got {size}. Use a power-of-two size for larger transforms."
+                )
+            shared_memory_bytes = 0
 
+        lto_placeholder = "/* scalar */ 0"
         return (
             (
-                Var(lto_symbol_fwd, str, False, True, False),
-                Var(lto_symbol_bwd, str, False, True, False),
+                Var(lto_placeholder, str, False, True, False),
+                Var(lto_placeholder, str, False, True, False),
                 Var(dtype, str, False, True, False),
                 Var(str(shared_memory_bytes), str, False, True, False),
                 Var(str(batch), str, False, True, False),
@@ -13173,9 +13336,48 @@ def tile_fft_generic_lto_dispatch_func(
                 inout,
             ),
             [],
-            [lto_code_data_fwd, lto_code_data_bwd],
+            [],
             shared_memory_bytes,
         )
+
+    # GPU cuFFTDx LTO path.
+    if ept < 2:
+        raise ValueError(
+            f"{func_name}() requires at least 2 elements per thread, but got ept={ept} "
+            f"(fft_size={size}, block_dim={num_threads}). "
+            f"Reduce block_dim to at most {size // 2} for this FFT size."
+        )
+
+    # generate the forward LTO
+    lto_symbol_fwd, lto_code_data_fwd, shared_memory_bytes = warp._src.build.build_lto_fft(
+        arch, size, ept, direction, fwd_dir, precision, builder
+    )
+
+    if options["enable_backward"]:
+        # generate the backward LTO (inverse direction for adjoint)
+        # shared memory requirements are identical since tile sizes match
+        lto_symbol_bwd, lto_code_data_bwd, _ = warp._src.build.build_lto_fft(
+            arch, size, ept, bwd_direction, bwd_dir, precision, builder
+        )
+    else:
+        # adjoints aren't computed, so we reuse forward symbol as a dummy arg
+        lto_symbol_bwd = lto_symbol_fwd
+        lto_code_data_bwd = None
+
+    return (
+        (
+            Var(lto_symbol_fwd, str, False, True, False),
+            Var(lto_symbol_bwd, str, False, True, False),
+            Var(dtype, str, False, True, False),
+            Var(str(shared_memory_bytes), str, False, True, False),
+            Var(str(batch), str, False, True, False),
+            Var(str(ept), str, False, True, False),
+            inout,
+        ),
+        [],
+        [lto_code_data_fwd, lto_code_data_bwd],
+        shared_memory_bytes,
+    )
 
 
 add_builtin(
@@ -13198,7 +13400,22 @@ add_builtin(
         * vec2f, vec2d
 
     Args:
-        inout: The input/output tile.""",
+        inout: The input/output tile.
+
+    Notes:
+        Supported FFT sizes by backend:
+
+        * **CPU**: Any size. Non-power-of-two sizes are capped at 4096;
+          larger non-power-of-two sizes raise ``ValueError``.
+        * **GPU with libmathdx**: Any size. This is the default when Warp
+          is built with libmathdx.
+        * **GPU without libmathdx** (or ``enable_mathdx_fft=False``):
+          Power-of-two sizes only, and the FFT size must be divisible by
+          ``block_dim``. Other sizes raise ``ValueError``. Slower than the
+          libmathdx path.
+
+        See :attr:`warp.config.enable_mathdx_fft` to control GPU backend
+        selection.""",
     group="Tile Primitives",
     export=False,
     namespace="",
@@ -13224,7 +13441,11 @@ add_builtin(
         * vec2f, vec2d
 
     Args:
-        inout: The input/output tile.""",
+        inout: The input/output tile.
+
+    Notes:
+        See :func:`tile_fft` for backend selection and supported sizes — the
+        same constraints apply to :func:`tile_ifft`.""",
     group="Tile Primitives",
     export=False,
     namespace="",
@@ -13324,8 +13545,13 @@ def _tile_cholesky_generic_lto_dispatch_func(
 
     arch = options["output_arch"]
 
-    if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
-        # CPU/no-MathDx dispatch
+    if (
+        arch is None
+        or not warp._src.context.runtime.core.wp_is_mathdx_enabled()
+        or not options.get("enable_mathdx_solver", True)
+    ):
+        # CPU/no-MathDx/disabled dispatch -- falls into the cooperative scalar
+        # branch via wp_is_null_func<Fwd>.
         if inplace:
             return ((0, a), [upper], [], 0)
         return ((0, 0, 0, a, out), [upper], [], 0)
@@ -13601,8 +13827,13 @@ def _tile_cholesky_solve_generic_lto_dispatch_func(
 
     arch = options["output_arch"]
 
-    if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
-        # CPU/no-MathDx dispatch
+    if (
+        arch is None
+        or not warp._src.context.runtime.core.wp_is_mathdx_enabled()
+        or not options.get("enable_mathdx_solver", True)
+    ):
+        # CPU/no-MathDx/disabled dispatch -- falls into the cooperative scalar
+        # branch via wp_is_null_func<Fwd>.
         return ((0, L, y) if inplace else (0, L, y, x), [upper], [], 0)
     else:
         NRHS = y.type.shape[1] if len(y.type.shape) > 1 else 1
@@ -13811,8 +14042,13 @@ def _tile_lower_solve_generic_lto_dispatch_func(
 
     arch = options["output_arch"]
 
-    if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
-        # CPU/no-MathDx dispatch
+    if (
+        arch is None
+        or not warp._src.context.runtime.core.wp_is_mathdx_enabled()
+        or not options.get("enable_mathdx_solver", True)
+    ):
+        # CPU/no-MathDx/disabled dispatch -- falls into the cooperative scalar
+        # branch via wp_is_null_func<Fwd>.
         return ((0, L, y) if inplace else (0, L, y, z), [], [], 0)
     else:
         NRHS = y.type.shape[1] if len(y.type.shape) > 1 else 1
@@ -14006,8 +14242,13 @@ def _tile_upper_solve_generic_lto_dispatch_func(
 
     arch = options["output_arch"]
 
-    if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
-        # CPU/no-MathDx dispatch
+    if (
+        arch is None
+        or not warp._src.context.runtime.core.wp_is_mathdx_enabled()
+        or not options.get("enable_mathdx_solver", True)
+    ):
+        # CPU/no-MathDx/disabled dispatch -- falls into the cooperative scalar
+        # branch via wp_is_null_func<Fwd>.
         return ((0, U, z) if inplace else (0, U, z, x), [], [], 0)
     else:
         NRHS = z.type.shape[1] if len(z.type.shape) > 1 else 1

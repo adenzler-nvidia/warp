@@ -103,8 +103,8 @@ void bvh_refit_with_solid_angle_recursive_host(BVH& bvh, int index, Mesh& mesh)
         const vec3& right_upper = reinterpret_cast<const vec3&>(bvh.node_uppers[right_index]);
 
         // union of child bounds
-        vec3 new_lower = min(left_lower, right_lower);
-        vec3 new_upper = max(left_upper, right_upper);
+        vec3 new_lower = std_min(left_lower, right_lower);
+        vec3 new_upper = std_max(left_upper, right_upper);
 
         // write new BVH nodes
         reinterpret_cast<vec3&>(lower) = new_lower;
@@ -292,8 +292,8 @@ WP_API uint64_t wp_mesh_create_device(
     return 0;
 }
 WP_API void wp_mesh_destroy_device(uint64_t id) { }
-WP_API void wp_mesh_refit_device(uint64_t id) { }
-WP_API void wp_mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points) { };
+WP_API int wp_mesh_refit_device(uint64_t id) { return 0; }
+WP_API int wp_mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points) { return 0; };
 WP_API void wp_mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> points) { };
 
 

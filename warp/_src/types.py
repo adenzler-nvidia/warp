@@ -31,6 +31,7 @@ import numpy.typing as npt
 
 import warp
 import warp.config
+from warp._src.logger import log_warning
 
 _wp_module_name_ = "warp.types"
 
@@ -2162,21 +2163,49 @@ class MeshQueryAABBTiled:
 
 # definition just for kernel type (cannot be a parameter), see hashgrid.h
 class HashGridQuery:
-    """Object used to track state during neighbor traversal (float32)."""
+    """Object used to track state during :class:`warp.HashGrid` neighbor traversal.
+
+    Query objects are returned by :func:`warp.hash_grid_query`; users normally do not construct them directly.
+    Use ``warp.HashGridQuery[dtype]`` in function annotations when the query's coordinate precision must be
+    explicit, for example ``warp.HashGridQuery[warp.float64]``.
+    """
 
     _wp_native_name_ = "hash_grid_query_f"
+    _wp_public_name_ = "HashGridQuery"
+    _wp_query_dtype_ = float32
+
+    @classmethod
+    def __class_getitem__(cls, dtype):
+        return hash_grid_query_type(dtype)
 
 
-class HashGridQueryH:
-    """Object used to track state during neighbor traversal (float16)."""
-
+class _HashGridQueryH(HashGridQuery):
     _wp_native_name_ = "hash_grid_query_h"
+    _wp_query_dtype_ = float16
 
 
-class HashGridQueryD:
-    """Object used to track state during neighbor traversal (float64)."""
-
+class _HashGridQueryD(HashGridQuery):
     _wp_native_name_ = "hash_grid_query_d"
+    _wp_query_dtype_ = float64
+
+
+_hash_grid_query_types = {
+    float16: _HashGridQueryH,
+    float32: HashGridQuery,
+    float64: _HashGridQueryD,
+}
+
+
+def hash_grid_query_type(dtype):
+    dtype = type_to_warp(dtype)
+    query_type = _hash_grid_query_types.get(dtype)
+    if query_type is None:
+        raise TypeError(f"Unsupported dtype {dtype} for HashGridQuery. Supported types: float16, float32, float64")
+    return query_type
+
+
+def type_is_hash_grid_query(t):
+    return isinstance(t, type) and getattr(t, "_wp_public_name_", None) == "HashGridQuery"
 
 
 # maximum number of dimensions, must match array.h
@@ -3181,7 +3210,7 @@ class array(Array[DType, NDim]):
             else:
                 # Warn if the data type is compatible with the requested dtype
                 if not np_dtype_is_compatible(data_dtype_np, dtype):
-                    warp._src.utils.warn(
+                    log_warning(
                         f"The input data type {data_dtype_np} does not appear to be "
                         f"compatible with the requested dtype {dtype}. If "
                         "data-type sizes do not match, then this may lead to memory-access violations."
@@ -3971,13 +4000,13 @@ class array(Array[DType, NDim]):
     def mark_write(self, **kwargs):
         """Detect if we are writing to an array that has already been read from."""
         if self._is_read:
-            if "arg_name" and "kernel_name" and "filename" and "lineno" in kwargs:
-                print(
-                    f"Warning: Array {self} passed to argument {kwargs['arg_name']} in kernel {kwargs['kernel_name']} at {kwargs['filename']}:{kwargs['lineno']} is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
+            if "arg_name" in kwargs and "kernel_name" in kwargs and "filename" in kwargs and "lineno" in kwargs:
+                log_warning(
+                    f"Array {self} passed to argument {kwargs['arg_name']} in kernel {kwargs['kernel_name']} at {kwargs['filename']}:{kwargs['lineno']} is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
                 )
             else:
-                print(
-                    f"Warning: Array {self} is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
+                log_warning(
+                    f"Array {self} is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
                 )
 
     def _apic_ensure_tracked(self):
@@ -4096,7 +4125,7 @@ class array(Array[DType, NDim]):
         if is_bf16 and not _suppress_bfloat16_warning:
             ml_bf16 = _get_ml_dtypes_bfloat16()
             if ml_bf16 is None:
-                warp._src.utils.warn(
+                log_warning(
                     "bfloat16 arrays are returned as np.uint16 (raw bit representation) "
                     "because NumPy does not natively support bfloat16. "
                     "Use wp.to_torch() or wp.to_jax() for frameworks that support bfloat16 natively, "
@@ -4564,7 +4593,7 @@ def from_ptr(ptr, length, dtype=None, shape=None, device=None):
     See Also:
         :class:`array`, :func:`from_ipc_handle`
     """
-    warp._src.utils.warn(
+    log_warning(
         """This version of wp.from_ptr() is deprecated. OmniGraph
     applications should use from_omni_graph_ptr() instead. To create an array
     from a C pointer, use the array constructor and pass the ptr argument as a
@@ -4573,6 +4602,7 @@ def from_ptr(ptr, length, dtype=None, shape=None, device=None):
     ptr=ctypes.cast(pointer, ctypes.POINTER(ctypes.c_size_t)).contents.value.
     Be sure to also specify the dtype and shape parameters.""",
         category=DeprecationWarning,
+        stacklevel=2,
     )
 
     return array(
@@ -5435,7 +5465,7 @@ class Bvh:
 
         if self.device.is_cpu:
             if constructor == BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
                 )
                 constructor = BvhConstructor.SAH
@@ -5529,14 +5559,14 @@ class Bvh:
 
         if self.device.is_cpu:
             if constructor == BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
                 )
                 constructor = BvhConstructor.SAH
             self.runtime.core.wp_bvh_rebuild_host(self.id, constructor)
         else:
             if constructor != BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "In-place rebuild method on the CUDA device only supports LBVH constructor. Falling back to LBVH constructor.",
                     stacklevel=2,
                 )
@@ -5650,7 +5680,7 @@ class Mesh:
 
         if self.device.is_cpu:
             if bvh_constructor == BvhConstructor.LBVH:
-                warp._src.utils.warn(
+                log_warning(
                     "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
                 )
                 bvh_constructor = BvhConstructor.SAH
@@ -5680,6 +5710,9 @@ class Mesh:
                 bvh_leaf_size,
             )
 
+        if not self.id:
+            raise RuntimeError(f"Failed to create mesh: {self.runtime.get_error_string()}")
+
     def __del__(self):
         if not self.id:
             return
@@ -5704,7 +5737,8 @@ class Mesh:
         if self.device.is_cpu:
             self.runtime.core.wp_mesh_refit_host(self.id)
         else:
-            self.runtime.core.wp_mesh_refit_device(self.id)
+            if not self.runtime.core.wp_mesh_refit_device(self.id):
+                raise RuntimeError(f"Failed to refit mesh: {self.runtime.get_error_string()}")
             self.runtime.verify_cuda_device(self.device)
 
     @property
@@ -5736,7 +5770,8 @@ class Mesh:
         if self.device.is_cpu:
             self.runtime.core.wp_mesh_set_points_host(self.id, points_new.__ctype__())
         else:
-            self.runtime.core.wp_mesh_set_points_device(self.id, points_new.__ctype__())
+            if not self.runtime.core.wp_mesh_set_points_device(self.id, points_new.__ctype__()):
+                raise RuntimeError(f"Failed to set mesh points: {self.runtime.get_error_string()}")
             self.runtime.verify_cuda_device(self.device)
 
     @property
@@ -7117,9 +7152,9 @@ simple_type_codes = {
     shape_t: "sh",
     range_t: "rg",
     launch_bounds_t: "lb",
-    HashGridQuery: "hgq",
-    HashGridQueryH: "hgqh",
-    HashGridQueryD: "hgqd",
+    hash_grid_query_type(float16): "hgqh",
+    hash_grid_query_type(float32): "hgq",
+    hash_grid_query_type(float64): "hgqd",
     MeshQueryAABB: "mqa",
     MeshQueryPoint: "mqp",
     MeshQueryRay: "mqr",

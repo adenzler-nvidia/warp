@@ -12,6 +12,12 @@
 
 #define WP_CURRENT_STREAM ((void*)0xffffffffffffffff)
 
+// Capture modes accepted by wp_cuda_graph_begin_capture. Values match
+// cudaStreamCaptureMode so the int can be passed straight through.
+#define WP_CUDA_GRAPH_CAPTURE_MODE_GLOBAL       0
+#define WP_CUDA_GRAPH_CAPTURE_MODE_THREAD_LOCAL 1
+#define WP_CUDA_GRAPH_CAPTURE_MODE_RELAXED      2
+
 struct timing_result_t;
 
 // this is the core runtime API exposed on the DLL level
@@ -125,10 +131,10 @@ WP_API uint64_t wp_mesh_create_device(
     int bvh_leaf_size
 );
 WP_API void wp_mesh_destroy_device(uint64_t id);
-WP_API void wp_mesh_refit_device(uint64_t id);
+WP_API int wp_mesh_refit_device(uint64_t id);
 
 WP_API void wp_mesh_set_points_host(uint64_t id, wp::array_t<wp::vec3> points);
-WP_API void wp_mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points);
+WP_API int wp_mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points);
 
 WP_API void wp_mesh_set_velocities_host(uint64_t id, wp::array_t<wp::vec3> velocities);
 WP_API void wp_mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> velocities);
@@ -422,6 +428,8 @@ WP_API int wp_cuda_device_set_mempool_release_threshold(int ordinal, uint64_t th
 WP_API uint64_t wp_cuda_device_get_mempool_release_threshold(int ordinal);
 WP_API uint64_t wp_cuda_device_get_mempool_used_mem_current(int ordinal);
 WP_API uint64_t wp_cuda_device_get_mempool_used_mem_high(int ordinal);
+WP_API uint64_t wp_cuda_device_get_graph_mem_current(int ordinal);
+WP_API void wp_cuda_device_graph_mem_trim(int ordinal);
 WP_API void wp_cuda_device_get_memory_info(int ordinal, size_t* free_mem, size_t* total_mem);
 
 WP_API void* wp_cuda_context_get_current();
@@ -475,7 +483,7 @@ WP_API void wp_cuda_event_record(void* event, void* stream, bool external = fals
 WP_API void wp_cuda_event_synchronize(void* event);
 WP_API float wp_cuda_event_elapsed_time(void* start_event, void* end_event);
 
-WP_API bool wp_cuda_graph_begin_capture(void* context, void* stream, int external);
+WP_API bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int mode);
 WP_API bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret);
 WP_API bool wp_cuda_graph_create_exec(void* context, void* stream, void* graph, void** graph_exec_ret);
 WP_API bool wp_cuda_graph_launch(void* graph, void* stream);
@@ -643,7 +651,7 @@ WP_API void wp_alloc_tracker_reset();
 WP_API void wp_alloc_tracker_set_tag(void* ptr, const char* tag);
 WP_API void wp_alloc_tracker_push_scope(const char* name);
 WP_API void wp_alloc_tracker_pop_scope();
-WP_API const char* wp_alloc_tracker_report(int sort_order = 0, int max_items = 10);
+WP_API size_t wp_alloc_tracker_report(char* buf, size_t cap, int sort_order = 0, int max_items = 10);
 WP_API size_t wp_alloc_tracker_get_current_bytes();
 WP_API size_t wp_alloc_tracker_get_peak_bytes();
 WP_API size_t wp_alloc_tracker_get_total_alloc_count();

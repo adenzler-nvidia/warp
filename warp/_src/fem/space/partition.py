@@ -8,7 +8,7 @@ from warp._src.fem import cache
 from warp._src.fem.geometry import GeometryPartition, WholeGeometryPartition
 from warp._src.fem.types import NULL_ELEMENT_INDEX, NULL_NODE_INDEX
 from warp._src.fem.utils import compress_node_indices
-from warp._src.utils import warn
+from warp._src.logger import log_warning
 
 from .function_space import FunctionSpace
 from .topology import SpaceTopology
@@ -432,13 +432,16 @@ def make_space_partition(
     """
 
     if space is not None:
-        warn(
-            "The `space` argument of `make_space_partition` is deprecated and will be removed in 1.14. "
+        log_warning(
+            "The `space` argument of `make_space_partition` is deprecated and will be removed in Warp 1.15. "
             "Please use `space_topology` instead.",
-            DeprecationWarning,
+            category=DeprecationWarning,
+            stacklevel=2,
         )
 
     if space_topology is None:
+        if space is None:
+            raise ValueError("One of `space_topology` or `space` must be provided")
         space_topology = space.topology
 
     space_topology = space_topology.full_space_topology()

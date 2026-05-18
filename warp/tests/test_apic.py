@@ -10,7 +10,14 @@ import unittest
 import numpy as np
 
 import warp as wp
-from warp.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from warp.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    get_test_devices_with_cuda_graph_module_load,
+    get_test_devices_with_mempool,
+    get_test_devices_with_mempool_and_cuda_graph_module_load,
+)
 
 
 @wp.kernel
@@ -506,26 +513,118 @@ def test_save_load_alloc_only(test, device):
         np.testing.assert_allclose(result.numpy(), np.arange(n, dtype=np.float32) + 1.0)
 
 
-devices = get_test_devices()
+def test_get_param_ptr(test, device):
+    """get_param_ptr returns a non-zero int for a known name, None for an unknown
+    name, and raises RuntimeError on a non-loaded graph."""
+    n = 64
+    a = wp.array(np.ones(n, dtype=np.float32), device=device)
+    b = wp.zeros(n, dtype=float, device=device)
 
-add_function_test(TestApic, "test_save_apic_false_error", test_save_apic_false_error, devices=devices)
-add_function_test(TestApic, "test_save_single_kernel", test_save_single_kernel, devices=devices)
-add_function_test(TestApic, "test_save_load_round_trip", test_save_load_round_trip, devices=devices)
-add_function_test(TestApic, "test_save_load_multiple_kernels", test_save_load_multiple_kernels, devices=devices)
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=n, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test_ptr")
+        wp.capture_save(capture.graph, path, inputs={"a": a}, outputs={"b": b})
+
+        loaded = wp.capture_load(path, device=device)
+
+        # Known name: should return a non-zero integer device pointer.
+        ptr = loaded.get_param_ptr("a")
+        test.assertIsInstance(ptr, int, "expected an integer device pointer")
+        test.assertNotEqual(ptr, 0, "expected a non-zero device pointer")
+
+        # Unknown name: should return None.
+        test.assertIsNone(loaded.get_param_ptr("nonexistent"))
+
+    # Non-loaded graph: should raise RuntimeError mentioning loaded APIC graphs.
+    with wp.ScopedCapture(device=device, force_module_load=False) as plain_capture:
+        wp.launch(scale_kernel, dim=n, inputs=[a, b, 1.0], device=device)
+
+    with test.assertRaisesRegex(RuntimeError, "loaded APIC"):
+        plain_capture.graph.get_param_ptr("a")
+
+
+devices = get_test_devices()
+devices_with_mempool = get_test_devices_with_mempool()
+devices_with_cuda_graph_module_load = get_test_devices_with_cuda_graph_module_load()
+devices_with_mempool_and_cuda_graph_module_load = get_test_devices_with_mempool_and_cuda_graph_module_load()
+
+add_function_test(
+    TestApic,
+    "test_save_apic_false_error",
+    test_save_apic_false_error,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_single_kernel",
+    test_save_single_kernel,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_round_trip",
+    test_save_load_round_trip,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_multiple_kernels",
+    test_save_load_multiple_kernels,
+    devices=devices_with_cuda_graph_module_load,
+)
 add_function_test(TestApic, "test_save_load_memcpy", test_save_load_memcpy, devices=devices)
 add_function_test(TestApic, "test_save_load_memset", test_save_load_memset, devices=devices)
-add_function_test(TestApic, "test_bindings_param_update", test_bindings_param_update, devices=devices)
+add_function_test(
+    TestApic,
+    "test_bindings_param_update",
+    test_bindings_param_update,
+    devices=devices_with_cuda_graph_module_load,
+)
 add_function_test(TestApic, "test_array_slicing", test_array_slicing, devices=devices)
-add_function_test(TestApic, "test_complex_pipeline", test_complex_pipeline, devices=devices)
-add_function_test(TestApic, "test_internal_allocation", test_internal_allocation, devices=devices)
-add_function_test(TestApic, "test_multiple_internal_allocations", test_multiple_internal_allocations, devices=devices)
-add_function_test(TestApic, "test_graph_execution_unchanged", test_graph_execution_unchanged, devices=devices)
-add_function_test(TestApic, "test_save_load_with_param_update", test_save_load_with_param_update, devices=devices)
-add_function_test(TestApic, "test_save_load_memcpy_and_kernel", test_save_load_memcpy_and_kernel, devices=devices)
+add_function_test(
+    TestApic,
+    "test_complex_pipeline",
+    test_complex_pipeline,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_internal_allocation",
+    test_internal_allocation,
+    devices=devices_with_mempool_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_multiple_internal_allocations",
+    test_multiple_internal_allocations,
+    devices=devices_with_mempool_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_graph_execution_unchanged",
+    test_graph_execution_unchanged,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_with_param_update",
+    test_save_load_with_param_update,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_memcpy_and_kernel",
+    test_save_load_memcpy_and_kernel,
+    devices=devices_with_cuda_graph_module_load,
+)
 add_function_test(
     TestApic, "test_save_load_fill", test_save_load_fill, devices=get_cuda_test_devices()
 )  # CPU: wp_memtile_host not recorded
-add_function_test(TestApic, "test_save_load_alloc_only", test_save_load_alloc_only, devices=devices)
+add_function_test(TestApic, "test_save_load_alloc_only", test_save_load_alloc_only, devices=devices_with_mempool)
+add_function_test(TestApic, "test_get_param_ptr", test_get_param_ptr, devices=devices_with_cuda_graph_module_load)
 
 
 if __name__ == "__main__":

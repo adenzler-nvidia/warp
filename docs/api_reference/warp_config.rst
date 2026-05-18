@@ -20,7 +20,9 @@ API
    cuda_output
    enable_backward
    enable_graph_capture_module_load_by_default
+   enable_mathdx_fft
    enable_mathdx_gemm
+   enable_mathdx_solver
    enable_mempools_at_init
    enable_tiles_in_stack_memory
    enable_vector_component_overwrites
@@ -31,6 +33,7 @@ API
    lineinfo
    llvm_cuda
    load_module_max_workers
+   log_level
    max_unroll
    mode
    optimization_level

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import itertools
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -64,7 +65,7 @@ FACE_COUNT = 12
 @wp.kernel(enable_backward=False)
 def read_points_kernel(
     mesh_id: wp.uint64,
-    out_points: wp.array(dtype=wp.vec3),
+    out_points: wp.array[wp.vec3],
 ):
     tid = wp.tid()
     mesh = wp.mesh_get(mesh_id)
@@ -74,7 +75,7 @@ def read_points_kernel(
 @wp.kernel(enable_backward=False)
 def read_indices_kernel(
     mesh_id: wp.uint64,
-    out_indices: wp.array(dtype=int),
+    out_indices: wp.array[int],
 ):
     tid = wp.tid()
     mesh = wp.mesh_get(mesh_id)
@@ -296,7 +297,7 @@ def query_ray_hit_kernel(
     mesh_id: wp.uint64,
     origin: wp.vec3,
     direction: wp.vec3,
-    hit_result: wp.array(dtype=wp.int32),
+    hit_result: wp.array[wp.int32],
 ):
     t = float(0.0)
     bary_u = float(0.0)
@@ -430,6 +431,7 @@ def test_mesh_exceptions(test, device):
 
 
 devices = get_test_devices()
+cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 
 class TestMesh(unittest.TestCase):
@@ -438,13 +440,51 @@ class TestMesh(unittest.TestCase):
         instance = wp.Mesh.__new__(wp.Mesh)
         instance.__del__()
 
+    def test_mesh_create_raises_on_native_failure(self):
+        points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device="cpu")
+        indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device="cpu")
+        runtime = wp._src.context.runtime
+
+        with (
+            mock.patch.object(runtime.core, "wp_mesh_create_host", return_value=0),
+            mock.patch.object(runtime, "get_error_string", return_value="native failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Failed to create mesh: native failure"):
+                wp.Mesh(points=points, indices=indices)
+
+    def test_mesh_refit_raises_on_native_device_failure(self):
+        mesh = wp.Mesh.__new__(wp.Mesh)
+        mesh.id = 123
+        mesh.device = mock.Mock(is_cpu=False)
+        mesh.runtime = mock.Mock()
+        mesh.runtime.core.wp_mesh_refit_device.return_value = 0
+        mesh.runtime.get_error_string.return_value = "native refit failure"
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to refit mesh: native refit failure"):
+            mesh.refit()
+
+    def test_mesh_points_setter_raises_on_native_device_failure(self):
+        points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device="cpu")
+        points_new = wp.array(POINT_POSITIONS, dtype=wp.vec3, device="cpu")
+
+        mesh = wp.Mesh.__new__(wp.Mesh)
+        mesh.id = 123
+        mesh.device = mock.Mock(is_cpu=False)
+        mesh._points = points
+        mesh.runtime = mock.Mock()
+        mesh.runtime.core.wp_mesh_set_points_device.return_value = 0
+        mesh.runtime.get_error_string.return_value = "native refit failure"
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to set mesh points: native refit failure"):
+            mesh.points = points_new
+
 
 add_function_test(TestMesh, "test_mesh_read_properties", test_mesh_read_properties, devices=devices)
 add_function_test(TestMesh, "test_mesh_query_point", test_mesh_query_point, devices=devices)
 add_function_test(TestMesh, "test_mesh_query_ray", test_mesh_query_ray, devices=devices)
 add_function_test(TestMesh, "test_grouped_mesh_query_ray", test_grouped_mesh_query_ray, devices=devices)
 add_function_test(TestMesh, "test_mesh_refit", test_mesh_refit, devices=devices)
-add_function_test(TestMesh, "test_mesh_refit_graph", test_mesh_refit_graph, devices=get_selected_cuda_test_devices())
+add_function_test(TestMesh, "test_mesh_refit_graph", test_mesh_refit_graph, devices=cuda_devices_with_mempool)
 add_function_test(TestMesh, "test_mesh_exceptions", test_mesh_exceptions, devices=get_selected_cuda_test_devices())
 
 

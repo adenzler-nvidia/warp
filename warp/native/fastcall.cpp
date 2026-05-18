@@ -7,10 +7,18 @@
 
 #include <Python.h>
 
+// Cached at PyInit time instead of using PyExc_TypeError directly. PyExc_TypeError
+// is a data import; data symbols are eagerly resolved by the OS loader on every
+// platform, which prevents warp.dll/so/dylib from being loaded by non-Python C++
+// hosts. Looking it up via PyImport_AddModule + PyObject_GetAttrString uses only
+// function imports, which are lazily bound and never resolved unless Python is
+// actually present in the process.
+static PyObject* g_python_type_error = nullptr;
+
 static PyObject* fastcall_float_to_half_bits(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
 {
     if (nargs != 1) {
-        PyErr_SetString(PyExc_TypeError, "float_to_half_bits() takes exactly 1 argument");
+        PyErr_SetString(g_python_type_error, "float_to_half_bits() takes exactly 1 argument");
         return nullptr;
     }
 
@@ -25,7 +33,7 @@ static PyObject* fastcall_float_to_half_bits(PyObject* self, PyObject* const* ar
 static PyObject* fastcall_half_bits_to_float(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
 {
     if (nargs != 1) {
-        PyErr_SetString(PyExc_TypeError, "half_bits_to_float() takes exactly 1 argument");
+        PyErr_SetString(g_python_type_error, "half_bits_to_float() takes exactly 1 argument");
         return nullptr;
     }
 
@@ -53,4 +61,15 @@ static PyModuleDef fastcall_module = {
     PyModuleDef_HEAD_INIT, "_warp_fastcall", "Warp METH_FASTCALL native bindings", -1, fastcall_methods,
 };
 
-extern "C" WP_API PyObject* PyInit__warp_fastcall() { return PyModule_Create(&fastcall_module); }
+extern "C" WP_API PyObject* PyInit__warp_fastcall()
+{
+    PyObject* builtins = PyImport_AddModule("builtins");
+    if (!builtins)
+        return nullptr;
+
+    g_python_type_error = PyObject_GetAttrString(builtins, "TypeError");
+    if (!g_python_type_error)
+        return nullptr;
+
+    return PyModule_Create(&fastcall_module);
+}

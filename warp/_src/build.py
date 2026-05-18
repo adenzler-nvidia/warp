@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import warp.config
+from warp._src.logger import LOG_DEBUG
 from warp._src.thirdparty import appdirs
 from warp._src.types import *
 
@@ -92,7 +93,7 @@ def build_cuda(
             None,
             config == "debug",
             optimization_level,
-            warp.config.verbose,
+            warp.config.verbose or warp.config.log_level <= LOG_DEBUG,
             verify_fp,
             fast_math,
             fuse_fp,
@@ -208,9 +209,9 @@ def init_kernel_cache(path=None):
         except OSError:
             has_stale = False
         if has_stale:
-            from warp._src.utils import warn  # noqa: PLC0415
+            from warp._src.logger import log_warning  # noqa: PLC0415
 
-            warn(
+            log_warning(
                 f"Kernel cache artifacts from a previous Warp version were found in '{base_dir}'. "
                 f"These will be ignored. You can safely delete them.",
             )
@@ -278,7 +279,9 @@ def safe_rename(src, dst, attempts=5, delay=0.1):
                 if i < attempts - 1:
                     time.sleep(delay)
                 else:
-                    print(
+                    from warp._src.logger import log_error  # noqa: PLC0415
+
+                    log_error(
                         f"Could not update Warp cache with compiled binaries, trying to rename {src} to {dst}, error {e}"
                     )
                     raise e
@@ -624,6 +627,7 @@ def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
     arch = 120 if arch > 121 else arch
 
     lto_symbol = f"fft_{size}_{ept}_{arch}_{direction}_{precision}"
+    dtype_ctype = "wp::vec2f" if precision == 5 else "wp::vec2d"
 
     def compile_lto_fft(temp_paths):
         shared_memory_size = ctypes.c_int(0)
@@ -676,6 +680,7 @@ def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
 
         # Update builder
         builder.ltoirs[lto_symbol] = lto_code_data
+        builder.ltoirs_decl[lto_symbol] = f"void {lto_symbol}({dtype_ctype}*, char*);"
         builder.shared_memory_bytes[lto_symbol] = shared_memory_bytes
 
     return lto_symbol, lto_code_data, shared_memory_bytes

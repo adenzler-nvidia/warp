@@ -180,8 +180,6 @@ from warp._src.types import Volume as Volume
 from warp._src.types import BvhQuery as BvhQuery
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
-from warp._src.types import HashGridQueryD as HashGridQueryD
-from warp._src.types import HashGridQueryH as HashGridQueryH
 from warp._src.types import MeshQueryAABB as MeshQueryAABB
 from warp._src.types import MeshQueryAABBTiled as MeshQueryAABBTiled
 from warp._src.types import MeshQueryPoint as MeshQueryPoint
@@ -341,15 +339,16 @@ from warp._src.context import get_device_allocator as get_device_allocator
 from warp._src.context import set_cuda_allocator as set_cuda_allocator
 from warp._src.context import set_device_allocator as set_device_allocator
 from warp._src.utils import ScopedAllocator as ScopedAllocator
-from warp._src.rmm_allocator import RmmAllocator as RmmAllocator
 
 
-# category: CUDA Graph Management
+# category: Graph Management
 
+from warp._src.context import CaptureMode as CaptureMode
 from warp._src.utils import ScopedCapture as ScopedCapture
 
 from warp._src.context import is_conditional_graph_supported as is_conditional_graph_supported
 
+from warp._src.context import Graph as Graph
 from warp._src.context import capture_begin as capture_begin
 from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch
@@ -388,6 +387,22 @@ from warp._src.utils import TIMING_MEMCPY as TIMING_MEMCPY
 from warp._src.utils import TIMING_MEMSET as TIMING_MEMSET
 from warp._src.utils import TIMING_GRAPH as TIMING_GRAPH
 from warp._src.utils import TIMING_ALL as TIMING_ALL
+
+
+# category: Logging
+
+from warp._src.logger import LOG_DEBUG as LOG_DEBUG
+from warp._src.logger import LOG_INFO as LOG_INFO
+from warp._src.logger import LOG_WARNING as LOG_WARNING
+from warp._src.logger import LOG_ERROR as LOG_ERROR
+
+from warp._src.logger import Logger as Logger
+
+from warp._src.logger import set_logger as set_logger
+from warp._src.logger import get_logger as get_logger
+
+from warp._src.utils import ScopedLogger as ScopedLogger
+from warp._src.utils import ScopedLogLevel as ScopedLogLevel
 
 
 # category: NumPy Interop
@@ -472,6 +487,26 @@ from . import utils as utils
 from warp._src.math import *
 from warp._src.marching_cubes import MarchingCubes as MarchingCubes
 from warp._src.context import RegisteredGLBuffer as RegisteredGLBuffer
+
+
+def __getattr__(name):
+    if name == "HashGridQueryH":
+        dtype = float16
+    elif name == "HashGridQueryD":
+        dtype = float64
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from warp._src.logger import log_warning  # noqa: PLC0415
+    from warp._src.types import hash_grid_query_type  # noqa: PLC0415
+
+    log_warning(
+        f"warp.{name} is deprecated and will be removed in a future release. "
+        "Use warp.HashGridQuery in public type references; query objects are returned by warp.hash_grid_query().",
+        category=DeprecationWarning,
+        stacklevel=2,
+    )
+    return hash_grid_query_type(dtype)
 
 
 __version__ = config.version

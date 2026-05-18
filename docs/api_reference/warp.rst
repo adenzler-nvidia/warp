@@ -22,7 +22,7 @@ These modules must be explicitly imported (e.g., ``import warp.autograd``).
 
 - :mod:`warp.autograd`
 - :mod:`warp.fem`
-- :mod:`warp.jax_experimental`
+- :mod:`warp.jax`
 - :mod:`warp.optim`
 - :mod:`warp.render`
 - :mod:`warp.sparse`
@@ -224,8 +224,6 @@ Spatial Acceleration
    BvhQueryTiled
    HashGrid
    HashGridQuery
-   HashGridQueryD
-   HashGridQueryH
    Mesh
    MeshQueryAABB
    MeshQueryAABBTiled
@@ -387,7 +385,6 @@ CUDA Memory Management
    :toctree: _generated
 
    Allocator
-   RmmAllocator
    ScopedAllocator
    ScopedMempool
    ScopedMempoolAccess
@@ -409,13 +406,15 @@ CUDA Memory Management
    set_mempool_release_threshold
    set_peer_access_enabled
 
-CUDA Graph Management
----------------------
+Graph Management
+----------------
 
 .. autosummary::
    :nosignatures:
    :toctree: _generated
 
+   CaptureMode
+   Graph
    ScopedCapture
    capture_begin
    capture_debug_dot_print
@@ -465,6 +464,23 @@ Timing Flags
    TIMING_KERNEL_BUILTIN
    TIMING_MEMCPY
    TIMING_MEMSET
+
+Logging
+-------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: _generated
+
+   Logger
+   ScopedLogLevel
+   ScopedLogger
+   get_logger
+   set_logger
+   LOG_DEBUG
+   LOG_ERROR
+   LOG_INFO
+   LOG_WARNING
 
 NumPy Interop
 -------------

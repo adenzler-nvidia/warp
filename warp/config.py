@@ -14,9 +14,74 @@ setting documentation for details.
 For information on module-level and kernel-level settings, see :doc:`/user_guide/configuration`.
 """
 
+import sys as _sys
+import types as _types
+
+from warp._src.logger import LOG_INFO as _LOG_INFO
+from warp._src.logger import log_warning as _log_warning
+
 _wp_module_name_ = "warp.config"
 
-version: str = "1.13.0.dev0"
+_deprecated_verbose_warning_seen = False
+_deprecated_quiet_warning_seen = False
+_suppress_verbose_log_level_mapping = False
+
+
+def _is_internal_warp_config_access() -> bool:
+    try:
+        # Temporary verbose/quiet migration hook. Frame depth 3 assumes:
+        # _is_internal_warp_config_access -> _warn_deprecated_config_access
+        # -> module __getattribute__/__setattr__ -> caller. Remove this when
+        # verbose/quiet are removed.
+        module_name = _sys._getframe(3).f_globals.get("__name__", "")
+    except ValueError:
+        return False
+    return module_name == "warp" or module_name.startswith("warp.")
+
+
+def _warn_deprecated_config_access(name: str) -> None:
+    global _deprecated_verbose_warning_seen, _deprecated_quiet_warning_seen
+
+    if _is_internal_warp_config_access():
+        return
+
+    if name == "verbose":
+        if _deprecated_verbose_warning_seen:
+            return
+        message = "warp.config.verbose is deprecated; use warp.config.log_level = warp.LOG_DEBUG instead."
+    elif name == "quiet":
+        if _deprecated_quiet_warning_seen:
+            return
+        message = (
+            "warp.config.quiet is deprecated; use warp.config.log_level = warp.LOG_WARNING to suppress the init banner."
+        )
+    else:
+        return
+
+    _log_warning(message, category=DeprecationWarning, stacklevel=3)
+    if name == "verbose":
+        _deprecated_verbose_warning_seen = True
+    else:
+        _deprecated_quiet_warning_seen = True
+
+
+class _ConfigModule(_types.ModuleType):
+    def __getattribute__(self, name):
+        if name in ("verbose", "quiet"):
+            _warn_deprecated_config_access(name)
+        return super().__getattribute__(name)
+
+    def __setattr__(self, name, value):
+        if name in ("verbose", "quiet"):
+            _warn_deprecated_config_access(name)
+        super().__setattr__(name, value)
+
+
+def _install_config_module_hooks() -> None:
+    _sys.modules[__name__].__class__ = _ConfigModule
+
+
+version: str = "1.14.0.dev0"
 """Warp version string"""
 
 verify_fp: bool = False
@@ -81,7 +146,12 @@ This setting can be overridden at the module level by setting the ``"optimizatio
 """
 
 verbose: bool = False
-"""Enable detailed logging during code generation and compilation."""
+"""Enable detailed logging during code generation and compilation.
+
+.. deprecated::
+    Use ``warp.config.log_level = warp.LOG_DEBUG`` instead. Reading or setting
+    this flag emits a ``DeprecationWarning`` for external callers.
+"""
 
 verbose_warnings: bool = False
 """Enable extended warning messages with source location information."""
@@ -89,7 +159,18 @@ verbose_warnings: bool = False
 quiet: bool = False
 """Disable Warp module initialization messages.
 
-Error messages and warnings remain unaffected.
+.. deprecated::
+    Use ``warp.config.log_level = warp.LOG_WARNING`` instead. Reading or setting
+    this flag emits a ``DeprecationWarning`` for external callers.
+"""
+
+log_level: int = _LOG_INFO
+"""Log level threshold for Warp's logging infrastructure.
+
+Messages below this level are suppressed. Use the ``LOG_DEBUG``, ``LOG_INFO``,
+``LOG_WARNING``, and ``LOG_ERROR`` constants from the ``warp`` module.
+
+Default is ``warp.LOG_INFO`` (20).
 """
 
 verify_autograd_array_access: bool = False
@@ -202,6 +283,32 @@ This setting can be overridden at the module level by setting the
 ``"enable_mathdx_gemm"`` module option.
 """
 
+enable_mathdx_solver: bool = True
+"""Use libmathdx (cuSolverDx) for tile solver ops on GPU when available.
+
+Controls all cuSolverDx-backed ops: :func:`tile_cholesky <warp._src.lang.tile_cholesky>`
+(and its adjoint), :func:`tile_cholesky_solve <warp._src.lang.tile_cholesky_solve>`,
+:func:`tile_lower_solve <warp._src.lang.tile_lower_solve>`, and
+:func:`tile_upper_solve <warp._src.lang.tile_upper_solve>`.
+
+When False, these ops fall back to cooperative shared-memory implementations
+that do not require libmathdx, at the cost of runtime performance.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_solver"`` module option.
+"""
+
+enable_mathdx_fft: bool = True
+"""Use libmathdx (cuFFTDx) for :func:`tile_fft <warp._src.lang.tile_fft>` and
+:func:`tile_ifft <warp._src.lang.tile_ifft>` on GPU when available.
+
+When False, these ops use a fallback that supports power-of-two FFT sizes only,
+trading runtime performance for faster kernel compile times.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_fft"`` module option.
+"""
+
 cpu_compiler_flags: str | None = None
 """Flags controlling CPU kernel compilation.
 
@@ -306,3 +413,6 @@ _git_commit_hash: str | None = None
 
 Set automatically by CI, do not modify.
 """
+
+
+_install_config_module_hooks()

@@ -17,6 +17,9 @@ import sys
 
 import docutils
 import sphinx
+from sphinx import addnodes
+from sphinx.environment.adapters.toctree import note_toctree
+from sphinx.ext.autosummary import autosummary_toc
 from sphinx.ext.autosummary.generate import AutosummaryRenderer
 from sphinx.ext.napoleon.docstring import GoogleDocstring
 
@@ -95,10 +98,10 @@ nitpick_ignore_regex = [
     (r"py:class", r"(warp|wp)\._src\..*"),
     # Ctypes-based geometric types that can't be documented as classes (vec*, mat*, quat, etc.)
     (r"py:class", r"(warp\.)?(vec\d*[ihfd]?|mat\d+[ihfd]?|quat[hfd]?|spatial_(vector|matrix)[hfd]?|transform[hfd]?)"),
-    # Type names used in FEM and internal annotations (e.g., Graph, Sample, Coords)
+    # Type names used in FEM and internal annotations (e.g., Sample, Coords)
     (
         r"py:class",
-        r"(Graph|Struct|BlockType|Rows|Cols|Sample|Coords|ElementIndex|"
+        r"(Struct|BlockType|Rows|Cols|Sample|Coords|ElementIndex|"
         r"ElementArg|ElementEvalArg|ElementIndexArg|TopologyArg|EvalArg|"
         r"BsrMatrixOrExpression|_Var|_FuncParams|FunctionMetadata|KernelHooks|"
         r"launch_bounds_t|FieldRestriction|scalar)",
@@ -125,8 +128,8 @@ nitpick_ignore_regex = [
         r"py:obj",
         r".*\.(conjugate|bit_length|bit_count|to_bytes|from_bytes|as_integer_ratio|is_integer|real|imag|numerator|denominator)",
     ),
-    # jax_callable lives in warp.jax_experimental (jax itself is mocked)
-    (r"py:func", r"warp\.jax_experimental\.jax_callable"),
+    # jax_callable lives in warp.jax (jax itself is mocked)
+    (r"py:func", r"warp\.jax\.jax_callable"),
 ]
 
 
@@ -148,7 +151,6 @@ templates_path = ["_templates"]
 
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
-    "announcement": "Warp v1.12.1 is now available. See the <a href='https://github.com/NVIDIA/warp/releases/tag/v1.12.1'>release notes</a>.",
     "secondary_sidebar_items": ["page-toc", "edit-this-page"],
     "article_header_end": ["view-page-source.html"],
     "use_edit_page_button": True,
@@ -165,7 +167,45 @@ html_theme_options = {
         },
     ],
     "navigation_depth": 2,
+    "sidebar_includehidden": False,
 }
+
+# Enable the version switcher when DOC_VERSION is set (CI builds only).
+# Local builds without DOC_VERSION will not render the switcher.
+# nvidia_sphinx_theme places the switcher in navbar_center by default once
+# `switcher` is configured; explicitly setting `navbar_end` would put a
+# second copy there and render two "Choose Version" dropdowns side by side.
+#
+# `show_version_warning_banner` reads versions.json at runtime and renders
+# the "this is an older version" banner whenever the page's `version_match`
+# differs from the `preferred` entry. Bumping `preferred` in versions.json
+# (a one-line JSON edit during the next release) makes every archived
+# version's docs surface the banner without a rebuild.
+doc_version = os.environ.get("DOC_VERSION", "")
+if doc_version:
+    html_theme_options.update(
+        {
+            "check_switcher": False,
+            "switcher": {
+                "json_url": "https://nvidia.github.io/warp/versions.json",
+                "version_match": doc_version,
+            },
+            "show_version_warning_banner": True,
+        }
+    )
+
+    # Override Sphinx's ``release`` (which feeds ``DOCUMENTATION_OPTIONS.VERSION``,
+    # used by the PyData warning banner) for release-doc builds. The docs collapse
+    # patch releases into ``/vMAJOR.MINOR/`` and ``versions.json`` records the
+    # preferred entry as ``"version": "MAJOR.MINOR"``; without this override, a
+    # patch like ``1.12.1`` semver-compares strictly greater than the preferred
+    # ``1.12``, so the banner classifies the stable docs as "an unstable
+    # development version" and links "Switch to stable version" back to itself.
+    # We leave ``version`` (used in ``html_title``) at ``wp.__version__`` so the
+    # navbar still shows the precise patch version.
+    if re.fullmatch(r"\d+\.\d+", doc_version):
+        release = doc_version
+
 html_title = f"Warp {version}"
 html_context = {
     "github_user": "NVIDIA",
@@ -227,6 +267,12 @@ autosummary_filename_map = {
     "warp.launch": "warp.launch_function",
     "warp.fem.cells": "warp.fem.cells_function",
     "warp.fem.integrand": "warp.fem.integrand_decorator",
+    # Linear solver functions share names with their functor classes (cg vs CG, etc.);
+    # suffix the function stubs so they don't collide on case-insensitive filesystems.
+    "warp.optim.linear.cg": "warp.optim.linear.cg_function",
+    "warp.optim.linear.cr": "warp.optim.linear.cr_function",
+    "warp.optim.linear.bicgstab": "warp.optim.linear.bicgstab_function",
+    "warp.optim.linear.gmres": "warp.optim.linear.gmres_function",
 }
 
 # Map internal builtin function paths to public names for output filenames.
@@ -253,6 +299,50 @@ def normalize_docstring(doc: str) -> str:
     return re.sub(r"^(:(rtype|type\s+\w+):.*)\bwp\.", r"\1warp.", rst, flags=re.MULTILINE) if "wp." in rst else rst
 
 
+def _get_builtin_overloads_info(symbol: str) -> list[dict[str, object]]:
+    head = wp._src.context.builtin_functions[symbol]
+
+    # Collect all overloads, filtering out hidden ones.
+    # Note: head.overloads already includes the head itself (see Function.__init__)
+    all_funcs = head.overloads if hasattr(head, "overloads") else [head]
+    visible_overloads = [f for f in all_funcs if not f.hidden]
+
+    overloads_info = []
+    seen_overloads = set()
+    for func in visible_overloads:
+        args = {k: wp._src.context.type_str(v) for k, v in func.input_types.items()}
+        args_str = ", ".join(f"{k}: {v}" for k, v in args.items())
+
+        try:
+            return_type = wp._src.context.type_str(func.value_func(None, None))
+        except Exception:
+            return_type = "None"
+
+        if hasattr(func, "overloads"):
+            sig = wp._src.context.resolve_exported_function_sig(func)
+            is_exported = sig is not None
+        else:
+            is_exported = False
+
+        doc = normalize_docstring(func.doc)
+        overload_key = (args_str, return_type, is_exported, func.is_differentiable, doc)
+        if overload_key in seen_overloads:
+            continue
+
+        seen_overloads.add(overload_key)
+        overloads_info.append(
+            {
+                "args": args_str,
+                "return_type": return_type,
+                "is_exported": is_exported,
+                "is_differentiable": func.is_differentiable,
+                "doc": doc,
+            }
+        )
+
+    return overloads_info
+
+
 class AutosummaryRenderer(AutosummaryRenderer):
     # Module containing Warp's built-ins functions and requiring special handling.
     BUILTINS_TEMPLATE_FILE = "builtins.rst"
@@ -262,44 +352,11 @@ class AutosummaryRenderer(AutosummaryRenderer):
             fullname = context["fullname"]
             symbol = fullname.split(".")[-1]
 
-            head = wp._src.context.builtin_functions[symbol]
-
-            # Collect all overloads, filtering out hidden ones.
-            # Note: head.overloads already includes the head itself (see Function.__init__)
-            all_funcs = head.overloads if hasattr(head, "overloads") else [head]
-            visible_overloads = [f for f in all_funcs if not f.hidden]
-
-            # Build overload info for each visible overload
-            overloads_info = []
-            for func in visible_overloads:
-                args = {k: wp._src.context.type_str(v) for k, v in func.input_types.items()}
-
-                try:
-                    return_type = wp._src.context.type_str(func.value_func(None, None))
-                except Exception:
-                    return_type = "None"
-
-                if hasattr(func, "overloads"):
-                    sig = wp._src.context.resolve_exported_function_sig(func)
-                    is_exported = sig is not None
-                else:
-                    is_exported = False
-
-                overloads_info.append(
-                    {
-                        "args": ", ".join(f"{k}: {v}" for k, v in args.items()),
-                        "return_type": return_type,
-                        "is_exported": is_exported,
-                        "is_differentiable": func.is_differentiable,
-                        "doc": normalize_docstring(func.doc),
-                    }
-                )
-
             # Insert metadata that can be accessed from the template.
             context.update(
                 {
                     "wp_display_name": f"warp.{symbol}",
-                    "wp_overloads": overloads_info,
+                    "wp_overloads": _get_builtin_overloads_info(symbol),
                 }
             )
 
@@ -317,7 +374,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-wp.config.quiet = True
+wp.config.log_level = wp.LOG_WARNING
 wp.init()
 """
 
@@ -337,7 +394,7 @@ intersphinx_mapping = {
     "jax": ("https://docs.jax.dev/en/latest", None),
     "numpy": ("https://numpy.org/doc/stable", None),
     "python": ("https://docs.python.org/3", None),
-    "pytorch": ("https://pytorch.org/docs/stable/", None),
+    "pytorch": ("https://pytorch.org/docs/stable", None),
 }
 
 
@@ -545,6 +602,35 @@ def rewrite_wp_aliases(app, what, name, obj, options, signature, return_annotati
     return _fix(signature), _fix(return_annotation)
 
 
+_RE_REPR_ADDRESS = re.compile(r"<([\w.]+) object at 0x[0-9a-f]+>")
+
+
+def strip_repr_addresses(app, doctree, docname):
+    """Drop memory addresses from default-repr leaks in the resolved doctree.
+
+    A handful of Warp attributes are documented without explicit type
+    annotations, so autodoc falls back to ``repr(obj)`` which for objects
+    without ``__repr__`` produces strings like ``<warp.types.array object
+    at 0x70faf939a250>`` (for class-level array sentinels) or ``<property
+    object at 0x...>`` (for descriptors).  The address differs every Python
+    process, which makes the rendered HTML byte-unstable across builds —
+    every push to ``main`` then writes a different ``gh-pages`` tree even
+    when the docs haven't changed.
+
+    ``sphinx.ext.autodoc.typehints`` injects these directly into the doctree
+    via the ``object-description-transform`` event, bypassing the
+    ``autodoc-process-signature`` and ``autodoc-process-docstring`` hooks,
+    so the cleanup has to happen at the doctree level.
+    """
+    for text_node in list(doctree.findall(docutils.nodes.Text)):
+        original = text_node.astext()
+        if "object at 0x" not in original:
+            continue
+        cleaned = _RE_REPR_ADDRESS.sub(r"<\1 object>", original)
+        if cleaned != original:
+            text_node.parent.replace(text_node, docutils.nodes.Text(cleaned))
+
+
 def resolve_wp_aliases(app, env, node, contnode):
     """Resolve ``wp.*`` cross-references by retrying as ``warp.*``.
 
@@ -594,9 +680,54 @@ def resolve_wp_aliases(app, env, node, contnode):
     return None
 
 
+def resolve_public_builtin_aliases(app, env, node, contnode):
+    """Resolve public ``warp.*`` built-in refs to their generated documents."""
+    reftarget = node.get("reftarget", "")
+    if node.get("reftype") != "func" or not reftarget.startswith("warp."):
+        return None
+
+    builtin_name = reftarget[5:]
+    if "." in builtin_name:
+        return None
+
+    from warp._src.context import builtin_functions  # noqa: PLC0415
+
+    if builtin_name not in builtin_functions:
+        return None
+
+    new_target = f"warp._src.lang.{builtin_name}"
+    node["reftarget"] = new_target
+
+    domain = env.get_domain("py")
+    result = domain.resolve_xref(env, node.get("refdoc", ""), app.builder, "func", new_target, node, contnode)
+
+    node["reftarget"] = reftarget
+    return result
+
+
 def generate_reference_docs(app):
     """Generate API and language reference .rst files before Sphinx reads sources."""
     docs.generate_reference.run()
+
+
+def drop_autosummary_toctrees(app, doctree):
+    # autosummary's `:toctree:` wraps its generated toctree in
+    # `autosummary_toc`, a `nodes.comment` subclass. HTML writers skip the
+    # wrapper, but Sphinx's TocTreeCollector still descends into it and
+    # copies the inner toctree into `env.tocs`, which is what populates the
+    # left sidebar. With navigation_depth=2 that exposes every generated
+    # stub under its parent API/Language reference page. Remove the wrapper
+    # so the toctree never reaches `env.tocs`; call `note_toctree` first so
+    # `env.toctree_includes` still records the stubs and they aren't flagged
+    # as orphan documents.
+    #
+    # Must run before TocTreeCollector (doctree-read, default priority 500;
+    # lower priority runs first), hence priority=400 in setup().
+    docname = app.env.docname
+    for asum in list(doctree.findall(autosummary_toc)):
+        for tocnode in asum.findall(addnodes.toctree):
+            note_toctree(app.env, docname, tocnode)
+        asum.parent.remove(asum)
 
 
 def setup(app):
@@ -609,4 +740,10 @@ def setup(app):
     app.connect("autodoc-process-docstring", populate_reexported_docstrings)
     app.connect("autodoc-process-signature", rewrite_wp_aliases)
     app.connect("missing-reference", resolve_wp_aliases)
+    app.connect("missing-reference", resolve_public_builtin_aliases)
+    # Lower priority runs first; this must precede TocTreeCollector
+    # (default 500) so the autosummary wrappers are gone before it
+    # populates `env.tocs`.
+    app.connect("doctree-read", drop_autosummary_toctrees, priority=400)
     app.connect("doctree-resolved", rewrite_internal_module_paths)
+    app.connect("doctree-resolved", strip_repr_addresses)

@@ -90,6 +90,9 @@ The options for a module can also be queried using :func:`wp.get_module_options(
 |``enable_mathdx_gemm``                | Boolean | ``None``    | A module-level override of the :attr:`warp.config.enable_mathdx_gemm`    |
 |                                      |         |             | setting. ``None`` defers to the global setting at compile time.          |
 +--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
+|``enable_mathdx_solver``              | Boolean | ``None``    | A module-level override of the :attr:`warp.config.enable_mathdx_solver`  |
+|                                      |         |             | setting. ``None`` defers to the global setting at compile time.          |
++--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
 
 Kernel Settings
 ---------------
@@ -159,7 +162,7 @@ Kernel-level settings can be passed as arguments to the :func:`@wp.kernel <warp.
 
 
     @wp.kernel(module_options={"fast_math": True}, module="unique")
-    def fast_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+    def fast_kernel(a: wp.array[float], b: wp.array[float]):
         # fast_math is applied to this kernel's unique module
         tid = wp.tid()
         b[tid] = a[tid] + 1.0

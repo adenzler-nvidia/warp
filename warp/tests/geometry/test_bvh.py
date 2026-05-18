@@ -10,7 +10,7 @@ from warp.tests.unittest_utils import *
 
 
 @wp.kernel
-def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array(dtype=int)):
+def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array[int]):
     query = wp.bvh_query_aabb(bvh_id, lower, upper)
     bounds_nr = int(0)
 
@@ -19,7 +19,7 @@ def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_int
 
 
 @wp.kernel
-def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_intersected: wp.array(dtype=int)):
+def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_intersected: wp.array[int]):
     query = wp.bvh_query_ray(bvh_id, start, dir)
     bounds_nr = int(0)
 
@@ -170,11 +170,11 @@ def get_random_aabbs(n, center, relative_shift, relative_size, rng):
 
 @wp.kernel
 def compute_num_contact_with_checksums(
-    lowers: wp.array(dtype=wp.vec3),
-    uppers: wp.array(dtype=wp.vec3),
+    lowers: wp.array[wp.vec3],
+    uppers: wp.array[wp.vec3],
     bvh_id: wp.uint64,
-    counts: wp.array(dtype=int),
-    check_sums: wp.array(dtype=int),
+    counts: wp.array[int],
+    check_sums: wp.array[int],
 ):
     tid = wp.tid()
 
@@ -281,7 +281,7 @@ def tile_bvh_query_aabb_kernel(
     bvh_id: wp.uint64,
     lower: wp.vec3,
     upper: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.tile_bvh_query_aabb(bvh_id, lower, upper)
 
@@ -300,7 +300,7 @@ def tile_bvh_query_ray_kernel(
     bvh_id: wp.uint64,
     start: wp.vec3,
     dir: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.tile_bvh_query_ray(bvh_id, start, dir)
 
@@ -493,7 +493,7 @@ def bvh_query_aabb_tiled_kernel(
     bvh_id: wp.uint64,
     lower: wp.vec3,
     upper: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.bvh_query_aabb_tiled(bvh_id, lower, upper)
 
@@ -511,7 +511,7 @@ def bvh_query_ray_tiled_kernel(
     bvh_id: wp.uint64,
     start: wp.vec3,
     dir: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.bvh_query_ray_tiled(bvh_id, start, dir)
 
@@ -666,7 +666,7 @@ def tile_bvh_query_valid_aabb_kernel(
     bvh_id: wp.uint64,
     lower: wp.vec3,
     upper: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.tile_bvh_query_aabb(bvh_id, lower, upper)
 
@@ -683,7 +683,7 @@ def tile_bvh_query_valid_ray_kernel(
     bvh_id: wp.uint64,
     start: wp.vec3,
     dir: wp.vec3,
-    bounds_intersected: wp.array(dtype=int),
+    bounds_intersected: wp.array[int],
 ):
     query = wp.tile_bvh_query_ray(bvh_id, start, dir)
 
@@ -697,6 +697,7 @@ def tile_bvh_query_valid_ray_kernel(
 
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
+cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
 
 
 class TestBvh(unittest.TestCase):
@@ -741,7 +742,7 @@ add_function_test(TestBvh, "test_tile_bvh_query_ray", test_tile_bvh_query_ray, d
 add_function_test(TestBvh, "test_bvh_query_aabb_tiled", test_bvh_query_aabb_tiled, devices=cuda_devices)
 add_function_test(TestBvh, "test_bvh_query_ray_tiled", test_bvh_query_ray_tiled, devices=cuda_devices)
 
-add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices)
+add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices_with_mempool)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

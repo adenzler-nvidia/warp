@@ -4,10 +4,12 @@
 # isort: skip_file
 
 from enum import Enum
-from warp._src.utils import warn
+
+import warp as wp
 import warp._src.fem.domain as _domain
 import warp._src.fem.geometry as _geometry
 import warp._src.fem.polynomial as _polynomial
+from warp._src.logger import log_warning
 
 from .function_space import FunctionSpace
 from .basis_function_space import CollocatedFunctionSpace, ContravariantFunctionSpace, CovariantFunctionSpace
@@ -61,15 +63,17 @@ def make_space_restriction(
     """
 
     if space is not None:
-        warn(
-            "The `space` argument of `make_space_restriction` is deprecated and will be removed in 1.14. "
+        log_warning(
+            "The `space` argument of `make_space_restriction` is deprecated and will be removed in Warp 1.15. "
             "Please use `space_partition` or `space_topology` instead.",
-            DeprecationWarning,
+            category=DeprecationWarning,
+            stacklevel=2,
         )
 
     if space_partition is None:
         if space_topology is None:
-            assert space is not None
+            if space is None:
+                raise ValueError("One of `space_partition`, `space_topology`, or `space` must be provided")
             space_topology = space.topology
 
         if domain is None:

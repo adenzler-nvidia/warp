@@ -72,8 +72,6 @@ from warp._src.types import Volume as Volume
 from warp._src.types import BvhQuery as BvhQuery
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
-from warp._src.types import HashGridQueryD as HashGridQueryD
-from warp._src.types import HashGridQueryH as HashGridQueryH
 from warp._src.types import MeshQueryAABB as MeshQueryAABB
 from warp._src.types import MeshQueryAABBTiled as MeshQueryAABBTiled
 from warp._src.types import MeshQueryPoint as MeshQueryPoint
@@ -174,9 +172,10 @@ from warp._src.context import get_device_allocator as get_device_allocator
 from warp._src.context import set_cuda_allocator as set_cuda_allocator
 from warp._src.context import set_device_allocator as set_device_allocator
 from warp._src.utils import ScopedAllocator as ScopedAllocator
-from warp._src.rmm_allocator import RmmAllocator as RmmAllocator
+from warp._src.context import CaptureMode as CaptureMode
 from warp._src.utils import ScopedCapture as ScopedCapture
 from warp._src.context import is_conditional_graph_supported as is_conditional_graph_supported
+from warp._src.context import Graph as Graph
 from warp._src.context import capture_begin as capture_begin
 from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch
@@ -200,6 +199,15 @@ from warp._src.utils import TIMING_MEMCPY as TIMING_MEMCPY
 from warp._src.utils import TIMING_MEMSET as TIMING_MEMSET
 from warp._src.utils import TIMING_GRAPH as TIMING_GRAPH
 from warp._src.utils import TIMING_ALL as TIMING_ALL
+from warp._src.logger import LOG_DEBUG as LOG_DEBUG
+from warp._src.logger import LOG_INFO as LOG_INFO
+from warp._src.logger import LOG_WARNING as LOG_WARNING
+from warp._src.logger import LOG_ERROR as LOG_ERROR
+from warp._src.logger import Logger as Logger
+from warp._src.logger import set_logger as set_logger
+from warp._src.logger import get_logger as get_logger
+from warp._src.utils import ScopedLogger as ScopedLogger
+from warp._src.utils import ScopedLogLevel as ScopedLogLevel
 from warp._src.types import dtype_from_numpy as dtype_from_numpy
 from warp._src.types import dtype_to_numpy as dtype_to_numpy
 from warp._src.context import from_numpy as from_numpy
@@ -1742,13 +1750,21 @@ def min(a: Vector[Scalar, Any], b: Vector[Scalar, Any]) -> Vector[Scalar, Any]:
 def min(a: Vector[Scalar, Any]) -> Scalar:
     """Compute the minimum value.
 
+    On float types, NaN elements are treated as missing (C ``fmin`` semantics);
+    the reduction returns the smallest non-NaN element, or NaN only if every
+    element is NaN.
+
     Returns:
         The minimum element of ``a``."""
     ...
 
 @over
 def min(a: Scalar, b: Scalar) -> Scalar:
-    """Compute the minimum value."""
+    """Compute the minimum value.
+
+    On float types, NaN is treated as missing (C ``fmin`` semantics): the
+    operation returns the non-NaN operand when exactly one is NaN, and NaN
+    only when both are NaN."""
     ...
 
 @over
@@ -1763,17 +1779,29 @@ def max(a: Vector[Scalar, Any], b: Vector[Scalar, Any]) -> Vector[Scalar, Any]:
 def max(a: Vector[Scalar, Any]) -> Scalar:
     """Compute the maximum value.
 
+    On float types, NaN elements are treated as missing (C ``fmax`` semantics);
+    the reduction returns the largest non-NaN element, or NaN only if every
+    element is NaN.
+
     Returns:
         The maximum element of ``a``."""
     ...
 
 @over
 def max(a: Scalar, b: Scalar) -> Scalar:
-    """Compute the maximum value."""
+    """Compute the maximum value.
+
+    On float types, NaN is treated as missing (C ``fmax`` semantics): the
+    operation returns the non-NaN operand when exactly one is NaN, and NaN
+    only when both are NaN."""
     ...
 
 def clamp(x: Scalar, low: Scalar, high: Scalar) -> Scalar:
-    """Clamp the value of ``x`` to the range [low, high]."""
+    """Clamp the value of ``x`` to the range [low, high].
+
+    Equivalent to ``wp.min(wp.max(low, x), high)``. On float types this means
+    NaN values of ``x`` produce ``wp.min(low, high)`` rather than propagating
+    NaN."""
     ...
 
 @over
@@ -1803,6 +1831,15 @@ def sign(x: Scalar) -> Scalar:
 
     Returns:
         -1 if ``x`` < 0 and 1 otherwise."""
+    ...
+
+def copysign(x: Float, y: Float) -> Float:
+    """Return a value with the magnitude of ``x`` and the sign of ``y``.
+
+    For example, ``wp.copysign(3.0, -1.0)`` returns ``-3.0`` and
+    ``wp.copysign(-3.0, 1.0)`` returns ``3.0``. Useful for forcing a
+    specific sign on a result whose signed-zero behavior is otherwise
+    implementation-defined (e.g. ``wp.min(-0.0, +0.0)``)."""
     ...
 
 def step(x: Scalar) -> Scalar:
@@ -1973,11 +2010,17 @@ def ddot(a: Matrix[Scalar, Any, Any], b: Matrix[Scalar, Any, Any]) -> Scalar:
     ...
 
 def argmin(a: Vector[Scalar, Any]) -> uint32:
-    """Compute the index of the minimum element of vector ``a``."""
+    """Compute the index of the minimum element of vector ``a``.
+
+    On float types, NaN elements are skipped; the result is the index of the
+    smallest non-NaN element. If every element is NaN, returns ``0``."""
     ...
 
 def argmax(a: Vector[Scalar, Any]) -> uint32:
-    """Compute the index of the maximum element of vector ``a``."""
+    """Compute the index of the maximum element of vector ``a``.
+
+    On float types, NaN elements are skipped; the result is the index of the
+    largest non-NaN element. If every element is NaN, returns ``0``."""
     ...
 
 def outer(a: Vector[Scalar, Any], b: Vector[Scalar, Any]) -> Matrix[Scalar, Any, Any]:
@@ -2500,6 +2543,37 @@ def tile_ones(shape: tuple[int, ...], dtype: Any, storage: str) -> Tile[Any, tup
 @over
 def tile_ones(shape: int32, dtype: Any, storage: str) -> Tile[Any, tuple[int, ...]]:
     """Allocate a tile of one-initialized items."""
+    ...
+
+@over
+def tile_empty(shape: tuple[int, ...], dtype: Any, storage: str) -> Tile[Any, tuple[int, ...]]:
+    """Allocate a tile of uninitialized items.
+
+    The tile's contents are undefined; the caller is responsible for overwriting
+    every element before any read. This matches the semantics of ``numpy.empty``.
+
+    Because it skips initialization, ``tile_empty`` can avoid unnecessary stores
+    when every element will be overwritten, especially for ``"shared"`` tiles.
+
+    For accumulator patterns (``a += ...``), use :func:`tile_zeros` instead -
+    accumulation reads the prior value and would propagate uninitialized data.
+    Use ``tile_empty`` only when the first operation after construction is a
+    full overwrite (a ``tile_load``, a tile-typed assignment, or a complete
+    element-wise fill).
+
+    Args:
+        shape: Shape of the output tile
+        dtype: Data type of output tile's elements (default float)
+        storage: The storage location for the tile: ``"register"`` for registers
+            (default) or ``"shared"`` for shared memory.
+
+    Returns:
+        An uninitialized tile with the requested shape and data type."""
+    ...
+
+@over
+def tile_empty(shape: int32, dtype: Any, storage: str) -> Tile[Any, tuple[int, ...]]:
+    """Allocate a tile of uninitialized items."""
     ...
 
 @over
@@ -3378,7 +3452,7 @@ def tile_scatter_add(a: Tile[Any, tuple[int, ...]], i: int32, value: Any, has_va
         .. code-block:: python
 
             @wp.kernel
-            def histogram(data: wp.array(dtype=float), out: wp.array(dtype=float)):
+            def histogram(data: wp.array[float], out: wp.array[float]):
 
                 bins = wp.tile_zeros(dtype=float, shape=4, storage="shared")
                 i = wp.tid()
@@ -3596,13 +3670,17 @@ def tile_sum(a: Tile[Any, tuple[int, ...]]) -> Tile[Any, tuple[Literal[1]]]:
 def tile_dot(a: Tile[Any, tuple[int, ...]], b: Tile[Any, tuple[int, ...]]) -> Tile[Any, tuple[Literal[1]]]:
     """Compute the dot product of two tiles.
 
-    Computes a full contraction (tensordot) between corresponding elements
-    and sums the results. For scalar tiles this is the standard dot product;
-    for vector or matrix tiles each element pair is fully contracted
-    (e.g., ``wp.dot(a[i], b[i])`` for ``vec3`` elements).
+    Computes a full contraction between corresponding elements and sums
+    the results. For scalar tiles this is the standard dot product; for
+    vector tiles each pair is contracted via ``wp.dot``; for matrix tiles
+    it is the Frobenius inner product (the sum of element-wise products
+    over all axes).
 
-    Equivalent to ``wp.tile_sum(wp.tile_map(wp.tensordot, a, b))``
-    but without any intermediate tiles or shared-memory round trips.
+    Equivalent in Python to ``wp.tile_sum(a * b)`` for scalar tiles,
+    ``wp.tile_sum(wp.tile_map(wp.dot, a, b))`` for vector tiles, and
+    ``wp.tile_sum(wp.tile_map(wp.ddot, a, b))`` for matrix tiles, but
+    without the intermediate tile and shared-memory round trip the
+    explicit forms would require.
 
     Args:
         a: First tile operand.
@@ -4316,7 +4394,7 @@ def tile_stack(capacity: int32, dtype: Any) -> TileStack[Any, Any]:
             CAP = wp.constant(8)
 
             @wp.kernel
-            def compact_kernel(data: wp.array(dtype=int), out: wp.array(dtype=int), out_count: wp.array(dtype=int)):
+            def compact_kernel(data: wp.array[int], out: wp.array[int], out_count: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
 
@@ -4365,7 +4443,7 @@ def tile_stack_push(s: Any, value: Any, has_value: bool) -> int:
             CAP = wp.constant(8)
 
             @wp.kernel
-            def push_kernel(out_idx: wp.array(dtype=int)):
+            def push_kernel(out_idx: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 idx = wp.tile_stack_push(s, j * 10, j < 4)
@@ -4408,7 +4486,7 @@ def tile_stack_pop(s: Any) -> tuple[Any, int]:
             CAP = wp.constant(8)
 
             @wp.kernel
-            def pop_kernel(out: wp.array(dtype=int)):
+            def pop_kernel(out: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j * 10, j < 4)
@@ -4443,7 +4521,7 @@ def tile_stack_clear(s: Any) -> None:
             CAP = wp.constant(8)
 
             @wp.kernel
-            def clear_kernel(before: wp.array(dtype=int), after: wp.array(dtype=int)):
+            def clear_kernel(before: wp.array[int], after: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j, True)
@@ -4489,7 +4567,7 @@ def tile_stack_count(s: Any) -> int:
             CAP = wp.constant(8)
 
             @wp.kernel
-            def count_kernel(out_count: wp.array(dtype=int)):
+            def count_kernel(out_count: wp.array[int]):
                 _i, j = wp.tid()
                 s = wp.tile_stack(capacity=CAP, dtype=int)
                 wp.tile_stack_push(s, j, j % 2 == 0)
@@ -4780,23 +4858,25 @@ def hash_grid_query(id: uint64, point: vec3f, max_dist: float32) -> HashGridQuer
     ...
 
 @over
-def hash_grid_query(id: uint64, point: vec3h, max_dist: float16) -> HashGridQueryH:
+def hash_grid_query(id: uint64, point: vec3h, max_dist: float16) -> HashGridQuery:
     """Construct a point query against a :class:`warp.HashGrid` (float16 precision).
 
     This query can be used to iterate over all neighboring points within a fixed radius from the query point."""
     ...
 
 @over
-def hash_grid_query(id: uint64, point: vec3d, max_dist: float64) -> HashGridQueryD:
+def hash_grid_query(id: uint64, point: vec3d, max_dist: float64) -> HashGridQuery:
     """Construct a point query against a :class:`warp.HashGrid` (float64 precision).
 
     This query can be used to iterate over all neighboring points within a fixed radius from the query point."""
     ...
 
-def hash_grid_query_next(query: HashGridQuery | HashGridQueryH | HashGridQueryD, index: int32) -> bool:
+def hash_grid_query_next(query: HashGridQuery, index: int32) -> bool:
     """Move to the next point in the hash grid query.
 
-    The index of the current neighbor is stored in ``index``, returns ``False`` if there are no more neighbors."""
+    Supports query objects returned by :func:`wp.hash_grid_query() <warp.hash_grid_query>` for all hash grid
+    coordinate precisions. The index of the current neighbor is stored in ``index``; returns ``False`` if there are no
+    more neighbors."""
     ...
 
 def hash_grid_point_id(id: uint64, index: int32) -> int:
@@ -6378,7 +6458,22 @@ def tile_fft(inout: Tile[Vector[Float, Literal[2]], tuple[int, ...]]) -> None:
         * vec2f, vec2d
 
     Args:
-        inout: The input/output tile."""
+        inout: The input/output tile.
+
+    Notes:
+        Supported FFT sizes by backend:
+
+        * **CPU**: Any size. Non-power-of-two sizes are capped at 4096;
+          larger non-power-of-two sizes raise ``ValueError``.
+        * **GPU with libmathdx**: Any size. This is the default when Warp
+          is built with libmathdx.
+        * **GPU without libmathdx** (or ``enable_mathdx_fft=False``):
+          Power-of-two sizes only, and the FFT size must be divisible by
+          ``block_dim``. Other sizes raise ``ValueError``. Slower than the
+          libmathdx path.
+
+        See :attr:`warp.config.enable_mathdx_fft` to control GPU backend
+        selection."""
     ...
 
 def tile_ifft(inout: Tile[Vector[Float, Literal[2]], tuple[int, ...]]) -> None:
@@ -6396,7 +6491,11 @@ def tile_ifft(inout: Tile[Vector[Float, Literal[2]], tuple[int, ...]]) -> None:
         * vec2f, vec2d
 
     Args:
-        inout: The input/output tile."""
+        inout: The input/output tile.
+
+    Notes:
+        See :func:`tile_fft` for backend selection and supported sizes — the
+        same constraints apply to :func:`tile_ifft`."""
     ...
 
 def tile_cholesky(A: Tile[Float, tuple[int, int]], fill_mode: str) -> Tile[Float, tuple[int, int]]:

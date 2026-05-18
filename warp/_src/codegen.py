@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, get_args, get_origin
 
 import warp.config
+from warp._src.logger import log_debug, log_warning
 from warp._src.types import *
 
 _wp_module_name_ = "warp.codegen"
@@ -379,11 +380,11 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
             setattr(inst._ctype, field, value)
         else:
             if is_scalar(value):
-                warp._src.utils.warn(
+                log_warning(
                     f"Implicit conversion from a scalar type to the composite type "
                     f"`{type_repr(var_type)}` for struct field '{field}' is deprecated. "
                     f"Use an explicit conversion, e.g.: `{type_repr(var_type)}(...)`.",
-                    DeprecationWarning,
+                    category=DeprecationWarning,
                     stacklevel=3,
                 )
             # conversion from list/tuple, ndarray, etc.
@@ -930,13 +931,13 @@ class Var:
 
         # detect if we are writing to an array after reading from it within the same kernel
         if self.is_read and warp._src.codegen.options.get("verify_autograd_array_access", False):
-            if "kernel_name" and "filename" and "lineno" in kwargs:
-                print(
-                    f"Warning: Array passed to argument {self.label} in kernel {kwargs['kernel_name']} at {kwargs['filename']}:{kwargs['lineno']} is being written to after it has been read from within the same kernel. This may corrupt gradient computation in the backward pass."
+            if "kernel_name" in kwargs and "filename" in kwargs and "lineno" in kwargs:
+                log_warning(
+                    f"Array passed to argument {self.label} in kernel {kwargs['kernel_name']} at {kwargs['filename']}:{kwargs['lineno']} is being written to after it has been read from within the same kernel. This may corrupt gradient computation in the backward pass."
                 )
             else:
-                print(
-                    f"Warning: Array {self} is being written to after it has been read from within the same kernel. This may corrupt gradient computation in the backward pass."
+                log_warning(
+                    f"Array {self} is being written to after it has been read from within the same kernel. This may corrupt gradient computation in the backward pass."
                 )
         self.is_write = True
 
@@ -2024,8 +2025,9 @@ class Adjoint:
         # Warn if this kernel has backward enabled, since the gradient call
         # is forward-only and won't participate in automatic differentiation.
         if adj.used_by_backward_kernel:
-            msg = f'Warning: grad() call for function "{func.key}" is used in a kernel with enable_backward=True. The gradient call does NOT participate in automatic differentiation - gradients will not flow through this call in the backward pass.'
-            print(msg)
+            log_warning(
+                f'grad() call for function "{func.key}" is used in a kernel with enable_backward=True. The gradient call does NOT participate in automatic differentiation - gradients will not flow through this call in the backward pass.'
+            )
 
         # Ensure the function is built so its adjoint code exists.
         if not func.is_builtin():
@@ -2246,6 +2248,10 @@ class Adjoint:
             if is_tile(i.type):
                 if i.type.owner:
                     reverse.append(adj.indentation + f"\t{i.emit_adj()}.grad_zero();")
+                # Non-owner tile adjoints are alias handles - their grad pointer
+                # references storage owned by another tile (typically a
+                # loop-invariant accumulator). Resetting here would corrupt that
+                # storage and null the alias pointers in this local handle.
             else:
                 reverse.append(adj.indentation + f"\t{i.emit_adj()} = {{}};")
 
@@ -2307,7 +2313,15 @@ class Adjoint:
 
         # zero adjoints of local vars
         for i in body_block.vars:
-            reverse.append(f"{i.emit_adj()} = {{}};")
+            if is_tile(i.type):
+                if i.type.owner:
+                    reverse.append(f"{i.emit_adj()}.grad_zero();")
+                # Non-owner tile adjoints are alias handles - their grad pointer
+                # references storage owned by another tile (typically a
+                # loop-invariant accumulator). Resetting here would corrupt that
+                # storage and null the alias pointers in this local handle.
+            else:
+                reverse.append(f"{i.emit_adj()} = {{}};")
 
         # replay
         for i in body_block.body_replay:
@@ -2774,11 +2788,11 @@ class Adjoint:
             var2 = adj.symbols[sym]
 
             if var1 != var2:
-                if warp.config.verbose and not adj.custom_reverse_mode:
+                if not adj.custom_reverse_mode:
                     lineno = adj.lineno + adj.fun_lineno
                     line = adj.source_lines[adj.lineno]
-                    msg = f'Warning: detected mutated variable {sym} during a dynamic for-loop in function "{adj.fun_name}" at {adj.filename}:{lineno}: this may not be a differentiable operation.\n{line}\n'
-                    print(msg)
+                    msg = f'Warning: detected mutated variable {sym} during a dynamic for-loop in function "{adj.fun_name}" at {adj.filename}:{lineno}: this may not be a differentiable operation.\n{line}'
+                    log_debug(msg)
 
                 if var1.constant is not None:
                     raise WarpCodegenError(
@@ -2907,23 +2921,21 @@ class Adjoint:
             # Always unroll if the loop contains static expressions
             if contains_static:
                 # Forced unrolling for loops with static expressions regardless of max_unroll
-                if warp.config.verbose and max_iters > max_unroll:
-                    print(
+                if max_iters > max_unroll:
+                    log_debug(
                         f"Notice: Forcing unroll of loop with {max_iters} iterations because it contains wp.static expressions."
                     )
                 return range(start, end, step)
 
             # Apply max_unroll check only for regular loops (no static expressions)
             if max_iters > max_unroll:
-                if warp.config.verbose:
-                    print(
-                        f"Warning: fixed-size loop count of {max_iters} is larger than the module 'max_unroll' limit of {max_unroll}, will generate dynamic loop."
-                    )
+                log_debug(
+                    f"Warning: fixed-size loop count of {max_iters} is larger than the module 'max_unroll' limit of {max_unroll}, will generate dynamic loop."
+                )
                 ok_to_unroll = False
 
             elif adj.contains_break(loop.body):
-                if warp.config.verbose:
-                    print("Warning: 'break' or 'continue' found in loop body, will generate dynamic loop.")
+                log_debug("Warning: 'break' or 'continue' found in loop body, will generate dynamic loop.")
                 ok_to_unroll = False
 
             if ok_to_unroll:
@@ -3538,6 +3550,13 @@ class Adjoint:
                 adj.add_forward(f"{var.emit()} = {rhs.emit()};")
                 return
 
+            # Fast path: array-rooted composite-component writes are
+            # emitted as direct slot access. Legacy ``indexref + store``
+            # has a nop adjoint; this lowering gives correct gradients at
+            # single-slot cost.
+            if adj._try_lower_array_slot_write(lhs, rhs):
+                return
+
             target, indices = adj.eval_subscript(lhs)
             target_type = strip_reference(target.type)
             indices = adj.eval_indices(target_type, indices)
@@ -3573,10 +3592,274 @@ class Adjoint:
             adj.symbols[name] = out
 
         elif isinstance(lhs, ast.Attribute):
+            # Fast path: array-rooted composite-component writes.
+            if adj._try_lower_array_slot_write(lhs, rhs):
+                return
             adj._store_attribute(lhs, adj.eval(lhs.value), rhs)
 
         else:
             raise WarpCodegenError("Error, unsupported assignment statement.")
+
+    def _try_lower_array_slot_write(adj, lhs, rhs):
+        """Intercept array-rooted composite-component writes and emit
+        direct slot access. Returns True if the write was handled.
+
+        For ``arr[i].y = rhs`` on a ``wp.array(dtype=wp.vec3)``, emits:
+
+        - Forward: ``wp::index(arr, i).c[1] = rhs;`` (one scalar-sized store).
+        - Reverse: ``wp::adj_array_store_slot(arr, adj_arr, adj_rhs,
+          [&](auto& _e) -> auto& { return _e.c[1]; }, i);`` — the native
+          helper reads the slot's accumulated adjoint into ``adj_rhs`` and
+          zeros it (overwrite semantic), or uses ``buf.grad`` as a fallback
+          source when no adjoint array is passed by the tape.
+
+        This avoids the whole-element load / assign_copy / array_store chain
+        the generic machinery would otherwise emit, which costs up to ~10x
+        more for large composite dtypes (mat44).
+
+        Shapes accepted on this fast path (where ``SCALAR`` means the
+        element's scalar dtype, e.g. ``float32``; ``COMPOSITE`` means a
+        ``vec``/``quat``/``mat``/``transform``):
+
+          - ``arr[i].x`` — vec/quat component via attribute (leaf SCALAR).
+          - ``arr[i][k]`` — vec/quat scalar subscript (leaf SCALAR).
+          - ``arr[i][r, c]`` — mat element subscript (leaf SCALAR).
+          - ``arr[i].p`` / ``arr[i].q`` — transform translation / rotation
+            (leaf is COMPOSITE: vec3 or quat).
+          - ``arr[i].field`` — struct field (leaf SCALAR or COMPOSITE).
+          - ``arr[i].outer.inner.a`` — nested struct chains terminating in
+            any of the above.
+          - ``arr[i].inner.m[r, c]``, ``arr[i].v.y``, etc. — struct chains
+            descending into a composite field.
+          - Any of the above on 2D/3D/4D arrays.
+
+        Declines (returns False) for:
+
+          - Arrays other than plain ``wp.array`` (indexed, fabric, fixed):
+            those don't have an ``adj_array_store_slot`` overload and
+            would fail to compile.
+          - Vec/quat/mat slices (writing a sub-vec, a row, or a sub-mat):
+            the slot is a composite that isn't trivially addressable as
+            a single reference via the lambda pattern, so these stay on
+            the existing ``assign_copy`` / ``assign_inplace`` path.
+          - Chains that traverse an array field of a struct
+            (``state.v[i] = rhs`` where ``v`` is ``wp.array``): that's
+            a plain array write, already handled correctly by
+            ``array_store``.
+          - wp.adjoint[var] — a special AST pattern, handled upstream.
+          - Non-Name roots (e.g. ``func_call().field``).
+          - Dtypes that don't support atomic accumulation at the array
+            level.
+        """
+        plan = adj._walk_array_slot_access(lhs)
+        if plan is None:
+            return False
+        root_var, array_indices_ast, access_parts, slot_type = plan
+
+        # If the rhs is still a reference (e.g. ``src[i]`` produced
+        # ``address(src, i)``), emit a differentiable ``copy`` to get a
+        # value with a working adjoint chain back to the source array.
+        # Using ``load`` here would route the rhs through a nop adjoint
+        # and drop the read-side gradient.
+        if is_reference(rhs.type):
+            rhs = adj.add_builtin_call("copy", [rhs])
+        rhs_value_type = strip_reference(rhs.type)
+        if not types_equal(rhs_value_type, slot_type):
+            return False
+
+        # Evaluate indices AFTER committing to the fast path, in Python
+        # left-to-right order: array subscripts outermost first, then the
+        # composite-component chain inner subscripts in order.
+        array_index_vars = [adj.eval(n) for n in array_indices_ast]
+        access_cpp_parts = []
+        for kind, payload in access_parts:
+            if kind == "str":
+                access_cpp_parts.append(payload)
+            else:  # ("idx", ast_node)
+                idx_var = adj.eval(payload)
+                access_cpp_parts.append(idx_var.emit())
+        access_cpp = "".join(access_cpp_parts)
+
+        arr_cpp = root_var.emit()
+        adj_arr_cpp = root_var.emit_adj()
+        rhs_cpp = rhs.emit()
+        adj_rhs_cpp = rhs.emit_adj()
+        array_indices_cpp = ", ".join(v.emit() for v in array_index_vars)
+
+        # Forward: one slot store.
+        adj.add_forward(f"wp::index({arr_cpp}, {array_indices_cpp}){access_cpp} = {rhs_cpp};")
+
+        # Reverse: single call to the slot-level adj_array_store variant,
+        # with the composite-component access encoded as a short lambda.
+        # The grad-routing (adj_buf vs buf.grad) and RETAIN_GRAD handling
+        # live in the native helper, matching adj_array_store's existing
+        # logic scoped to the single slot.
+        adj.add_reverse(
+            f"wp::adj_array_store_slot({arr_cpp}, {adj_arr_cpp}, {adj_rhs_cpp}, "
+            f"[&](auto& _e) -> auto& {{ return _e{access_cpp}; }}"
+            + (f", {array_indices_cpp}" if array_indices_cpp else "")
+            + ");"
+        )
+
+        if adj.builder_options.get("verify_autograd_array_access", False):
+            kernel_name = adj.fun_name
+            filename = adj.filename
+            lineno = adj.lineno + adj.fun_lineno
+            root_var.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
+
+        return True
+
+    def _walk_array_slot_access(adj, lhs):
+        """Inspect the LHS AST without emitting IR. Returns ``None`` if the
+        fast path can't handle this shape. On success, returns a plan:
+
+        ``(root_var, array_indices_ast, access_parts, slot_type)``
+
+        where:
+
+        - ``root_var`` is the Warp ``Var`` for the array root.
+        - ``array_indices_ast`` is the list of AST nodes for the array
+          indices, in Python left-to-right order (outermost subscript
+          first).
+        - ``access_parts`` is a list of ``(kind, payload)`` tuples that
+          the caller concatenates into the C++ member-access string
+          after evaluating each ``("idx", ast_node)`` placeholder. The
+          interleaving lets the caller evaluate subscript indices in
+          left-to-right order without duplicating them.
+        - ``slot_type`` is the Warp type of the leaf slot.
+
+        This function performs type checks and AST-shape analysis only;
+        no ``adj.eval`` or other IR-emitting calls. All index evaluation
+        happens in the caller after the acceptance decision is final.
+        """
+        chain = []
+        node = lhs
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            chain.append(node)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        # ``wp.adjoint[var]`` has its own upstream handler; don't intercept.
+        if node.id == "wp":
+            return None
+        if node.id not in adj.symbols:
+            return None
+        root_var = adj.symbols[node.id]
+        if not isinstance(root_var, Var):
+            return None
+        root_type = strip_reference(root_var.type)
+        # Only plain ``wp.array`` is supported here. ``indexedarray``,
+        # ``fabricarray``, ``indexedfabricarray``, and ``fixedarray`` do
+        # not have an ``adj_array_store_slot`` overload and would fail to
+        # compile; they stay on the legacy path for both forward and
+        # reverse (same as main).
+        if not warp._src.types.matches_array_class(root_type, warp._src.types.array):
+            return None
+        # Reject dtypes that can't support the slot-level grad update.
+        if root_type.dtype in warp._src.types.non_atomic_types:
+            return None
+
+        # Consume ``ndim`` subscripts from the outer end of the chain to
+        # get the array indices. The AST chain we collected is inner-to-
+        # outer; reverse so ``chain[0]`` is the outermost access.
+        chain = list(reversed(chain))
+        needed = root_type.ndim
+        array_indices_ast = []
+        consumed = 0
+        for step in chain:
+            if not isinstance(step, ast.Subscript):
+                break
+            if needed == 0:
+                break
+            elts = list(step.slice.elts) if isinstance(step.slice, ast.Tuple) else [step.slice]
+            if len(elts) > needed:
+                return None
+            array_indices_ast.extend(elts)
+            needed -= len(elts)
+            consumed += 1
+        if needed != 0:
+            return None
+        remaining = chain[consumed:]
+        if not remaining:
+            # Whole-element write — not a composite-component write.
+            return None
+
+        # Walk the remaining chain, building ``access_parts`` without
+        # evaluating any subscript indices. The caller evaluates them
+        # after the full walk accepts.
+        access_parts = []
+        current_type = root_type.dtype
+        for step in remaining:
+            if isinstance(step, ast.Attribute):
+                if type_is_vector(current_type):
+                    # ``.x``/``.y``/``.z``/``.w`` → ``.c[N]``. Resolve the
+                    # swizzle index inline to avoid emitting IR during the walk.
+                    dim = current_type._shape_[0]
+                    swizzles = "xyzw"[:dim]
+                    if len(step.attr) != 1 or step.attr not in swizzles:
+                        return None
+                    access_parts.append(("str", f".c[{swizzles.index(step.attr)}]"))
+                    current_type = getattr(current_type, "_wp_scalar_type_", None)
+                elif type_is_quaternion(current_type):
+                    if step.attr not in ("x", "y", "z", "w"):
+                        return None
+                    access_parts.append(("str", f".{step.attr}"))
+                    current_type = getattr(current_type, "_wp_scalar_type_", None)
+                elif type_is_transformation(current_type):
+                    scalar_t = getattr(current_type, "_wp_scalar_type_", None)
+                    if scalar_t is None:
+                        return None
+                    if step.attr == "p":
+                        access_parts.append(("str", ".p"))
+                        current_type = vector(length=3, dtype=scalar_t)
+                    elif step.attr == "q":
+                        access_parts.append(("str", ".q"))
+                        current_type = quaternion(dtype=scalar_t)
+                    else:
+                        return None
+                elif isinstance(current_type, Struct):
+                    if step.attr not in current_type.vars:
+                        return None
+                    access_parts.append(("str", f".{step.attr}"))
+                    current_type = current_type.vars[step.attr].type
+                    # Array-field chains (``state.v[i] = rhs`` where ``v``
+                    # is ``wp.array``) belong on the regular array_store
+                    # path. Reject here so the legacy flow handles them.
+                    if is_array(current_type):
+                        return None
+                else:
+                    return None
+            else:  # ast.Subscript
+                if type_is_matrix(current_type):
+                    if not isinstance(step.slice, ast.Tuple):
+                        return None
+                    slice_elts = step.slice.elts
+                    if len(slice_elts) != 2:
+                        return None
+                    access_parts.append(("str", ".data["))
+                    access_parts.append(("idx", slice_elts[0]))
+                    access_parts.append(("str", "]["))
+                    access_parts.append(("idx", slice_elts[1]))
+                    access_parts.append(("str", "]"))
+                    current_type = getattr(current_type, "_wp_scalar_type_", None)
+                elif (
+                    type_is_vector(current_type)
+                    or type_is_quaternion(current_type)
+                    or type_is_transformation(current_type)
+                ):
+                    if isinstance(step.slice, ast.Tuple):
+                        # 2D subscript on a 1D composite — unsupported.
+                        return None
+                    access_parts.append(("str", "["))
+                    access_parts.append(("idx", step.slice))
+                    access_parts.append(("str", "]"))
+                    current_type = getattr(current_type, "_wp_scalar_type_", None)
+                else:
+                    return None
+            if current_type is None:
+                return None
+
+        return root_var, array_indices_ast, access_parts, current_type
 
     def _store_subscript(adj, lhs, target, indices, rhs):
         """Store ``rhs`` into a subscript target using pre-evaluated ``target`` and ``indices``.
@@ -3619,12 +3902,12 @@ class Adjoint:
                 attr = adj.add_builtin_call("indexref", [target, *indices])
                 adj.add_builtin_call("store", [attr, rhs])
 
-                if warp.config.verbose and not adj.custom_reverse_mode:
+                if not adj.custom_reverse_mode:
                     lineno = adj.lineno + adj.fun_lineno
                     line = adj.source_lines[adj.lineno]
                     node_source = adj.get_node_source(lhs.value)
-                    print(
-                        f"Warning: mutating {node_source} in function {adj.fun_name} at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n"
+                    log_debug(
+                        f"Warning: mutating {node_source} in function {adj.fun_name} at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}"
                     )
             else:
                 if adj.builder_options.get("enable_vector_component_overwrites", False):
@@ -3689,11 +3972,11 @@ class Adjoint:
             else:
                 adj.add_builtin_call("assign", [attr, rhs])
 
-            if warp.config.verbose and not adj.custom_reverse_mode:
+            if not adj.custom_reverse_mode:
                 lineno = adj.lineno + adj.fun_lineno
                 line = adj.source_lines[adj.lineno]
-                msg = f'Warning: detected mutated struct {attr.label} during function "{adj.fun_name}" at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n'
-                print(msg)
+                msg = f'Warning: detected mutated struct {attr.label} during function "{adj.fun_name}" at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}'
+                log_debug(msg)
 
     def emit_Return(adj, node):
         if node.value is None:
@@ -3905,8 +4188,7 @@ class Adjoint:
                     if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
                 else:
-                    if warp.config.verbose:
-                        print(f"Warning: in-place op {node.op} is not differentiable")
+                    log_debug(f"Warning: in-place op {node.op} is not differentiable")
                     augassign_subscript(target, indices)
                     return
 
@@ -3927,8 +4209,7 @@ class Adjoint:
                 elif isinstance(node.op, ast.BitXor):
                     adj.add_builtin_call("bit_xor_inplace", [target, *indices, rhs])
                 else:
-                    if warp.config.verbose:
-                        print(f"Warning: in-place op {node.op} is not differentiable")
+                    log_debug(f"Warning: in-place op {node.op} is not differentiable")
                     augassign_subscript(target, indices)
                     return
 
@@ -3944,8 +4225,7 @@ class Adjoint:
                 elif isinstance(node.op, ast.BitXor):
                     adj.add_builtin_call("tile_bit_xor_inplace", [target, *indices, rhs])
                 else:
-                    if warp.config.verbose:
-                        print(f"Warning: in-place op {node.op} is not differentiable")
+                    log_debug(f"Warning: in-place op {node.op} is not differentiable")
                     augassign_subscript(target, indices)
                     return
 
@@ -4243,8 +4523,7 @@ class Adjoint:
             value = eval(code_to_eval, vars_dict)
             if isinstance(value, (enum.IntEnum, enum.IntFlag)):
                 value = int(value)
-            if warp.config.verbose:
-                print(f"Evaluated static command: {static_code} = {value}")
+            log_debug(f"Evaluated static command: {static_code} = {value}")
         except NameError as e:
             raise WarpCodegenError(
                 f"Error evaluating static expression: {e}. Make sure all variables used in the static expression are constant."

@@ -3,8 +3,13 @@
 
 # ruff: noqa: PLC0415
 
+import contextlib
+import importlib
+import io
 import os
+import sys
 import unittest
+import warnings
 from functools import partial
 from typing import Any
 
@@ -20,33 +25,33 @@ ARRAY_SIZE = 1024 * 1024
 
 # basic kernel with one input and output
 @wp.kernel
-def triple_kernel(input: wp.array(dtype=float), output: wp.array(dtype=float)):
+def triple_kernel(inp: wp.array[float], output: wp.array[float]):
     tid = wp.tid()
-    output[tid] = 3.0 * input[tid]
+    output[tid] = 3.0 * inp[tid]
 
 
 # generic kernel with one scalar input and output
 @wp.kernel
-def triple_kernel_scalar(input: wp.array(dtype=Any), output: wp.array(dtype=Any)):
+def triple_kernel_scalar(inp: wp.array[Any], output: wp.array[Any]):
     tid = wp.tid()
-    output[tid] = input.dtype(3) * input[tid]
+    output[tid] = inp.dtype(3) * inp[tid]
 
 
 # generic kernel with one vector/matrix input and output
 @wp.kernel
-def triple_kernel_vecmat(input: wp.array(dtype=Any), output: wp.array(dtype=Any)):
+def triple_kernel_vecmat(inp: wp.array[Any], output: wp.array[Any]):
     tid = wp.tid()
-    output[tid] = input.dtype.dtype(3) * input[tid]
+    output[tid] = inp.dtype.dtype(3) * inp[tid]
 
 
 @wp.kernel
-def inc_1d_kernel(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+def inc_1d_kernel(x: wp.array[float], y: wp.array[float]):
     tid = wp.tid()
     y[tid] = x[tid] + 1.0
 
 
 @wp.kernel
-def inc_2d_kernel(x: wp.array2d(dtype=float), y: wp.array2d(dtype=float)):
+def inc_2d_kernel(x: wp.array2d[float], y: wp.array2d[float]):
     i, j = wp.tid()
     y[i, j] = x[i, j] + 1.0
 
@@ -55,12 +60,12 @@ def inc_2d_kernel(x: wp.array2d(dtype=float), y: wp.array2d(dtype=float)):
 @wp.kernel
 def multiarg_kernel(
     # inputs
-    a: wp.array(dtype=float),
-    b: wp.array(dtype=float),
-    c: wp.array(dtype=float),
+    a: wp.array[float],
+    b: wp.array[float],
+    c: wp.array[float],
     # outputs
-    ab: wp.array(dtype=float),
-    bc: wp.array(dtype=float),
+    ab: wp.array[float],
+    bc: wp.array[float],
 ):
     tid = wp.tid()
     ab[tid] = a[tid] + b[tid]
@@ -90,6 +95,112 @@ def _jax_version():
         return jax.__version_info__
     except ImportError:
         return (0, 0, 0)
+
+
+_JAX_NAMESPACE_MODULES = ("warp.jax", "warp.jax_experimental")
+_JAX_EXPERIMENTAL_WARNING_PREFIX = "The `warp.jax_experimental"
+
+
+def _clear_jax_namespace_modules():
+    for module_name in list(sys.modules):
+        if any(module_name == prefix or module_name.startswith(prefix + ".") for prefix in _JAX_NAMESPACE_MODULES):
+            del sys.modules[module_name]
+
+
+def _clear_jax_experimental_warning_cache():
+    wp._src.logger._warnings_seen = {
+        entry
+        for entry in wp._src.logger._warnings_seen
+        if not (
+            entry[0] is DeprecationWarning
+            and isinstance(entry[1], str)
+            and entry[1].startswith(_JAX_EXPERIMENTAL_WARNING_PREFIX)
+        )
+    }
+
+
+def _import_deprecated_jax_namespace(module_name):
+    _clear_jax_experimental_warning_cache()
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+        warnings.simplefilter("always", DeprecationWarning)
+        module = importlib.import_module(module_name)
+    return module, stderr.getvalue()
+
+
+def test_jax_namespace_imports(test, device):
+    _clear_jax_namespace_modules()
+
+    with contextlib.redirect_stdout(io.StringIO()) as stdout:
+        jax_module = importlib.import_module("warp.jax")
+        ffi_module = importlib.import_module("warp.jax.ffi")
+        custom_call_module = importlib.import_module("warp.jax.custom_call")
+
+    test.assertEqual(stdout.getvalue(), "")
+    test.assertIs(wp.to_jax, jax_module.to_jax)
+    test.assertIs(wp.from_jax, jax_module.from_jax)
+    test.assertIs(wp.dtype_to_jax, jax_module.dtype_to_jax)
+    test.assertIs(wp.dtype_from_jax, jax_module.dtype_from_jax)
+    test.assertIs(wp.device_to_jax, jax_module.device_to_jax)
+    test.assertIs(wp.device_from_jax, jax_module.device_from_jax)
+    test.assertIs(jax_module.jax_kernel, ffi_module.jax_kernel)
+    test.assertIs(jax_module.jax_callable, ffi_module.jax_callable)
+    test.assertIs(jax_module.register_ffi_callback, ffi_module.register_ffi_callback)
+    test.assertIs(jax_module.GraphMode, ffi_module.GraphMode)
+    test.assertTrue(callable(custom_call_module.jax_kernel))
+
+
+def test_jax_experimental_import_deprecation(test, device):
+    _clear_jax_namespace_modules()
+
+    module, output = _import_deprecated_jax_namespace("warp.jax_experimental")
+    jax_module = importlib.import_module("warp.jax")
+
+    expected = (
+        "Warp DeprecationWarning: The `warp.jax_experimental` namespace is deprecated "
+        "and will be removed in Warp 1.16. Use `warp.jax` instead.\n"
+    )
+    test.assertEqual(output, expected)
+    test.assertIs(module.jax_kernel, jax_module.jax_kernel)
+    test.assertIs(module.jax_callable, jax_module.jax_callable)
+    test.assertIs(module.register_ffi_callback, jax_module.register_ffi_callback)
+    test.assertIs(module.GraphMode, jax_module.GraphMode)
+
+
+def test_jax_experimental_ffi_import_deprecation(test, device):
+    _clear_jax_namespace_modules()
+    with contextlib.redirect_stdout(io.StringIO()):
+        importlib.import_module("warp.jax_experimental")
+    sys.modules.pop("warp.jax_experimental.ffi", None)
+
+    module, output = _import_deprecated_jax_namespace("warp.jax_experimental.ffi")
+    ffi_module = importlib.import_module("warp.jax.ffi")
+
+    expected = (
+        "Warp DeprecationWarning: The `warp.jax_experimental.ffi` namespace is deprecated "
+        "and will be removed in Warp 1.16. Use `warp.jax.ffi` instead.\n"
+    )
+    test.assertEqual(output, expected)
+    test.assertIs(module.jax_kernel, ffi_module.jax_kernel)
+    test.assertIs(module.jax_callable, ffi_module.jax_callable)
+    test.assertIs(module.register_ffi_callback, ffi_module.register_ffi_callback)
+    test.assertIs(module.GraphMode, ffi_module.GraphMode)
+
+
+def test_jax_experimental_custom_call_import_deprecation(test, device):
+    _clear_jax_namespace_modules()
+    with contextlib.redirect_stdout(io.StringIO()):
+        importlib.import_module("warp.jax_experimental")
+    sys.modules.pop("warp.jax_experimental.custom_call", None)
+
+    module, output = _import_deprecated_jax_namespace("warp.jax_experimental.custom_call")
+    custom_call_module = importlib.import_module("warp.jax.custom_call")
+
+    expected = (
+        "Warp DeprecationWarning: The `warp.jax_experimental.custom_call` namespace is deprecated "
+        "and will be removed in Warp 1.16. Use `warp.jax.custom_call` instead.\n"
+    )
+    test.assertEqual(output, expected)
+    test.assertIs(module.jax_kernel, custom_call_module.jax_kernel)
 
 
 def test_dtype_from_jax(test, device):
@@ -143,11 +254,11 @@ def test_jax_kernel_basic(test, device, use_ffi=False):
     import jax.numpy as jp
 
     if use_ffi:
-        from warp.jax_experimental.ffi import jax_kernel
+        from warp.jax.ffi import jax_kernel
 
         jax_triple = jax_kernel(triple_kernel)
     else:
-        from warp.jax_experimental.custom_call import jax_kernel
+        from warp.jax.custom_call import jax_kernel
 
         jax_triple = jax_kernel(triple_kernel, quiet=True)  # suppress deprecation warnings
 
@@ -174,11 +285,11 @@ def test_jax_kernel_scalar(test, device, use_ffi=False):
     import jax.numpy as jp
 
     if use_ffi:
-        from warp.jax_experimental.ffi import jax_kernel
+        from warp.jax.ffi import jax_kernel
 
         kwargs = {}
     else:
-        from warp.jax_experimental.custom_call import jax_kernel
+        from warp.jax.custom_call import jax_kernel
 
         kwargs = {"quiet": True}
 
@@ -216,11 +327,11 @@ def test_jax_kernel_vecmat(test, device, use_ffi=False):
     import jax.numpy as jp
 
     if use_ffi:
-        from warp.jax_experimental.ffi import jax_kernel
+        from warp.jax.ffi import jax_kernel
 
         kwargs = {}
     else:
-        from warp.jax_experimental.custom_call import jax_kernel
+        from warp.jax.custom_call import jax_kernel
 
         kwargs = {"quiet": True}
 
@@ -260,11 +371,11 @@ def test_jax_kernel_multiarg(test, device, use_ffi=False):
     import jax.numpy as jp
 
     if use_ffi:
-        from warp.jax_experimental.ffi import jax_kernel
+        from warp.jax.ffi import jax_kernel
 
         jax_multiarg = jax_kernel(multiarg_kernel, num_outputs=2)
     else:
-        from warp.jax_experimental.custom_call import jax_kernel
+        from warp.jax.custom_call import jax_kernel
 
         jax_multiarg = jax_kernel(multiarg_kernel, quiet=True)
 
@@ -295,11 +406,11 @@ def test_jax_kernel_launch_dims(test, device, use_ffi=False):
     import jax.numpy as jp
 
     if use_ffi:
-        from warp.jax_experimental.ffi import jax_kernel
+        from warp.jax.ffi import jax_kernel
 
         kwargs = {}
     else:
-        from warp.jax_experimental.custom_call import jax_kernel
+        from warp.jax.custom_call import jax_kernel
 
         kwargs = {"quiet": True}
 
@@ -349,60 +460,60 @@ def test_jax_kernel_launch_dims(test, device, use_ffi=False):
 
 
 @wp.kernel
-def add_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), output: wp.array(dtype=float)):
+def add_kernel(a: wp.array[float], b: wp.array[float], output: wp.array[float]):
     tid = wp.tid()
     output[tid] = a[tid] + b[tid]
 
 
 @wp.kernel
-def add2d_kernel(a: wp.array2d(dtype=float), b: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+def add2d_kernel(a: wp.array2d[float], b: wp.array2d[float], output: wp.array2d[float]):
     i, j = wp.tid()
     output[i, j] = a[i, j] + b[i, j]
 
 
 @wp.kernel
-def axpy_kernel(x: wp.array(dtype=float), y: wp.array(dtype=float), alpha: float, out: wp.array(dtype=float)):
+def axpy_kernel(x: wp.array[float], y: wp.array[float], alpha: float, out: wp.array[float]):
     tid = wp.tid()
     out[tid] = alpha * x[tid] + y[tid]
 
 
 @wp.kernel
-def sincos_kernel(angle: wp.array(dtype=float), sin_out: wp.array(dtype=float), cos_out: wp.array(dtype=float)):
+def sincos_kernel(angle: wp.array[float], sin_out: wp.array[float], cos_out: wp.array[float]):
     tid = wp.tid()
     sin_out[tid] = wp.sin(angle[tid])
     cos_out[tid] = wp.cos(angle[tid])
 
 
 @wp.kernel
-def diagonal_kernel(output: wp.array(dtype=wp.mat33)):
+def diagonal_kernel(output: wp.array[wp.mat33]):
     tid = wp.tid()
     d = float(tid + 1)
     output[tid] = wp.mat33(d, 0.0, 0.0, 0.0, d * 2.0, 0.0, 0.0, 0.0, d * 3.0)
 
 
 @wp.kernel
-def scale_kernel(a: wp.array(dtype=float), s: float, output: wp.array(dtype=float)):
+def scale_kernel(a: wp.array[float], s: float, output: wp.array[float]):
     tid = wp.tid()
     output[tid] = a[tid] * s
 
 
 @wp.kernel
-def scale_vec_kernel(a: wp.array(dtype=wp.vec2), s: float, output: wp.array(dtype=wp.vec2)):
+def scale_vec_kernel(a: wp.array[wp.vec2], s: float, output: wp.array[wp.vec2]):
     tid = wp.tid()
     output[tid] = a[tid] * s
 
 
 @wp.kernel
-def accum_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+def accum_kernel(a: wp.array[float], b: wp.array[float]):
     tid = wp.tid()
     b[tid] += a[tid]
 
 
 @wp.kernel
 def matmul_kernel(
-    a: wp.array2d(dtype=float),  # NxK
-    b: wp.array2d(dtype=float),  # KxM
-    c: wp.array2d(dtype=float),  # NxM
+    a: wp.array2d[float],  # NxK
+    b: wp.array2d[float],  # KxM
+    c: wp.array2d[float],  # NxM
 ):
     # launch dims should be (N, M)
     i, j = wp.tid()
@@ -418,9 +529,9 @@ def matmul_kernel(
 
 @wp.kernel
 def in_out_kernel(
-    a: wp.array(dtype=float),  # input only
-    b: wp.array(dtype=float),  # input and output
-    c: wp.array(dtype=float),  # output only
+    a: wp.array[float],  # input only
+    b: wp.array[float],  # input and output
+    c: wp.array[float],  # output only
 ):
     tid = wp.tid()
     b[tid] += a[tid]
@@ -428,34 +539,28 @@ def in_out_kernel(
 
 
 @wp.kernel
-def multi_out_kernel(
-    a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, c: wp.array(dtype=float), d: wp.array(dtype=float)
-):
+def multi_out_kernel(a: wp.array[float], b: wp.array[float], s: float, c: wp.array[float], d: wp.array[float]):
     tid = wp.tid()
     c[tid] = a[tid] + b[tid]
     d[tid] = s * a[tid]
 
 
 @wp.kernel
-def multi_out_kernel_v2(
-    a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, c: wp.array(dtype=float), d: wp.array(dtype=float)
-):
+def multi_out_kernel_v2(a: wp.array[float], b: wp.array[float], s: float, c: wp.array[float], d: wp.array[float]):
     tid = wp.tid()
     c[tid] = a[tid] * a[tid]
     d[tid] = a[tid] * b[tid] * s
 
 
 @wp.kernel
-def multi_out_kernel_v3(
-    a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, c: wp.array(dtype=float), d: wp.array(dtype=float)
-):
+def multi_out_kernel_v3(a: wp.array[float], b: wp.array[float], s: float, c: wp.array[float], d: wp.array[float]):
     tid = wp.tid()
     c[tid] = a[tid] ** 2.0
     d[tid] = a[tid] * b[tid] * s
 
 
 @wp.kernel
-def scale_sum_square_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, c: wp.array(dtype=float)):
+def scale_sum_square_kernel(a: wp.array[float], b: wp.array[float], s: float, c: wp.array[float]):
     tid = wp.tid()
     c[tid] = (a[tid] * s + b[tid]) ** 2.0
 
@@ -483,21 +588,21 @@ def scale_sum_square_kernel_subscript(a: wp.array[float], b: wp.array[float], s:
 # Note the argument annotations, just like Warp kernels.
 def scale_func(
     # inputs
-    a: wp.array(dtype=float),
-    b: wp.array(dtype=wp.vec2),
+    a: wp.array[float],
+    b: wp.array[wp.vec2],
     s: float,
     # outputs
-    c: wp.array(dtype=float),
-    d: wp.array(dtype=wp.vec2),
+    c: wp.array[float],
+    d: wp.array[wp.vec2],
 ):
     wp.launch(scale_kernel, dim=a.shape, inputs=[a, s], outputs=[c])
     wp.launch(scale_vec_kernel, dim=b.shape, inputs=[b, s], outputs=[d])
 
 
 def in_out_func(
-    a: wp.array(dtype=float),  # input only
-    b: wp.array(dtype=float),  # input and output
-    c: wp.array(dtype=float),  # output only
+    a: wp.array[float],  # input only
+    b: wp.array[float],  # input and output
+    c: wp.array[float],  # output only
 ):
     wp.launch(scale_kernel, dim=a.size, inputs=[a, 2.0], outputs=[c])
     wp.launch(accum_kernel, dim=a.size, inputs=[a, b])  # modifies `b`
@@ -505,9 +610,9 @@ def in_out_func(
 
 def double_func(
     # inputs
-    a: wp.array(dtype=float),
+    a: wp.array[float],
     # outputs
-    b: wp.array(dtype=float),
+    b: wp.array[float],
 ):
     wp.launch(scale_kernel, dim=a.shape, inputs=[a, 2.0], outputs=[b])
 
@@ -517,7 +622,7 @@ def test_ffi_jax_kernel_add(test, device):
     # two inputs and one output
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_add = jax_kernel(add_kernel)
 
@@ -544,7 +649,7 @@ def test_ffi_jax_kernel_sincos(test, device):
     # one input and two outputs
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_sincos = jax_kernel(sincos_kernel, num_outputs=2)
 
@@ -574,7 +679,7 @@ def test_ffi_jax_kernel_sincos(test, device):
 @unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
 def test_ffi_jax_kernel_diagonal(test, device):
     # no inputs and one output
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_diagonal = jax_kernel(diagonal_kernel)
 
@@ -607,7 +712,7 @@ def test_ffi_jax_kernel_in_out(test, device):
     # in-out args
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(in_out_kernel, num_outputs=2, in_out_argnames=["b"])
 
@@ -629,7 +734,7 @@ def test_ffi_jax_kernel_scale_vec_constant(test, device):
     # multiply vectors by scalar (constant)
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_scale_vec = jax_kernel(scale_vec_kernel)
 
@@ -657,7 +762,7 @@ def test_ffi_jax_kernel_scale_vec_static(test, device):
     # multiply vectors by scalar (static arg)
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_scale_vec = jax_kernel(scale_vec_kernel)
 
@@ -684,7 +789,7 @@ def test_ffi_jax_kernel_launch_dims_default(test, device):
     # specify default launch dims
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     N, M, K = 3, 4, 2
 
@@ -714,7 +819,7 @@ def test_ffi_jax_kernel_launch_dims_custom(test, device):
     # specify custom launch dims per call
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_matmul = jax_kernel(matmul_kernel)
 
@@ -755,7 +860,7 @@ def test_ffi_jax_callable_scale_constant(test, device):
     # scale two arrays using a constant
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     jax_func = jax_callable(scale_func, num_outputs=2)
 
@@ -790,7 +895,7 @@ def test_ffi_jax_callable_scale_static(test, device):
     # scale two arrays using a static arg
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     jax_func = jax_callable(scale_func, num_outputs=2)
 
@@ -825,7 +930,7 @@ def test_ffi_jax_callable_in_out(test, device):
     # in-out arguments
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     jax_func = jax_callable(in_out_func, num_outputs=2, in_out_argnames=["b"])
 
@@ -848,7 +953,7 @@ def test_ffi_jax_callable_graph_cache(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import (
+    from warp.jax.ffi import (
         GraphMode,
         clear_jax_callable_graph_cache,
         get_jax_callable_default_graph_cache_max,
@@ -911,8 +1016,8 @@ def test_ffi_jax_callable_graph_cache(test, device):
 
     clear_jax_callable_graph_cache()
 
-    with wp._src.jax_experimental.ffi._FFI_REGISTRY_LOCK:
-        for c in wp._src.jax_experimental.ffi._FFI_CALLABLE_REGISTRY.values():
+    with wp._src.jax.ffi._FFI_REGISTRY_LOCK:
+        for c in wp._src.jax.ffi._FFI_CALLABLE_REGISTRY.values():
             test.assertEqual(c.graph_cache_size, 0)
 
     # --- test with a custom default cache limit ---
@@ -957,7 +1062,7 @@ def test_ffi_jax_callable_pmap_mul(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     j = jax_callable(double_func, num_outputs=1)
 
@@ -984,14 +1089,14 @@ def test_ffi_jax_callable_pmap_multi_output(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     def multi_out_py(
-        a: wp.array(dtype=float),
-        b: wp.array(dtype=float),
+        a: wp.array[float],
+        b: wp.array[float],
         s: float,
-        c: wp.array(dtype=float),
-        d: wp.array(dtype=float),
+        c: wp.array[float],
+        d: wp.array[float],
     ):
         wp.launch(multi_out_kernel, dim=a.shape, inputs=[a, b, s], outputs=[c, d])
 
@@ -1025,14 +1130,14 @@ def test_ffi_jax_callable_pmap_multi_stage(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable
+    from warp.jax.ffi import jax_callable
 
     def multi_stage_py(
-        a: wp.array(dtype=float),
-        b: wp.array(dtype=float),
+        a: wp.array[float],
+        b: wp.array[float],
         alpha: float,
-        tmp: wp.array(dtype=float),
-        out: wp.array(dtype=float),
+        tmp: wp.array[float],
+        out: wp.array[float],
     ):
         wp.launch(add_kernel, dim=a.shape, inputs=[a, b], outputs=[tmp])
         wp.launch(axpy_kernel, dim=a.shape, inputs=[tmp, b, alpha], outputs=[out])
@@ -1069,7 +1174,7 @@ def test_ffi_callback(test, device):
     # in-out arguments
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import register_ffi_callback
+    from warp.jax.ffi import register_ffi_callback
 
     # the Python function to call
     def warp_func(inputs, outputs, attrs, ctx):
@@ -1130,7 +1235,7 @@ def test_ffi_jax_kernel_autodiff_simple(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(
         scale_sum_square_kernel,
@@ -1175,7 +1280,7 @@ def test_ffi_jax_kernel_autodiff_jit_of_grad_simple(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(scale_sum_square_kernel, num_outputs=1, enable_backward=True)
 
@@ -1215,7 +1320,7 @@ def test_ffi_jax_kernel_autodiff_multi_output(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(multi_out_kernel_v3, num_outputs=2, enable_backward=True)
 
@@ -1260,7 +1365,7 @@ def test_ffi_jax_kernel_autodiff_jit_of_grad_multi_output(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(multi_out_kernel_v3, num_outputs=2, enable_backward=True)
 
@@ -1295,7 +1400,7 @@ def test_ffi_jax_kernel_autodiff_2d(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(inc_2d_kernel, num_outputs=1, enable_backward=True)
 
@@ -1321,7 +1426,7 @@ def test_ffi_jax_kernel_autodiff_vec2(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(scale_vec_kernel, num_outputs=1, enable_backward=True)
 
@@ -1351,10 +1456,10 @@ def test_ffi_jax_kernel_autodiff_mat22(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     @wp.kernel
-    def scale_mat_kernel(a: wp.array(dtype=wp.mat22), s: float, out: wp.array(dtype=wp.mat22)):
+    def scale_mat_kernel(a: wp.array[wp.mat22], s: float, out: wp.array[wp.mat22]):
         tid = wp.tid()
         out[tid] = a[tid] * s
 
@@ -1388,7 +1493,7 @@ def test_ffi_jax_kernel_autodiff_static_required(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     # Require explicit static_argnames for scalar s
     jax_func = jax_kernel(scale_sum_square_kernel, num_outputs=1, enable_backward=True)
@@ -1421,7 +1526,7 @@ def test_ffi_jax_kernel_autodiff_pmap_triple(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_mul = jax_kernel(triple_kernel, num_outputs=1, enable_backward=True)
 
@@ -1448,7 +1553,7 @@ def test_ffi_jax_kernel_autodiff_pmap_multi_output(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_mo = jax_kernel(multi_out_kernel_v2, num_outputs=2, enable_backward=True)
 
@@ -1474,24 +1579,284 @@ def test_ffi_jax_kernel_autodiff_pmap_multi_output(test, device):
     assert_np_equal(np.asarray(db), ref_db)
 
 
+# --- launch_dims + enable_backward=True tests (GH-1380) --------------------
+
+
+@wp.kernel
+def scale_extra_axis_kernel(
+    a: wp.array4d[wp.float32],
+    b: wp.array4d[wp.float32],
+):
+    """3-D tid but 4-D array; outer axis iterated inside the kernel body."""
+    i, j, k = wp.tid()
+    for m in range(a.shape[0]):
+        b[m, i, j, k] = a[m, i, j, k] * 2.0
+
+
+@wp.kernel
+def scale_outer_2d_kernel(
+    a: wp.array3d[wp.float32],
+    b: wp.array3d[wp.float32],
+):
+    """2-D tid with an outer axis iterated inside; used for the vmap test."""
+    i, j = wp.tid()
+    for m in range(a.shape[0]):
+        b[m, i, j] = a[m, i, j] * 2.0
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_launch_dims_autodiff_basic(test, device):
+    """launch_dims is accepted with enable_backward=True (GH-1380)."""
+    import jax
+    import jax.numpy as jnp
+
+    from warp.jax.ffi import jax_kernel
+
+    N = 8
+    with jax.default_device(wp.device_to_jax(device)):
+        jax_func = jax_kernel(
+            scale_extra_axis_kernel,
+            num_outputs=1,
+            launch_dims=(N, N, N),
+            enable_backward=True,
+        )
+
+        a = jnp.ones((4, N, N, N), dtype=jnp.float32)
+        out = jax_func(a)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+
+        expected = 2.0 * np.ones((4, N, N, N), dtype=np.float32)
+        assert_np_equal(np.asarray(out), expected)
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_launch_dims_autodiff_gradient(test, device):
+    """Gradient matches the analytical value when launch_dims is explicit (GH-1380).
+
+    Without this fix, auto-inference returns the full 4-D shape and the
+    adjoint kernel over-accumulates by a factor equal to the outer axis
+    size via atomic_add. Explicit launch_dims, shared between forward and
+    adjoint via the enclosing closure, prevents this.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from warp.jax.ffi import jax_kernel
+
+    BATCH, N = 4, 8
+    with jax.default_device(wp.device_to_jax(device)):
+        jax_func = jax_kernel(
+            scale_extra_axis_kernel,
+            num_outputs=1,
+            launch_dims=(N, N, N),
+            enable_backward=True,
+        )
+
+        a = jnp.ones((BATCH, N, N, N), dtype=jnp.float32)
+
+        def loss(x):
+            """Sum of the kernel's output; analytical gradient is 2.0 everywhere."""
+            y = jax_func(x)
+            if isinstance(y, (list, tuple)):
+                y = y[0]
+            return jnp.sum(y)
+
+        grad = jax.grad(loss)(a)
+
+        expected = 2.0 * np.ones((BATCH, N, N, N), dtype=np.float32)
+        assert_np_equal(np.asarray(grad), expected)
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_launch_dims_autodiff_separate_cache(test, device):
+    """Wrapping the same kernel with different launch_dims must not share
+    wrappers (GH-1380).
+
+    Regression guard for the _FFI_DIFF_KERNEL_REGISTRY cache key: without
+    launch_dims in the key, the second wrapper silently reuses the first
+    wrapper's closure, so the launch_dims passed to the second call is
+    ignored at runtime.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from warp.jax.ffi import jax_kernel
+
+    with jax.default_device(wp.device_to_jax(device)):
+        ffi_small = jax_kernel(
+            scale_extra_axis_kernel,
+            num_outputs=1,
+            launch_dims=(4, 4, 4),
+            enable_backward=True,
+        )
+        ffi_large = jax_kernel(
+            scale_extra_axis_kernel,
+            num_outputs=1,
+            launch_dims=(8, 8, 8),
+            enable_backward=True,
+        )
+
+        a_small = jnp.ones((2, 4, 4, 4), dtype=jnp.float32)
+        a_large = jnp.ones((2, 8, 8, 8), dtype=jnp.float32)
+
+        out_small = ffi_small(a_small)
+        out_large = ffi_large(a_large)
+        if isinstance(out_small, (list, tuple)):
+            out_small = out_small[0]
+        if isinstance(out_large, (list, tuple)):
+            out_large = out_large[0]
+
+        test.assertEqual(out_small.shape, (2, 4, 4, 4))
+        test.assertEqual(out_large.shape, (2, 8, 8, 8))
+        assert_np_equal(
+            np.asarray(out_small),
+            2.0 * np.ones((2, 4, 4, 4), dtype=np.float32),
+        )
+        assert_np_equal(
+            np.asarray(out_large),
+            2.0 * np.ones((2, 8, 8, 8), dtype=np.float32),
+        )
+
+        # Also exercise the adjoint path: if the cache key were missing
+        # launch_dims, the second wrapper would silently reuse the first
+        # wrapper's closure and the gradient would be computed with the
+        # wrong launch dimensions (atomic_add over-accumulation).
+        def loss_small(x):
+            """Sum; analytical gradient is 2.0 everywhere."""
+            y = ffi_small(x)
+            if isinstance(y, (list, tuple)):
+                y = y[0]
+            return jnp.sum(y)
+
+        grad_small = jax.grad(loss_small)(a_small)
+        assert_np_equal(
+            np.asarray(grad_small),
+            2.0 * np.ones((2, 4, 4, 4), dtype=np.float32),
+        )
+
+        def loss_large(x):
+            """Sum; analytical gradient is 2.0 everywhere."""
+            y = ffi_large(x)
+            if isinstance(y, (list, tuple)):
+                y = y[0]
+            return jnp.sum(y)
+
+        grad_large = jax.grad(loss_large)(a_large)
+        assert_np_equal(
+            np.asarray(grad_large),
+            2.0 * np.ones((2, 8, 8, 8), dtype=np.float32),
+        )
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_autodiff_per_call_override_rejected(test, device):
+    """Passing FfiKernel-style per-call kwargs to a differentiable wrapper raises TypeError."""
+    import jax.numpy as jnp
+
+    from warp.jax.ffi import jax_kernel
+
+    @wp.kernel
+    def noop(a: wp.array1d[wp.float32], b: wp.array1d[wp.float32]):
+        i = wp.tid()
+        b[i] = a[i]
+
+    N = 8
+    jax_func = jax_kernel(noop, num_outputs=1, launch_dims=(N,), enable_backward=True)
+    a = jnp.ones((N,), dtype=jnp.float32)
+
+    with test.assertRaisesRegex(TypeError, "launch_dims cannot be overridden per-call"):
+        jax_func(a, launch_dims=(N,))
+
+    with test.assertRaisesRegex(TypeError, "output_dims is not supported"):
+        jax_func(a, output_dims={"b": (N,)})
+
+    with test.assertRaisesRegex(TypeError, "vmap_method cannot be overridden per-call"):
+        jax_func(a, vmap_method="sequential")
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_output_dims_autodiff_still_blocked(test, device):
+    """output_dims with enable_backward=True remains a follow-up (still blocked)."""
+    from warp.jax.ffi import jax_kernel
+
+    @wp.kernel
+    def noop(a: wp.array1d[wp.float32], b: wp.array1d[wp.float32]):
+        """Identity copy; used only to trigger the output_dims guard path."""
+        i = wp.tid()
+        b[i] = a[i]
+
+    with test.assertRaises(NotImplementedError):
+        jax_kernel(
+            noop,
+            num_outputs=1,
+            output_dims={"b": (8,)},
+            enable_backward=True,
+        )
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_launch_dims_autodiff_vmap(test, device):
+    """launch_dims + enable_backward=True composes with jax.vmap (GH-1380).
+
+    The user-supplied launch_dims fixes the inner (kernel tid) iteration
+    space, and jax.vmap prefixes an additional outer axis which the FFI
+    layer handles via collapse_batch_dims/compute_batch_size. The two
+    operate on disjoint axes, so forward values and gradients remain
+    correct under vmap.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from warp.jax.ffi import jax_kernel
+
+    OUTER, INNER, N = 3, 4, 8
+    with jax.default_device(wp.device_to_jax(device)):
+        jax_func = jax_kernel(
+            scale_outer_2d_kernel,
+            num_outputs=1,
+            launch_dims=(N, N),
+            enable_backward=True,
+        )
+        batched = jax.vmap(jax_func)
+
+        a = jnp.ones((OUTER, INNER, N, N), dtype=jnp.float32)
+        out = batched(a)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+
+        expected = 2.0 * np.ones((OUTER, INNER, N, N), dtype=np.float32)
+        assert_np_equal(np.asarray(out), expected)
+
+        def loss(x):
+            """Sum over all axes; analytical gradient is 2.0 everywhere."""
+            y = batched(x)
+            if isinstance(y, (list, tuple)):
+                y = y[0]
+            return jnp.sum(y)
+
+        grad = jax.grad(loss)(a)
+        assert_np_equal(np.asarray(grad), expected)
+
+
 @unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
 def test_ffi_vmap_add(test, device, vmap_method):
     """Test basic batching over different input and output axes."""
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+    from warp.jax.ffi import jax_callable, jax_kernel
 
     # jax reference implementation
     def jax_add(a, b):
         return a + b
 
     # warp callable 1d
-    def warp_add1d(a: wp.array(dtype=float), b: wp.array(dtype=float), output: wp.array(dtype=float)):
+    def warp_add1d(a: wp.array[float], b: wp.array[float], output: wp.array[float]):
         wp.launch(add_kernel, dim=a.shape, inputs=[a, b, output])
 
     # warp callable 2d
-    def warp_add2d(a: wp.array2d(dtype=float), b: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+    def warp_add2d(a: wp.array2d[float], b: wp.array2d[float], output: wp.array2d[float]):
         wp.launch(add2d_kernel, dim=a.shape, inputs=[a, b, output])
 
     jk_add1d = jax_kernel(add_kernel, vmap_method=vmap_method)
@@ -1536,7 +1901,7 @@ def test_ffi_vmap_add(test, device, vmap_method):
 
 
 @wp.kernel
-def rowsum_kernel(matrix: wp.array2d(dtype=float), sums: wp.array1d(dtype=float)):
+def rowsum_kernel(matrix: wp.array2d[float], sums: wp.array1d[float]):
     i, j = wp.tid()
     wp.atomic_add(sums, i, matrix[i, j])
 
@@ -1547,14 +1912,14 @@ def test_ffi_vmap_rowsum(test, device, vmap_method):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+    from warp.jax.ffi import jax_callable, jax_kernel
 
     # jax reference implementation
     def jax_rowsum(matrix):
         return jp.sum(matrix, axis=1)
 
     # warp callable
-    def warp_rowsum(matrix: wp.array2d(dtype=float), sums: wp.array1d(dtype=float)):
+    def warp_rowsum(matrix: wp.array2d[float], sums: wp.array1d[float]):
         wp.launch(rowsum_kernel, dim=matrix.shape, inputs=[matrix, sums])
 
     jk_rowsum = jax_kernel(rowsum_kernel, in_out_argnames=["sums"], vmap_method=vmap_method)
@@ -1613,7 +1978,7 @@ def test_ffi_vmap_rowsum(test, device, vmap_method):
 
 
 @wp.kernel
-def lookup_kernel(table: wp.array(dtype=float), indices: wp.array(dtype=int), output: wp.array(dtype=float)):
+def lookup_kernel(table: wp.array[float], indices: wp.array[int], output: wp.array[float]):
     i = wp.tid()
     output[i] = table[indices[i]]
 
@@ -1629,13 +1994,13 @@ def test_ffi_vmap_lookup(test, device, vmap_method):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+    from warp.jax.ffi import jax_callable, jax_kernel
 
     # jax reference implementation
     def jax_lookup(a, indices):
         return a[indices]
 
-    def warp_lookup(table: wp.array(dtype=float), indices: wp.array(dtype=int), output: wp.array(dtype=float)):
+    def warp_lookup(table: wp.array[float], indices: wp.array[int], output: wp.array[float]):
         wp.launch(lookup_kernel, dim=indices.shape, inputs=[table, indices, output])
 
     jk_lookup = jax_kernel(lookup_kernel, vmap_method=vmap_method)
@@ -1694,7 +2059,7 @@ def test_ffi_jax_kernel_subscript_scalar(test, device):
     """Test jax_kernel with wp.array[float] subscript syntax for scalar dtypes."""
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_add = jax_kernel(add_kernel_subscript)
 
@@ -1721,7 +2086,7 @@ def test_ffi_jax_kernel_subscript_vec(test, device):
     """Test jax_kernel with wp.array[wp.vec2] subscript syntax for vector dtypes."""
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_scale_vec = jax_kernel(scale_vec_kernel_subscript)
 
@@ -1750,7 +2115,7 @@ def test_ffi_jax_kernel_subscript_autodiff(test, device):
     import jax
     import jax.numpy as jp
 
-    from warp.jax_experimental.ffi import jax_kernel
+    from warp.jax.ffi import jax_kernel
 
     jax_func = jax_kernel(
         scale_sum_square_kernel_subscript,
@@ -1833,6 +2198,25 @@ try:
         except Exception as e:
             print(f"Skipping Jax DLPack tests on device '{d}' due to exception: {e}")
 
+    add_function_test(TestJax, "test_jax_namespace_imports", test_jax_namespace_imports, devices=None)
+    add_function_test(
+        TestJax,
+        "test_jax_experimental_import_deprecation",
+        test_jax_experimental_import_deprecation,
+        devices=None,
+    )
+    add_function_test(
+        TestJax,
+        "test_jax_experimental_ffi_import_deprecation",
+        test_jax_experimental_ffi_import_deprecation,
+        devices=None,
+    )
+    add_function_test(
+        TestJax,
+        "test_jax_experimental_custom_call_import_deprecation",
+        test_jax_experimental_custom_call_import_deprecation,
+        devices=None,
+    )
     add_function_test(TestJax, "test_dtype_from_jax", test_dtype_from_jax, devices=None)
     add_function_test(TestJax, "test_dtype_to_jax", test_dtype_to_jax, devices=None)
 
@@ -2058,6 +2442,44 @@ try:
             "test_ffi_jax_kernel_autodiff_pmap_multi_output",
             test_ffi_jax_kernel_autodiff_pmap_multi_output,
             devices=None,
+        )
+
+        # launch_dims + enable_backward=True tests (GH-1380)
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_launch_dims_autodiff_basic",
+            test_ffi_jax_kernel_launch_dims_autodiff_basic,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_launch_dims_autodiff_gradient",
+            test_ffi_jax_kernel_launch_dims_autodiff_gradient,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_launch_dims_autodiff_separate_cache",
+            test_ffi_jax_kernel_launch_dims_autodiff_separate_cache,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_autodiff_per_call_override_rejected",
+            test_ffi_jax_kernel_autodiff_per_call_override_rejected,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_output_dims_autodiff_still_blocked",
+            test_ffi_jax_kernel_output_dims_autodiff_still_blocked,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_launch_dims_autodiff_vmap",
+            test_ffi_jax_kernel_launch_dims_autodiff_vmap,
+            devices=jax_compatible_cuda_devices,
         )
 
         # vmap tests
