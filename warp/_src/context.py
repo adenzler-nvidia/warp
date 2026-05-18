@@ -9675,7 +9675,7 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
 
     module_exec = module.load(device, block_dim)
     if graph is not None:
-        graph.retain_module_exec(module_exec)
+        graph._retain_module_exec(module_exec)
     hooks = module_exec.get_kernel_hooks(spec_kernel)
     if hooks.forward is None:
         raise RuntimeError(f"Failed to find specialized kernel '{kernel.key}'")
