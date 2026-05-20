@@ -9983,14 +9983,19 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
     ``graph`` is provided, the module exec is retained by the graph so
     the captured launch survives the surrounding scope.
     """
-    from warp._src.types import launch_bounds_t  # noqa: PLC0415
-
     if kernel.is_generic:
         raise RuntimeError("Graph specialization does not support generic kernels")
     if len(inputs) != len(kernel.adj.args):
         raise RuntimeError(f"Graph specialize expected {len(kernel.adj.args)} inputs, got {len(inputs)}")
 
-    bounds = launch_bounds_t(dim)
+    # ``_build_launch_bounds`` pads/truncates the user's ``dim`` to
+    # the kernel's intrinsic ndim (``adj.kernel_dim``) and folds extra
+    # trailing dims into ``coord_mult`` — same canonicalization the
+    # non-spec launch path uses.  Without this, a kernel that takes a
+    # 2D tid launched with a 1D ``dim`` produces a bounds whose
+    # ``shape`` length doesn't match ``launch_bounds_t<N>`` and the
+    # generated kernel reads out-of-bounds shape values.
+    bounds = _build_launch_bounds(dim, kernel.adj.kernel_dim)
     if bounds.size == 0:
         return
 
