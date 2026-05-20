@@ -301,6 +301,11 @@ class StructInstance:
         return tuple(npvalue)
 
 
+def _is_tid_call(node) -> bool:
+    """Return True if ``node`` is an AST call to ``wp.tid()``."""
+    return isinstance(node, ast.Call) and hasattr(node.func, "attr") and node.func.attr == "tid"
+
+
 def _is_texture_type(var_type: type) -> bool:
     """Check if var_type is a Texture subclass (Texture2D, Texture3D, etc.)."""
     from warp._src.texture import Texture  # noqa: PLC0415
@@ -1238,6 +1243,22 @@ class Adjoint:
         # for unit testing errors being spit out from kernels.
         adj.skip_build = False
 
+        # Infer kernel_dim before hashing because it selects the
+        # ``launch_bounds_t<N>`` type in generated C++.
+        adj.kernel_dim = adj._infer_kernel_dim()
+
+    def _infer_kernel_dim(adj) -> int:
+        max_dim = 0
+        for node in ast.walk(adj.tree):
+            if isinstance(node, ast.Assign) and _is_tid_call(node.value):
+                target = node.targets[0]
+                if isinstance(target, ast.Tuple):
+                    max_dim = max(max_dim, len(target.elts))
+                else:
+                    max_dim = max(max_dim, 1)
+
+        return max_dim if max_dim > 0 else 1
+
     # allocate extra space for a function call that requires its
     # own shared memory space, we treat shared memory as a stack
     # where each function pushes and pops space off, the extra
@@ -1959,8 +1980,13 @@ class Adjoint:
         # Skip reverse call generation for functions that use warp.grad() - they don't have
         # meaningful adjoints (the gradient of a gradient call is not supported).
         skip_reverse = not func.is_builtin() and func.adj.uses_grad_call
+        # Higher-order built-ins pass callable args to native adjoint helpers.
+        # Only generate the reverse call when those callables have adjoints.
+        has_nondifferentiable_callable_arg = any(
+            isinstance(arg, warp._src.context.Function) and not arg.is_differentiable for arg in func_args
+        )
 
-        if func.is_differentiable and func_args and not skip_reverse:
+        if func.is_differentiable and func_args and not skip_reverse and not has_nondifferentiable_callable_arg:
             adj_args = tuple(strip_reference(x) for x in func_args)
             reverse_has_output_args = (
                 func.require_original_output_arg or len(output_list) > 1
@@ -4454,6 +4480,12 @@ class Adjoint:
                 if only_body:
                     # extract the body of the lambda function
                     lambda_source = Adjoint.extract_node_source_from_lines(source_lines, node.body)
+                    if lambda_source is not None and "\n" in lambda_source:
+                        try:
+                            # Probe parseability; missing outer parentheses are the only fixable case.
+                            ast.parse(lambda_source, mode="eval")
+                        except SyntaxError:
+                            lambda_source = f"({lambda_source})"
                 else:
                     # extract the entire lambda function
                     lambda_source = Adjoint.extract_node_source_from_lines(source_lines, node)
@@ -4936,7 +4968,7 @@ extern "C" {{
 
 // Python CPU entry points
 WP_API void {name}_cpu_forward(
-    wp::launch_bounds_t *dim,
+    wp::launch_bounds_t<{launch_ndim}> *dim,
     wp_args_{name} *_wp_args)
 {{
     wp::tile_shared_storage_t tile_mem;
@@ -4959,7 +4991,7 @@ cpu_module_template_backward = """
 extern "C" {{
 
 WP_API void {name}_cpu_backward(
-    wp::launch_bounds_t *dim,
+    wp::launch_bounds_t<{launch_ndim}> *dim,
     wp_args_{name} *_wp_args,
     wp_args_{name} *_wp_adj_args)
 {{
@@ -5078,20 +5110,27 @@ def format_baked_nttps(label, value, warp_type=None):
     character-for-character.  Routing both through this helper
     eliminates that class of bug.
 
-    Returns 6 entries for ``launch_bounds_t`` (shape_0..3, ndim, size),
-    9 for ``array_t`` (shape_0..3, stride_0..3, ndim), 1 for a scalar.
-    ``warp_type`` is required only for scalars (drives the C++ NTTP
-    type).
+    Returns ``N + 2`` entries for ``launch_bounds_t<N>`` (``shape_0`` ..
+    ``shape_{N-1}``, ``size``, ``coord_mult``), 9 for ``array_t``
+    (shape_0..3, stride_0..3, ndim), 1 for a scalar.  ``warp_type`` is
+    required only for scalars (drives the C++ NTTP type).
     """
-    from warp._src.types import launch_bounds_t  # noqa: PLC0415
+    from warp._src.types import _launch_bounds_classes  # noqa: PLC0415
 
-    if isinstance(value, launch_bounds_t):
-        decls = [f"int {label}_shape_{k}" for k in range(4)]
-        decls.append(f"int {label}_ndim")
+    if isinstance(value, tuple(_launch_bounds_classes.values())):
+        # Per-ndim ctypes class (``launch_bounds_1d_t`` ..
+        # ``launch_bounds_4d_t``); ``len(value.shape)`` is the
+        # kernel's ``ndim``.  Emit one ``int <label>_shape_K`` NTTP
+        # per axis, plus ``size`` and ``coord_mult``.  No ``ndim``
+        # NTTP — ndim is encoded in the templated ``launch_bounds_t<N>``
+        # type itself.
+        ndim = len(value.shape)
+        decls = [f"int {label}_shape_{k}" for k in range(ndim)]
         decls.append(f"size_t {label}_size")
-        lits = [str(int(value.shape[k])) for k in range(4)]
-        lits.append(str(int(value.ndim)))
+        decls.append(f"size_t {label}_coord_mult")
+        lits = [str(int(value.shape[k])) for k in range(ndim)]
         lits.append(str(int(value.size)))
+        lits.append(str(int(value.coord_mult)))
         return decls, lits
     if isinstance(value, array_t):
         ndim = int(value.ndim)
@@ -5686,6 +5725,7 @@ def codegen_kernel(kernel, device, options):
     template = ""
     template_fmt_args = {
         "name": kernel.get_mangled_name(),
+        "launch_ndim": kernel.adj.kernel_dim,
     }
 
     # Generate launch_bounds string for CUDA kernels
@@ -5724,19 +5764,21 @@ def codegen_kernel(kernel, device, options):
         # requested kernel via ``nvrtcAddNameExpression`` and we look
         # up the lowered (mangled) name from the ``.symbols`` file
         # post-compile.
+        #
+        # ``launch_bounds_t`` was templated on N in upstream (GH-1270);
+        # the spec branch reconstructs it inline from per-dim NTTPs
+        # (``dim_shape_0`` .. ``dim_shape_{N-1}``, ``dim_size``,
+        # ``dim_coord_mult``).
         bounds = baked_args["dim"]
+        ndim = adj.kernel_dim
         dim_decls, dim_lits = format_baked_nttps("dim", bounds)
         kernel_template_params.extend(dim_decls)
         kernel_template_values.extend(dim_lits)
-        baked_decls_outer = (
-            "    wp::launch_bounds_t dim;\n"
-            "    dim.shape[0] = dim_shape_0;\n"
-            "    dim.shape[1] = dim_shape_1;\n"
-            "    dim.shape[2] = dim_shape_2;\n"
-            "    dim.shape[3] = dim_shape_3;\n"
-            "    dim.ndim = dim_ndim;\n"
-            "    dim.size = dim_size;\n"
-        )
+        baked_decls_outer = f"    wp::launch_bounds_t<{ndim}> dim;\n"
+        for k in range(ndim):
+            baked_decls_outer += f"        dim.shape[{k}] = dim_shape_{k};\n"
+        baked_decls_outer += "        dim.size = dim_size;\n"
+        baked_decls_outer += "        dim.coord_mult = dim_coord_mult;\n"
 
         forward_args = []
         for arg in adj.args:
@@ -5770,7 +5812,8 @@ def codegen_kernel(kernel, device, options):
                 # passes through as a normal kernel param.
                 forward_args.append(arg.ctype() + " var_" + arg.label)
     else:
-        forward_args = ["wp::launch_bounds_t dim"]
+        # Non-spec path uses the upstream templated launch_bounds_t<N>.
+        forward_args = [f"wp::launch_bounds_t<{adj.kernel_dim}> dim"]
         if device == "cpu":
             forward_args.append("size_t task_index")
         else:
@@ -5795,7 +5838,7 @@ def codegen_kernel(kernel, device, options):
 
     if options["enable_backward"]:
         # build reverse signature
-        reverse_args = ["wp::launch_bounds_t dim"]
+        reverse_args = [f"wp::launch_bounds_t<{adj.kernel_dim}> dim"]
         if device == "cpu":
             reverse_args.append("size_t task_index")
         else:
@@ -5842,6 +5885,7 @@ def codegen_module(kernel, device, options):
     template = ""
     template_fmt_args = {
         "name": kernel.get_mangled_name(),
+        "launch_ndim": kernel.adj.kernel_dim,
     }
 
     template += cpu_module_template_forward

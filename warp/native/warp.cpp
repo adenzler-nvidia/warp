@@ -5,6 +5,7 @@
 
 #include "alloc_tracker.h"
 #include "apic.h"
+#include "apic_internal.h"
 #include "array.h"
 #include "error.h"
 #include "exports.h"
@@ -256,21 +257,24 @@ void wp_cpu_launch_kernel(void* func, void* bounds, void* args, void* adj_args, 
         return;
     }
     if (recording_state && apic_info) {
-        // Extract shape/ndim/size from the launch_bounds_t struct (see builtin.h)
-        // for the byte stream record.
+        // Extract shape from launch_bounds_t<N>. kernel_dim gives the exact
+        // dimensionality expected by the generated kernel.
         int shape[APIC_LAUNCH_MAX_DIMS] = {};
-        int ndim = 0;
+        int ndim = apic_info->kernel_dim;
+        if (ndim < 1)
+            ndim = 1;
+        if (ndim > APIC_LAUNCH_MAX_DIMS)
+            ndim = APIC_LAUNCH_MAX_DIMS;
+
         uint64_t launch_size = 0;
-        if (bounds) {
-            const auto* lb = static_cast<const wp::launch_bounds_t*>(bounds);
-            ndim = lb->ndim;
-            if (ndim < 1)
-                ndim = 1;
-            if (ndim > APIC_LAUNCH_MAX_DIMS)
-                ndim = APIC_LAUNCH_MAX_DIMS;
+        if (bounds && ndim > 0) {
+            const int* bounds_shape = static_cast<const int*>(bounds);
             for (int d = 0; d < ndim; d++)
-                shape[d] = lb->shape[d];
-            launch_size = lb->size;
+                shape[d] = bounds_shape[d];
+
+            const size_t size_offset = apic_detail::launch_bounds_size_offset(ndim);
+            const uint8_t* bounds_bytes = static_cast<const uint8_t*>(bounds);
+            launch_size = *reinterpret_cast<const size_t*>(bounds_bytes + size_offset);
         }
 
         apic_record_kernel_launch(
@@ -962,7 +966,7 @@ void wp_free_device(void* context, void* ptr) { }
 
 void wp_free_device_default(void* context, void* ptr) { }
 
-void wp_free_device_async(void* context, void* ptr) { }
+void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret) { }
 
 bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream) { return false; }
 
@@ -1007,6 +1011,9 @@ WP_API int wp_cuda_device_get_pci_domain_id(int ordinal) { return -1; }
 WP_API int wp_cuda_device_get_pci_bus_id(int ordinal) { return -1; }
 WP_API int wp_cuda_device_get_pci_device_id(int ordinal) { return -1; }
 WP_API int wp_cuda_device_is_uva(int ordinal) { return 0; }
+WP_API int wp_cuda_device_get_pageable_memory_access(int ordinal) { return 0; }
+WP_API int wp_cuda_device_get_direct_managed_mem_access_from_host(int ordinal) { return 0; }
+WP_API int wp_cuda_device_get_host_native_atomic_supported(int ordinal) { return 0; }
 WP_API int wp_cuda_device_is_mempool_supported(int ordinal) { return 0; }
 WP_API int wp_cuda_device_is_ipc_supported(int ordinal) { return 0; }
 WP_API int wp_cuda_device_set_mempool_release_threshold(int ordinal, uint64_t threshold) { return 0; }
@@ -1112,6 +1119,12 @@ WP_API bool wp_cuda_graph_update_memcpy_batch(
 {
     return false;
 }
+
+WP_API void* wp_cuda_graph_insert_alloc_node(void* context, size_t size) { return NULL; }
+WP_API void* wp_cuda_graph_insert_free_node(void* context, void* alloc_node) { return NULL; }
+WP_API void* wp_cuda_graph_insert_empty_node(void* context) { return NULL; }
+WP_API int wp_cuda_graph_node_depends_on(void* argument, void* referent) { return -1; }
+WP_API int wp_cuda_graph_alloc_query(void* alloc, void* arg) { return -1; }
 
 WP_API size_t wp_cuda_compile_program(
     const char* cuda_src,

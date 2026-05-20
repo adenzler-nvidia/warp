@@ -97,12 +97,14 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.cuda.test_pinned import TestPinned
     from warp.tests.cuda.test_streams import TestStreams
     from warp.tests.cuda.test_texture import TestTexture
+    from warp.tests.cuda.test_unified_memory import TestUnifiedMemory
     from warp.tests.fem.test_fem_examples import TestFemDiffusionExamples, TestFemExamples
     from warp.tests.fem.test_fem_field import TestFemField
     from warp.tests.fem.test_fem_fp64 import TestFemFp64
     from warp.tests.fem.test_fem_geometry import TestFemGeometry
     from warp.tests.fem.test_fem_integrate import TestFemIntegrate
     from warp.tests.fem.test_fem_linalg import TestFemLinalg
+    from warp.tests.fem.test_fem_multi_env import TestFemMultiEnv
     from warp.tests.fem.test_fem_quadrature import TestFemQuadrature
     from warp.tests.fem.test_fem_shape import TestFemShape
     from warp.tests.geometry.test_bvh import TestBvh
@@ -208,6 +210,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_struct import TestStruct
     from warp.tests.test_subscript_types import TestSubscriptTypes
     from warp.tests.test_tape import TestTape
+    from warp.tests.test_template_launch_bounds import TestTemplateLaunchBounds
     from warp.tests.test_transient_module import TestTransientModule
     from warp.tests.test_triangle_closest_point import TestTriangleClosestPoint
     from warp.tests.test_types import TestTypes
@@ -295,6 +298,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestFemGeometry,
         TestFemIntegrate,
         TestFemLinalg,
+        TestFemMultiEnv,
         TestFemQuadrature,
         TestFemShape,
         TestFp16,
@@ -363,6 +367,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestStruct,
         TestSubscriptTypes,
         TestTape,
+        TestTemplateLaunchBounds,
         TestTexture,
         TestTile,
         TestTileAtomicBitwise,
@@ -389,6 +394,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTriangleClosestPoint,
         TestTypes,
         TestUniqueModule,
+        TestUnifiedMemory,
         TestUtils,
         TestVec,
         TestVecConstructors,

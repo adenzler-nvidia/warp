@@ -5,6 +5,7 @@
 
 #include "alloc_tracker.h"
 #include "apic.h"
+#include "apic_internal.h"
 #include "cuda_util.h"
 #include "error.h"
 #include "scan.h"
@@ -147,6 +148,9 @@ struct DeviceInfo {
     char name[kNameLen] = "";
     int arch = 0;
     int is_uva = 0;
+    int pageable_memory_access = 0;
+    int direct_managed_mem_access_from_host = 0;
+    int host_native_atomic_supported = 0;
     int is_mempool_supported = 0;
     int sm_count = 0;
     int is_ipc_supported = -1;
@@ -192,14 +196,15 @@ struct GraphDestroyCallbackInfo {
     std::vector<FreeInfo> tmp_allocs;  // temporary allocations owned by the graph (e.g., staged array fill values)
 };
 
-// Information for graph allocations that are not freed by the graph.
-// These allocations have a shared ownership:
+// Information for a graph allocation.
+// If the allocation is not freed in the graph, it has a shared ownership:
 // - The graph instance allocates/maps the memory on each launch, even if the user reference is released.
 // - The user reference must remain valid even if the graph is destroyed.
 // The memory will be freed once the user reference is released and the graph is destroyed.
 struct GraphAllocInfo {
     uint64_t capture_id = 0;
     void* context = NULL;
+    cudaGraphNode_t node = NULL;  // corresponding mem alloc node in the graph
     bool ref_exists = false;  // whether user reference still exists
     bool graph_destroyed = false;  // whether graph instance was destroyed
 };
@@ -286,6 +291,16 @@ int cuda_init()
                     cuDeviceGetAttribute_f(&g_devices[i].pci_device_id, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, device)
                 );
                 check_cu(cuDeviceGetAttribute_f(&g_devices[i].is_uva, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+                check_cu(cuDeviceGetAttribute_f(
+                    &g_devices[i].pageable_memory_access, CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, device
+                ));
+                check_cu(cuDeviceGetAttribute_f(
+                    &g_devices[i].direct_managed_mem_access_from_host,
+                    CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST, device
+                ));
+                check_cu(cuDeviceGetAttribute_f(
+                    &g_devices[i].host_native_atomic_supported, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device
+                ));
                 check_cu(cuDeviceGetAttribute_f(
                     &g_devices[i].is_mempool_supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device
                 ));
@@ -685,6 +700,18 @@ static inline const char* get_cuda_kernel_name(void* kernel)
         return "unknown_kernel";
 }
 
+template <typename HaystackIter, typename NeedleIter>
+static bool
+contains_any(HaystackIter haystack_begin, HaystackIter haystack_end, NeedleIter needle_begin, NeedleIter needle_end)
+{
+    for (auto it = needle_begin; it != needle_end; ++it) {
+        if (std::find(haystack_begin, haystack_end, *it) != haystack_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 void* wp_alloc_pinned(size_t s, const char* tag)
 {
@@ -779,6 +806,32 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
                 alloc_info.context = context ? context : get_current_context();
                 alloc_info.ref_exists = true;  // user reference created and returned here
                 alloc_info.graph_destroyed = false;  // graph not destroyed yet
+
+                // find the MemAllocNode that was just added
+                std::vector<cudaGraphNode_t> deps;
+                if (get_capture_dependencies(stream, deps)) {
+                    for (cudaGraphNode_t node : deps) {
+                        CUgraphNodeType node_type;
+                        if (check_cu(cuGraphNodeGetType_f(node, &node_type))) {
+                            if (node_type == CU_GRAPH_NODE_TYPE_MEM_ALLOC) {
+                                cudaMemAllocNodeParams params;
+                                if (check_cuda(cudaGraphMemAllocNodeGetParams(node, &params))) {
+                                    if (params.dptr == ptr) {
+                                        alloc_info.node = node;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Warn if the node is not found. This is unlikely and it's not a critical error,
+                // but we must also handle this situation in wp_free_device_async().
+                if (!alloc_info.node) {
+                    fprintf(stderr, "Warp warning: %s: failed to find memory allocation node\n", __FUNCTION__);
+                }
+
                 g_graph_allocs[ptr] = alloc_info;
             }
         }
@@ -786,10 +839,11 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
 
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_alloc(ptr, s, ALLOC_KIND_DEVICE, wp_cuda_context_get_device_ordinal(context), tag);
+
     return ptr;
 }
 
-void wp_free_device_async(void* context, void* ptr)
+void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
 {
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_free(ptr);
@@ -820,26 +874,108 @@ void wp_free_device_async(void* context, void* ptr)
     } else {
         // get the graph allocation details
         GraphAllocInfo& alloc_info = alloc_iter->second;
-
         uint64_t capture_id = alloc_info.capture_id;
 
         // check if the capture is still active
         auto capture_iter = g_captures.find(capture_id);
         if (capture_iter != g_captures.end()) {
-            // Add a mem free node.  Use all current leaf nodes as dependencies to ensure that all prior
-            // work completes before deallocating.  This works with both Warp-initiated and external captures
-            // and avoids the need to explicitly track all streams used during the capture.
             CaptureInfo* capture = capture_iter->second;
             cudaGraph_t graph = get_capture_graph(capture->stream);
-            std::vector<cudaGraphNode_t> leaf_nodes;
-            if (graph && get_graph_leaf_nodes(graph, leaf_nodes)) {
-                cudaGraphNode_t free_node;
-                if (check_cuda(cudaGraphAddMemFreeNode(&free_node, graph, leaf_nodes.data(), leaf_nodes.size(), ptr))) {
-                    check_cu(cuStreamUpdateCaptureDependencies_f(
-                        capture->stream, &free_node, 1, cudaStreamSetCaptureDependencies
-                    ));
+            if (!graph) {
+                fprintf(stderr, "Warp warning: %s: failed to get capture graph\n", __FUNCTION__);
+                g_graph_allocs.erase(alloc_iter);
+                return;
+            }
+
+            cudaGraphNode_t free_node = NULL;
+
+            if (alloc_info.node) {
+                // Find all leaf nodes that depend on the alloc node.
+                std::vector<cudaGraphNode_t> alloc_leaf_nodes;
+                if (!get_dependent_leaf_nodes(alloc_info.node, alloc_leaf_nodes)) {
+                    fprintf(stderr, "Warp warning: %s: failed to get allocation-dependent nodes\n", __FUNCTION__);
+                    g_graph_allocs.erase(alloc_iter);
+                    return;
+                }
+
+                // Add a mem free node. All graph leaf nodes that are descendants of the alloc node
+                // will be used as dependencies to ensure that all prior work completes before deallocating.
+                // This works with both Warp-initiated and external captures and avoids the need to explicitly
+                // track all streams used during the capture.
+                if (!check_cuda(cudaGraphAddMemFreeNode(
+                        &free_node, graph, alloc_leaf_nodes.data(), alloc_leaf_nodes.size(), ptr
+                    ))) {
+                    fprintf(stderr, "Warp warning: %s: failed to add a memory free node\n", __FUNCTION__);
+                    g_graph_allocs.erase(alloc_iter);
+                    return;
+                }
+
+                // Update the capture dependencies for affected child streams, if the streams are still alive.
+                // Adding the MemFreeNode as a dependency allows the memory to be reused later,
+                // leading to smaller graph memory footprints.
+                // This creates an implicit synchronization point between all streams that
+                // potentially depend on the allocation, but other streams are unaffected.
+                // Implementation notes:
+                // - Brute force search through all streams known to Warp, since we don't track
+                //   which streams are part of a capture. FIXME?
+                // - If a stream's frontier includes alloc-dependent nodes:
+                //   - The free node already depends on these nodes
+                //     (get_dependent_leaf_nodes() + cudaGraphAddMemFreeNode() above).
+                //   - We replace all alloc-dependent deps with the new free node. Other deps remain unchanged.
+                for (const auto& kv : g_streams) {
+                    cudaStream_t other_stream = kv.first;
+                    CUstreamCaptureStatus other_capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+                    uint64_t other_capture_id = 0;
+                    const cudaGraphNode_t* other_capture_deps = NULL;
+                    size_t other_dep_count = 0;
+                    if (check_cu(cuStreamGetCaptureInfo_f(
+                            other_stream, &other_capture_status, &other_capture_id, NULL, &other_capture_deps,
+                            &other_dep_count
+                        ))) {
+                        // check if the other stream is part of the same capture
+                        if (other_capture_status == CU_STREAM_CAPTURE_STATUS_ACTIVE && other_capture_id == capture_id) {
+                            // check if the stream's frontier includes alloc-dependent nodes
+                            if (contains_any(
+                                    other_capture_deps, other_capture_deps + other_dep_count, alloc_leaf_nodes.begin(),
+                                    alloc_leaf_nodes.end()
+                                )) {
+                                // Update the stream's capture deps. We replace all alloc-dependent deps with the new
+                                // free node. Other deps remain unchanged.
+                                std::vector<cudaGraphNode_t> new_deps { free_node };
+                                for (size_t i = 0; i < other_dep_count; i++) {
+                                    cudaGraphNode_t dep = other_capture_deps[i];
+                                    if (std::find(alloc_leaf_nodes.begin(), alloc_leaf_nodes.end(), dep)
+                                        == alloc_leaf_nodes.end()) {
+                                        new_deps.push_back(dep);
+                                    }
+                                }
+                                check_cu(cuStreamUpdateCaptureDependencies_f(
+                                    other_stream, new_deps.data(), new_deps.size(), CU_STREAM_SET_CAPTURE_DEPENDENCIES
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback if the allocation node was not found in wp_alloc_device_async().
+                // Use all current leaf nodes as dependencies to ensure that all prior work completes before
+                // deallocating. This produces correct graphs, but may introduce unnecessary stream serialization with
+                // multi-stream captures.
+                std::vector<cudaGraphNode_t> leaf_nodes;
+                if (get_graph_leaf_nodes(graph, leaf_nodes)) {
+                    if (check_cuda(
+                            cudaGraphAddMemFreeNode(&free_node, graph, leaf_nodes.data(), leaf_nodes.size(), ptr)
+                        )) {
+                        check_cu(cuStreamUpdateCaptureDependencies_f(
+                            capture->stream, &free_node, 1, CU_STREAM_SET_CAPTURE_DEPENDENCIES
+                        ));
+                    }
                 }
             }
+
+            // return the free node for testing/debugging
+            if (dbg_node_ret)
+                *dbg_node_ret = free_node;
 
             // we're done with this allocation, it's owned by the graph
             g_graph_allocs.erase(alloc_iter);
@@ -2034,6 +2170,27 @@ int wp_cuda_device_is_uva(int ordinal)
     return 0;
 }
 
+int wp_cuda_device_get_pageable_memory_access(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].pageable_memory_access;
+    return 0;
+}
+
+int wp_cuda_device_get_direct_managed_mem_access_from_host(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].direct_managed_mem_access_from_host;
+    return 0;
+}
+
+int wp_cuda_device_get_host_native_atomic_supported(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].host_native_atomic_supported;
+    return 0;
+}
+
 int wp_cuda_device_is_mempool_supported(int ordinal)
 {
     if (ordinal >= 0 && ordinal < int(g_devices.size()))
@@ -3127,6 +3284,113 @@ bool wp_cuda_graph_update_memcpy_batch(
     }
 
     return true;
+}
+
+void* wp_cuda_graph_insert_alloc_node(void* context, size_t size)
+{
+    // This function is used to exercise wp_alloc_device_async() during graph capture
+    // and return the newly created alloc node. It is primarily a testing/debugging tool
+    // and modifications are discouraged unless critical flaws are found.
+
+    void* ptr = wp_alloc_device_async(context, size);
+
+    // get the resulting alloc node
+    if (ptr) {
+        auto alloc_iter = g_graph_allocs.find(ptr);
+        if (alloc_iter != g_graph_allocs.end()) {
+            // NOTE: Set ``ref_exists`` to false for this allocation. This ensures that
+            // the allocation is freed when the graph is destroyed.
+            // Use wp_cuda_graph_insert_free_node() to explicitly free this allocation
+            // during capture, but that can't free allocations that leak out of the capture.
+            alloc_iter->second.ref_exists = false;
+            return alloc_iter->second.node;
+        }
+    }
+
+    wp::set_error_string("Warp error: failed to get MemAllocNode");
+    return NULL;
+}
+
+void* wp_cuda_graph_insert_free_node(void* context, void* alloc_node_)
+{
+    // This function is used to exercise wp_free_device_async() during graph capture
+    // and return the newly created free node. It is primarily a testing/debugging tool
+    // and modifications are discouraged unless critical flaws are found.
+
+    cudaGraphNode_t alloc_node = static_cast<cudaGraphNode_t>(alloc_node_);
+
+    // verify input is an alloc node
+    CUgraphNodeType alloc_node_type;
+    if (!check_cu(cuGraphNodeGetType_f(alloc_node, &alloc_node_type)))
+        return NULL;
+    if (alloc_node_type != CU_GRAPH_NODE_TYPE_MEM_ALLOC) {
+        wp::set_error_string("Warp error: invalid node type, expected MemAllocNode");
+        return NULL;
+    }
+
+    // get the allocation pointer
+    cudaMemAllocNodeParams alloc_params;
+    if (!check_cuda(cudaGraphMemAllocNodeGetParams(alloc_node, &alloc_params)))
+        return NULL;
+    void* ptr = alloc_params.dptr;
+
+    // use wp_free_device_async() and get the free node it added
+    void* free_node = NULL;
+    wp_free_device_async(context, ptr, &free_node);
+
+    return free_node;
+}
+
+void* wp_cuda_graph_insert_empty_node(void* context)
+{
+    CUstream cuda_stream = get_current_stream(context);
+
+    // get capture info
+    CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+    cudaGraph_t graph = NULL;
+    const cudaGraphNode_t* capture_deps = NULL;
+    size_t dep_count = 0;
+    if (!check_cu(cuStreamGetCaptureInfo_f(cuda_stream, &capture_status, nullptr, &graph, &capture_deps, &dep_count))) {
+        wp::append_error_string("Failed to get capture info");
+        return NULL;
+    }
+
+    // abort if not capturing
+    if (!graph || capture_status != CU_STREAM_CAPTURE_STATUS_ACTIVE) {
+        wp::set_error_string("Stream is not capturing");
+        return NULL;
+    }
+
+    // add empty node
+    cudaGraphNode_t empty_node = NULL;
+    if (!check_cuda(cudaGraphAddEmptyNode(&empty_node, graph, capture_deps, dep_count))) {
+        wp::append_error_string("Failed to add empty node");
+        return NULL;
+    }
+
+    // update capture dependencies
+    if (!check_cu(
+            cuStreamUpdateCaptureDependencies_f(cuda_stream, &empty_node, 1, CU_STREAM_SET_CAPTURE_DEPENDENCIES)
+        )) {
+        wp::append_error_string("Failed to update capture dependencies");
+        return NULL;
+    }
+
+    return empty_node;
+}
+
+int wp_cuda_graph_node_depends_on(void* argument, void* referent)
+{
+    return static_cast<int>(
+        graph_node_depends_on(static_cast<cudaGraphNode_t>(argument), static_cast<cudaGraphNode_t>(referent))
+    );
+}
+
+int wp_cuda_graph_alloc_query(void* alloc_node, void* query_node)
+{
+    return static_cast<int>(
+        graph_alloc_query(static_cast<cudaGraphNode_t>(alloc_node), static_cast<cudaGraphNode_t>(query_node))
+    );
 }
 
 // Support for conditional graph nodes available with CUDA 12.4+.
@@ -4726,22 +4990,24 @@ size_t wp_cuda_launch_kernel(
     if (apic_info) {
         APICState state = wp_apic_get_recording_state();
         if (state) {
-            // Read shape/ndim/size from the launch_bounds_t* in args[0] (see builtin.h).
+            // Read shape and size from launch_bounds_t<N> in args[0].
+            int ndim = apic_info->kernel_dim;
+            if (ndim < 1)
+                ndim = 1;
+            if (ndim > APIC_LAUNCH_MAX_DIMS)
+                ndim = APIC_LAUNCH_MAX_DIMS;
+
             int shape[APIC_LAUNCH_MAX_DIMS] = {};
-            int ndim = 0;
             uint64_t launch_size = dim;
             if (args && args[0]) {
-                const auto* lb = static_cast<const wp::launch_bounds_t*>(args[0]);
-                ndim = lb->ndim;
-                if (ndim < 1)
-                    ndim = 1;
-                if (ndim > APIC_LAUNCH_MAX_DIMS)
-                    ndim = APIC_LAUNCH_MAX_DIMS;
+                const int* bounds_shape = static_cast<const int*>(args[0]);
                 for (int d = 0; d < ndim; d++)
-                    shape[d] = lb->shape[d];
-                launch_size = lb->size;
+                    shape[d] = bounds_shape[d];
+
+                const size_t size_offset = apic_detail::launch_bounds_size_offset(ndim);
+                const uint8_t* bounds_bytes = static_cast<const uint8_t*>(args[0]);
+                launch_size = *reinterpret_cast<const size_t*>(bounds_bytes + size_offset);
             } else {
-                ndim = 1;
                 shape[0] = (int)dim;
             }
 
