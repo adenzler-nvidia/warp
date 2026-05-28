@@ -5,12 +5,6 @@
 
 #include "tile.h"
 
-#if defined(__clang__)
-// disable warnings related to C++17 extensions on CPU JIT builds
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc++17-extensions"
-#endif
-
 namespace wp {
 
 // Operation structs for different scan types (shared between CPU and GPU)
@@ -291,7 +285,3 @@ template <typename Tile, typename AdjTile> void adj_tile_scan_min_inclusive(Tile
 }
 
 }  // namespace wp
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif

@@ -730,7 +730,7 @@ class StaticArray(_Static):
     ``cpp_ctype_override`` is set when the Var came from
     ``wp::view`` on a baked source so the local is declared with
     ``decltype(wp::view(...))`` and C++ deduction carries the
-    post-view ``baked_array_t<...>`` shape through.
+    post-view ``static_array_t<...>`` shape through.
     """
     __slots__ = ("value", "cpp_ctype_override")
 
@@ -804,7 +804,7 @@ class Var:
     def emit_for_truthiness(self, adj: "Adjoint") -> str:
         """C++ expression for this Var in a boolean context.
 
-        Baked arrays materialize to ``baked_array_t<...>`` locals (or
+        Baked arrays materialize to ``static_array_t<...>`` locals (or
         flow through wp.func templates as deduced typename params);
         both inherit ``array_t<T>::operator T*()`` so ``if (var_X)``
         implicitly converts to a raw-pointer check.  No special case
@@ -833,9 +833,8 @@ class Var:
             (runtime K).
 
           - ``"ndim"`` — emits the constant value directly as a
-            Python constant Var (kernel body / view-result) or
-            ``const wp::int32 var_X = Config::<label>_ndim;``
-            (templated wp.func body).
+            Python constant Var.  ``ndim`` is type-level so the literal
+            is invariant across instantiations.
 
         Anything else (``.data``, ``.grad``) — return None, fall
         through to generic.
@@ -1127,10 +1126,6 @@ class Adjoint:
         adj.func = func
 
         adj.is_user_function = is_user_function
-        # Set while emitting a templated spec kernel body so attribute
-        # access / scheme-B dispatch use bare template-arg references
-        # (``<label>_shape_K`` etc.) instead of literal substitution.
-        adj.in_spec_kernel = False
 
         # whether the generation of the forward code is skipped for this function
         adj.skip_forward_codegen = skip_forward_codegen
@@ -1343,12 +1338,11 @@ class Adjoint:
         for a in adj.args:
             adj.symbols[a.label] = a
 
-        # Spec-feature: bind ``binding_time`` tags onto arg Vars for
-        # the current build.  Every consumer (truthiness check,
-        # attribute access, data-pointer reference, scheme-B dispatch)
-        # reads from the Var rather than looking up ``baked_args[label]``
-        # at the call site.  Reset first so a rebuild without baking
-        # (or with a different baking) starts clean.
+        # Bind ``binding_time`` tags onto arg Vars for the current
+        # build.  Downstream codegen reads the tag off the Var instead
+        # of looking up ``baked_args[label]`` at every call site.
+        # Reset before binding so a rebuild with different (or no)
+        # baking doesn't inherit stale tags.
         for a in adj.args:
             a.binding_time = None
         if isinstance(baked_params, dict):
@@ -1879,10 +1873,9 @@ class Adjoint:
         # (kernel arg or already-tracked sub-array) with all-int
         # indices, the result is itself a baked sub-array — its
         # shape/strides/ndim are pure shifts of the source's
-        # compile-time values.  Set the baked metadata directly on the
-        # result Var so subsequent attribute access, scheme-B builtin
-        # dispatch, and codegen-time type emission all see it as just
-        # another baked array — no separate label-keyed dict needed.
+        # compile-time values.  Tag the result Var with the shifted
+        # metadata so downstream attribute access, builtin dispatch,
+        # and ctype emission treat it as just another baked array.
         if (
             func.is_builtin()
             and func.key == "view"
@@ -1911,7 +1904,7 @@ class Adjoint:
                     )
                     # Precompute the view-result local's C++ type so
                     # primal-vars emission can declare it with the right
-                    # post-view ``baked_array_t<...>`` shape via C++
+                    # post-view ``static_array_t<...>`` shape via C++
                     # template deduction (``decltype`` of the same
                     # ``wp::view`` call shape).  ``cpp_ctype_override``
                     # being set also signals "this is a view result" to
@@ -1924,7 +1917,7 @@ class Adjoint:
         # emitted once as a function template with its array args as
         # deduced typename parameters (see ``codegen_func``); the same
         # template body serves both ``array_t<T>`` and
-        # ``baked_array_t<T, ...>`` call sites via C++ template
+        # ``static_array_t<T, ...>`` call sites via C++ template
         # deduction.  Scalars flow through as runtime args; NVRTC
         # constant-propagates the NTTP values from the kernel-template
         # instantiation through the inlined wp.func body.
@@ -2594,7 +2587,7 @@ class Adjoint:
           - **Kernel body, kernel arg**: ``<label>_<stem>_K`` (bare
             template-arg ref) for literal K, or
             ``wp::baked_shape_extract<...>(k)`` for runtime K.
-          - **View-result**: the Var is a typed ``baked_array_t<...>``
+          - **View-result**: the Var is a typed ``static_array_t<...>``
             local; static accessors (``baked_shape[K]`` /
             ``baked_strides[K]``) handle runtime K, literals for
             compile-time K.
@@ -2681,8 +2674,9 @@ class Adjoint:
             else:
                 # Spec hook: when the aggregate is a baked array Var and we're
                 # reading ``.shape``, return a marker Var that the subscript
-                # site recognises and lowers to a literal (or Config:: lookup
-                # in templated wp.func bodies) without going through extract.
+                # site recognises and lowers to a literal (or
+                # ``baked_shape_extract<...>`` for a runtime index) without
+                # going through extract.
                 if isinstance(aggregate, Var):
                     baked_attr = aggregate.emit_for_attribute(node.attr, adj)
                     if baked_attr is not None:
@@ -3370,7 +3364,7 @@ class Adjoint:
                     # leaving an all-int index list as plain ints lets the
                     # int-arity ``view(arr, int)`` / ``view(arr, int, int)``
                     # / ``view(arr, int, int, int)`` overloads fire, whose
-                    # ``baked_array_t<...>`` form returns a sub-array with
+                    # ``static_array_t<...>`` form returns a sub-array with
                     # shifted shape/stride template args.  Without this we
                     # lose the type-level baked metadata at the view
                     # boundary.  Mixed int/slice still uses the variadic
@@ -4876,35 +4870,14 @@ cuda_reverse_function_template = """
 
 """
 
+# Shared CUDA forward template.  ``{kernel_prefix}`` is either
+# ``extern "C"`` (non-spec) or ``template <...>`` (spec — NVRTC
+# instantiates via ``nvrtcAddNameExpression`` and the lowered symbol
+# is looked up via ``nvrtcGetLoweredName``).  Templates can't have C
+# linkage, so the two are mutually exclusive at this slot.
 cuda_kernel_template_forward = """
 
-{line_directive}extern "C" {launch_bounds_str}__global__ void {name}_cuda_kernel_forward(
-    {forward_args})
-{{
-{line_directive}    wp::tile_shared_storage_t tile_mem;
-{baked_decls_outer}
-{line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
-{line_directive}         _idx < dim.size;
-{line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
-    {{
-            // reset shared memory allocator
-{line_directive}        wp::tile_shared_storage_t::init();
-{baked_decls_inner}
-{forward_body}{line_directive}    }}
-{line_directive}}}
-
-"""
-
-# Templated spec kernel.  Same body shape as the non-spec template,
-# but with a C++ template prefix carrying every baked value as an
-# NTTP and no ``extern "C"`` (templates can't have C linkage).  NVRTC
-# instantiates the kernel via ``nvrtcAddNameExpression``; the lowered
-# (mangled) symbol is looked up via ``nvrtcGetLoweredName``.  Emitted
-# at namespace scope (no enclosing ``extern "C"``).
-cuda_spec_kernel_template_forward = """
-
-{line_directive}template <{template_params}>
-{line_directive}{launch_bounds_str}__global__ void {name}_cuda_kernel_forward(
+{line_directive}{kernel_prefix}{launch_bounds_str}__global__ void {name}_cuda_kernel_forward(
     {forward_args})
 {{
 {line_directive}    wp::tile_shared_storage_t tile_mem;
@@ -5169,7 +5142,7 @@ def bake_scalar(ctype_str, var_name, label, pad="    "):
 
 def bake_array_struct_decl(elem_ctype, value, label, pad="    "):
     """Generate the kernel-entry adapter line for a baked array:
-    ``wp::baked_array_t<T, NTTPs...> var_<label>{var_<label>_data};``.
+    ``wp::static_array_t<T, NTTPs...> var_<label>{var_<label>_data};``.
 
     The raw ``T* __restrict__`` cmem param is named ``var_<label>_data``
     by convention; the struct local is ``var_<label>``.  Both reach the
@@ -5183,7 +5156,7 @@ def bake_array_struct_decl(elem_ctype, value, label, pad="    "):
     shape_args = [f"{label}_shape_{i}" if i < value.ndim else "0" for i in range(4)]
     stride_args = [f"{label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
     return (
-        f"{pad}wp::baked_array_t<{elem_ctype}, {ndim_arg}, "
+        f"{pad}wp::static_array_t<{elem_ctype}, {ndim_arg}, "
         f"{', '.join(shape_args)}, {', '.join(stride_args)}> "
         f"var_{label}{{var_{label}_data}};\n"
     )
@@ -5478,7 +5451,7 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     #
     # Array args are emitted as templated typename parameters (like
     # tiles) so the SAME wp.func template can be called with either
-    # ``array_t<T>`` (generic kernel context) or ``baked_array_t<T,
+    # ``array_t<T>`` (generic kernel context) or ``static_array_t<T,
     # NTTPs...>`` (spec kernel context).  C++ template deduction picks
     # the type at the call site; ``wp::address(arr, i)`` etc. inside the
     # body dispatches to the right overload based on the deduced type.
@@ -5713,11 +5686,7 @@ def codegen_kernel(kernel, device, options):
         template_forward = cpu_kernel_template_forward
         template_backward = cpu_kernel_template_backward
     elif device == "cuda":
-        # Spec mode: emit a C++ template kernel with NTTPs for every
-        # baked value; non-spec uses the plain extern "C" form.
-        baked_args = kernel.options.get("baked_args")
-        is_spec_cuda = bool(isinstance(baked_args, dict) and "dim" in baked_args)
-        template_forward = cuda_spec_kernel_template_forward if is_spec_cuda else cuda_kernel_template_forward
+        template_forward = cuda_kernel_template_forward
         template_backward = cuda_kernel_template_backward
     else:
         raise ValueError(f"Device {device} is not supported")
@@ -5785,7 +5754,7 @@ def codegen_kernel(kernel, device, options):
             value = baked_args[arg.label]
             if isinstance(value, array_t):
                 # T*-ABI: kernel takes ``T* __restrict__`` only.  The
-                # ``baked_array_t<T, ...>`` struct local is materialized
+                # ``static_array_t<T, ...>`` struct local is materialized
                 # below from the raw pointer (constexpr fields from
                 # NTTPs, data pointer from the kernel arg) so generic
                 # builtins like ``wp::view`` / ``wp::where`` have a
@@ -5822,6 +5791,16 @@ def codegen_kernel(kernel, device, options):
 
     forward_body = codegen_func_forward(adj, func_type="kernel", device=device)
 
+    # The kernel-prefix slot is C-linkage for normal launches and a
+    # C++ template prefix for spec launches (templates can't have C
+    # linkage).  Both forms feed the same shared template body.
+    if specialize:
+        kernel_prefix = f"template <{', '.join(kernel_template_params)}>\n"
+    elif device == "cuda":
+        kernel_prefix = 'extern "C" '
+    else:
+        kernel_prefix = ""
+
     template_fmt_args.update(
         {
             "forward_args": indent(forward_args),
@@ -5830,10 +5809,9 @@ def codegen_kernel(kernel, device, options):
             "launch_bounds_str": launch_bounds_str,
             "baked_decls_outer": baked_decls_outer,
             "baked_decls_inner": baked_decls_inner,
+            "kernel_prefix": kernel_prefix,
         }
     )
-    if specialize and device == "cuda":
-        template_fmt_args["template_params"] = ", ".join(kernel_template_params)
     template += template_forward
 
     if options["enable_backward"]:

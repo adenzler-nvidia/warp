@@ -153,13 +153,11 @@ def view_then_shape(arr: wp.array2d(dtype=float), out: wp.array(dtype=int)):
         out[0] = slice.shape[0]
 
 
-# Exercises the Phase D body-sharing path: a wp.func that views one of
-# its array args and reads the view-result's shape, called twice from
-# the same kernel with two differently-shaped arrays.  Phase D shares
-# one template body across both bakings via Config:: traits — without
-# provenance tracking on view-result Vars, the body would bake in the
-# first caller's literal and the second call would silently get the
-# wrong answer.
+# Fixture for the wp.func body-sharing test: a wp.func that views one
+# of its array args and reads the view-result's shape, called from
+# the same kernel with two differently-shaped arrays.  One template
+# body serves both call sites; the shape value must come from the
+# caller's baked metadata, not be baked into the shared body.
 @wp.func
 def view_inner_shape(a: wp.array2d(dtype=float)) -> int:
     s = a[0]
@@ -229,8 +227,9 @@ class TestKernelSpecialize(unittest.TestCase):
     # ---- Codegen verification ----
 
     def test_codegen_bakes_constants(self):
-        """Verify the generated .cu has baked shape/stride/ndim, baked
-        scalar constants, and scheme-B helpers for array access.
+        """Verify the generated .cu carries baked shape/stride/ndim,
+        baked scalar constants, and routes array access through the
+        baked-array helpers.
         """
         N = 256
         device = "cuda:0"
@@ -258,15 +257,15 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertRegex(source, r"wp::float32\* __restrict__ var_x_data")
         # Array access goes through ``wp::address(var_x, ...)`` and
         # ``wp::array_store(var_y, ...)``; C++ overload resolution picks
-        # the templated ``baked_array_t<...>`` overload, which delegates
+        # the templated ``static_array_t<...>`` overload, which delegates
         # to the shape/stride-templated address helpers in ``array.h``.
         self.assertRegex(source, r"wp::address\(var_x, ")
         self.assertRegex(source, r"wp::array_store\(var_y, ")
-        # The materialized baked_array_t locals carry the NTTPs in
+        # The materialized static_array_t locals carry the NTTPs in
         # their type, so the address helpers see them via overload
         # resolution rather than Python emitting them explicitly.
-        self.assertRegex(source, r"wp::baked_array_t<wp::float32, x_ndim, x_shape_0,")
-        self.assertRegex(source, r"wp::baked_array_t<wp::float32, y_ndim, y_shape_0,")
+        self.assertRegex(source, r"wp::static_array_t<wp::float32, x_ndim, x_shape_0,")
+        self.assertRegex(source, r"wp::static_array_t<wp::float32, y_ndim, y_shape_0,")
 
     def test_codegen_baked_shape_local(self):
         """Verify `arr.shape[K]` on a baked array uses a bare
@@ -401,7 +400,7 @@ class TestKernelSpecialize(unittest.TestCase):
 
     def test_codegen_baked_array_for_view(self):
         """`arr[i]` on a 2D baked array takes the `view(arr, int)` path.
-        Verify the emit uses `wp::baked_array_t<...>` with template-
+        Verify the emit uses `wp::static_array_t<...>` with template-
         encoded shape/strides/ndim, the int-indexed view fires (no
         slice_t wrapping), and the result is correct.
         """
@@ -419,12 +418,12 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Templated kernel: kernel-arg materialized as baked_array_t
+        # Templated kernel: kernel-arg materialized as static_array_t
         # with template-arg refs for the in-use dims (extra slots
         # zero-padded since `bake_array_struct_decl` only fills 0..ndim).
         self.assertRegex(
             source,
-            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0, arr_shape_1, 0, 0, arr_stride_0, arr_stride_1, 0, 0>",
+            r"wp::static_array_t<wp::float32, arr_ndim, arr_shape_0, arr_shape_1, 0, 0, arr_stride_0, arr_stride_1, 0, 0>",
         )
         # Codegen passes the bare int index through to view (rather than
         # wrapping in slice_t(i, i, 0)).
@@ -436,8 +435,8 @@ class TestKernelSpecialize(unittest.TestCase):
         np.testing.assert_allclose(out.numpy(), np.arange(N, dtype=np.float32) * M)
 
     def test_codegen_baked_array_for_where(self):
-        """`wp.where(arr, a, b)` forces baked_array_t reconstruction —
-        the where overload is templated on baked_array_t so shape /
+        """`wp.where(arr, a, b)` forces static_array_t reconstruction —
+        the where overload is templated on static_array_t so shape /
         stride / ndim flow through as compile-time template args.
         """
         N = 16
@@ -453,25 +452,24 @@ class TestKernelSpecialize(unittest.TestCase):
         with open(cu_path) as f:
             source = f.read()
 
-        # Templated kernel: kernel-arg materialized as baked_array_t
+        # Templated kernel: kernel-arg materialized as static_array_t
         # with template-arg refs.
         self.assertRegex(
             source,
-            r"wp::baked_array_t<wp::float32, maybe_ndim, maybe_shape_0,",
+            r"wp::static_array_t<wp::float32, maybe_ndim, maybe_shape_0,",
         )
         self.assertIn("wp::where(var_maybe,", source)
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(out.numpy(), np.ones(N, dtype=np.float32))
 
-    def test_codegen_nested_view_propagates_scheme_b(self):
-        """`arr[i][j][k]` on a baked 3D kernel arg goes through two
-        `wp::view(baked_array_t, int)` calls returning shape-shifted
-        baked_array_t sub-arrays, then a final element access.  Verify
-        the codegen tracks the sub-array shape/stride at each hop and
-        emits scheme-B (`wp_address_baked_1d<S, St>(sub.data, ...)`)
-        for the terminal access — i.e. static info flows end-to-end
-        across nested views, not just from the kernel arg.
+    def test_codegen_nested_view_propagates_baked_metadata(self):
+        """``arr[i][j][k]`` on a baked 3D kernel arg goes through two
+        ``wp::view(static_array_t, int)`` calls returning shape-shifted
+        sub-arrays, then a final element access.  Verify static info
+        flows end-to-end across nested views: each sub-array keeps its
+        baked shape/stride, and the terminal access resolves to the
+        baked overload of ``wp::address``.
         """
         N, M, K = 8, 4, 5
         device = "cuda:0"
@@ -487,21 +485,20 @@ class TestKernelSpecialize(unittest.TestCase):
             source = f.read()
 
         # Two int-indexed views chained off the kernel arg.  Kernel-arg
-        # materialized via templated `baked_array_t<...>` with template-arg refs.
+        # materialized via templated `static_array_t<...>` with template-arg refs.
         self.assertRegex(
             source,
-            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0,.*> var_arr",
+            r"wp::static_array_t<wp::float32, arr_ndim, arr_shape_0,.*> var_arr",
         )
         # View-result locals declared via decltype(wp::view(...)) — C++
-        # template deduction picks the post-view baked_array_t<...> type.
+        # template deduction picks the post-view static_array_t<...> type.
         self.assertRegex(source, r"decltype\(wp::view\(var_arr, 0\)\) var_\d+;")
         self.assertRegex(source, r"decltype\(wp::view\(var_\d+, 0\)\) var_\d+;")
         self.assertRegex(source, r"wp::view\(var_arr, var_\d+\);")
         self.assertRegex(source, r"wp::view\(var_\d+, var_\d+\);")
-        # Terminal element access on the (sub-array of sub-array) uses
-        # standard wp::address; overload resolution routes to the baked
-        # variant in array.h via the local's templated type.  No
-        # codegen-emitted scheme-B helper for view-results.
+        # Terminal element access uses plain ``wp::address``; overload
+        # resolution picks the baked variant in array.h through the
+        # view-result local's templated type.
         self.assertRegex(source, r"wp::address\(var_\d+, var_\d+\);")
 
         wp.synchronize_device(device)
@@ -509,10 +506,10 @@ class TestKernelSpecialize(unittest.TestCase):
 
     def test_codegen_view_result_shape_baked(self):
         """``slice = arr[i]; slice.shape[0]`` on a baked source: the
-        view result carries its post-view ``baked_value`` (shape ``(M,)``
-        after viewing the 0th row of an ``(N, M)`` array), and
-        ``slice.shape[0]`` constant-folds to ``M`` at codegen time
-        without any shape_t materialisation.
+        view result inherits the post-view shape (``(M,)`` after
+        viewing row 0 of an ``(N, M)`` array), and ``slice.shape[0]``
+        constant-folds to ``M`` at codegen time without any ``shape_t``
+        materialization.
         """
         N = 8
         M = 5
@@ -538,18 +535,16 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertEqual(int(out.numpy()[0]), M)
 
     def test_view_result_shape_in_templated_func_two_callers(self):
-        """Phase D body-sharing correctness: a wp.func that views one
-        of its array args and reads the view-result's shape, called
-        twice from the same kernel with arrays of different shapes,
-        must produce the right answer for each call — not bake the
-        first caller's literal into the shared body.
+        """Body-sharing correctness: a wp.func that views one of its
+        array args and reads the view-result's shape, called twice
+        from the same kernel with arrays of different shapes, must
+        produce the right answer at each call site — not bake the
+        first caller's literal into the shared template body.
 
-        Phase D registers ONE C++ template per (function, label-set)
-        and instantiates it with different ``Config`` traits per call.
-        Without provenance tracking on view-result Vars,
-        ``s.shape[0]`` inside ``view_inner_shape`` would emit
-        ``const int = M1`` from whichever call was built first, and
-        the second call would silently get the wrong answer.
+        The wp.func is emitted once as a template parameterized on
+        the array typename; each call deduces a different
+        ``static_array_t<...>`` so the view-result's shape is read off
+        the per-call type, not a literal substituted at emission.
         """
         device = "cuda:0"
         N1, M1 = 8, 5
@@ -583,7 +578,7 @@ class TestKernelSpecialize(unittest.TestCase):
 
         # Both wp.funcs are emitted as function templates with their
         # array arg as a deduced typename parameter (the same template
-        # serves array_t<T> and baked_array_t<T,...> call sites).
+        # serves array_t<T> and static_array_t<T,...> call sites).
         self.assertRegex(
             source,
             r"template<typename array_t_arr>\s*\n\s*\n?\s*//[^\n]*\n\s*static CUDA_CALLABLE wp::float32 inner_add_0\(",
@@ -595,12 +590,12 @@ class TestKernelSpecialize(unittest.TestCase):
         # outer body calls inner with no explicit template args (deduced
         # from the array arg type at the call site).
         self.assertIn("inner_add_0(var_arr, var_i)", source)
-        # Kernel materializes ``var_a`` as baked_array_t and passes it
-        # by value to outer_scale_0 (typename deduces to baked_array_t).
+        # Kernel materializes ``var_a`` as static_array_t and passes it
+        # by value to outer_scale_0 (typename deduces to static_array_t).
         self.assertIn("outer_scale_0(var_a, var_0, var_1)", source)
         # And the kernel constructs the baked array struct from the raw
         # __restrict__ pointer.
-        self.assertRegex(source, r"wp::baked_array_t<wp::float32, a_ndim,[^>]*>\s+var_a\{var_a_data\}")
+        self.assertRegex(source, r"wp::static_array_t<wp::float32, a_ndim,[^>]*>\s+var_a\{var_a_data\}")
 
     # ---- Correctness (parametrized: specialized vs generic) ----
 
@@ -714,9 +709,11 @@ class TestKernelSpecialize(unittest.TestCase):
         np.testing.assert_allclose(x.grad.numpy(), 3.0 * np.ones(N, dtype=np.float32), rtol=1e-5)
 
     def test_eager_mode_warning_fires_once(self):
-        """Spec launches outside graph capture should warn (once per
-        process) — eager mode is correct but ~47% slower, so the user
-        deserves a heads-up.  Refusing to spec would break debuggability."""
+        """Spec launches outside graph capture should warn once per
+        process — eager mode is correct but materially slower than the
+        non-spec path, so the user deserves a heads-up.  Refusing to
+        spec outside capture would hide spec-codegen bugs from
+        eager-mode debugging."""
         import io
         from contextlib import redirect_stderr
 

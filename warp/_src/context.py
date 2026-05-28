@@ -1955,9 +1955,10 @@ def register_api_function(
 # global dictionary of modules
 user_modules: dict[str, Module] = {}
 
-# Cache of specialized Kernel objects keyed by spec-module name.  Populated
-# in `_launch_specialized` so repeated launches with the same baked_hash
-# reuse one Kernel instance (and therefore a stable module hash).
+# Cache of specialized Kernel objects keyed by spec-module name.
+# Reusing one Kernel instance per (kernel, baked_hash) keeps the
+# module hash stable across launches, which is what lets graph replay
+# skip the rebuild/driver-reload path.
 _spec_kernel_cache: dict[str, "Kernel"] = {}
 
 
@@ -2351,14 +2352,8 @@ class ModuleBuilder:
 
         # Top-level kernel build: pull baked metadata from kernel.options
         # (set by `_launch_specialized` for spec launches; absent
-        # otherwise).  No need for the back channel through
-        # ``module.options["baked_args"]``.
+        # otherwise).
         baked = kernel.options.get("baked_args")
-        # Spec kernel body emits with template-arg references
-        # (``<label>_shape_K`` etc.) — the codegen branches that pick
-        # template-arg refs vs literals key off ``adj.in_spec_kernel``.
-        if isinstance(baked, dict) and "dim" in baked:
-            kernel.adj.in_spec_kernel = True
         kernel.adj.build(self, baked_params=baked)
 
         if kernel.adj.return_var is not None:
@@ -9918,11 +9913,11 @@ def _build_spec_name_expression(kernel, baked_args):
 
 
 def _get_or_create_spec_kernel(module, module_name, kernel, baked_args):
-    """Module-level cache of the spec ``Kernel``.  Registering a fresh
-    Kernel per launch used to churn ``_live_kernels``, force
-    ``ModuleHasher`` to recompute a different hash each call, and
-    trigger a rebuild + driver reload that serialized against the
-    stream.  A stable cached identity keeps replay overhead flat.
+    """Return a cached spec ``Kernel`` for ``module_name``, creating
+    one on first sight.  A stable Kernel identity per (kernel,
+    baked_hash) keeps the ``ModuleHasher`` output stable across
+    launches; without that, every launch would re-hash, rebuild, and
+    reload, serializing the stream against the JIT.
     """
     spec_kernel = _spec_kernel_cache.get(module_name)
     if spec_kernel is None:

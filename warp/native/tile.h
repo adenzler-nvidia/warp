@@ -7,12 +7,6 @@
 
 #include "rand.h"
 
-#ifdef __clang__
-// disable warnings related to C++17 extensions on CPU JIT builds
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc++17-extensions"
-#endif  // __clang__
-
 // Check if the CUDA toolkit is available
 #if WP_ENABLE_CUDA || defined(__CUDACC_RTC__) || (defined(__clang__) && defined(__CUDA__))
 
@@ -666,7 +660,7 @@ template <typename Shape> struct tile_coord_iter_t {
 //   (2) array is contiguous (dense row-major strides), (3) outer-dimension strides are multiples of
 //   16 bytes, and (4) tile fits entirely within array bounds. Skips runtime checks in tile_can_vectorize().
 // Src is the source-array type — ``array_t<T>`` (the default, for
-// runtime-stride sources) or ``baked_array_t<T, NTTPs...>`` when the
+// runtime-stride sources) or ``static_array_t<T, NTTPs...>`` when the
 // call site knows the static shape/strides.  Passing the concrete
 // baked type keeps the static info on ``data`` so ``index_from_coord``
 // reads strides via ``strides_at<I>`` (compile-time-indexed, per-type
@@ -691,7 +685,7 @@ struct tile_global_t {
 
 private:
     // Fold over the dimensions: each ``strides_at<I>(data)`` resolves
-    // at compile time for ``Src = baked_array_t<...>`` (returns the
+    // at compile time for ``Src = static_array_t<...>`` (returns the
     // NTTP via ``if constexpr``) and to a runtime field read for
     // ``Src = array_t<T>``.  No PRAGMA_UNROLL, no runtime ternary,
     // no inlining-dependent constant folding — the ``I`` parameter
@@ -2691,7 +2685,7 @@ adj_tile_arange(T start, T stop, T step, T& adj_start, T& adj_stop, T& adj_step,
 // Aligned: when true, indicates caller guarantees 16-byte alignment and full tile bounds (skips runtime checks)
 //
 // Templated on the source array type — accepts both ``array_t<T>``
-// and ``baked_array_t<T, NTTPs...>``.  ``Src=ArrT`` flows into
+// and ``static_array_t<T, NTTPs...>``.  ``Src=ArrT`` flows into
 // ``tile_global_t`` so the static shape/strides survive for baked
 // sources.
 template <typename T, bool BoundsCheck, bool Aligned, unsigned... Shape, typename ArrT, typename... Offset>
@@ -2702,7 +2696,7 @@ inline CUDA_CALLABLE auto tile_load(ArrT& src, Offset... offset)
 
 // Used for indexed loads and stores.  Templated on the source array
 // type so the same body serves ``array_t<T>`` and
-// ``baked_array_t<T, NTTPs...>``.  Per-axis stride/shape access goes
+// ``static_array_t<T, NTTPs...>``.  Per-axis stride/shape access goes
 // through ``strides_at<I>(src)`` / ``shape_at<I>(src)`` — compile-time
 // template indices, with ``if constexpr`` selecting the NTTP for
 // baked sources or the runtime field for generic.  No PRAGMA_UNROLL
@@ -2748,7 +2742,7 @@ compute_index(ArrT& src, IndicesTile& indices, int axis, Coord offset, Coord c, 
 
 
 // Templated on the source array type — accepts both ``array_t<T>``
-// and ``baked_array_t<T, NTTPs...>``.  The latter routes through
+// and ``static_array_t<T, NTTPs...>``.  The latter routes through
 // ``compute_index`` (templated above) so the NTTPs flow into
 // shape/stride reads via ``shape_at<I>`` / ``strides_at<I>``.
 template <unsigned... Shape, typename ArrT, typename IndicesTile, typename... Offset>
@@ -2773,7 +2767,7 @@ inline CUDA_CALLABLE auto tile_load_indexed(ArrT& src, IndicesTile& indices, int
 // entry point for tile store operations
 //
 // Templated on the destination array type — accepts both
-// ``array_t<T>`` and ``baked_array_t<T, NTTPs...>``.  ``Src=ArrT``
+// ``array_t<T>`` and ``static_array_t<T, NTTPs...>``.  ``Src=ArrT``
 // threads into ``tile_global_t`` so static shape/strides survive for
 // baked dests.
 template <typename T, bool BoundsCheck, bool Aligned, typename Tile, typename ArrT>
@@ -2804,7 +2798,7 @@ inline CUDA_CALLABLE void tile_store(ArrT& dest, int x, int y, int z, int w, Til
 }
 
 // Templated on the destination array type — accepts both ``array_t<T>``
-// and ``baked_array_t<T, NTTPs...>``.  ndim-wrapper variants below
+// and ``static_array_t<T, NTTPs...>``.  ndim-wrapper variants below
 // follow the same generalization so codegen call sites resolve to the
 // right baked dispatch through ``compute_index``.
 template <int M, typename ArrT, typename Tile, typename Coord>
@@ -2875,8 +2869,8 @@ inline CUDA_CALLABLE void tile_store_indexed(
 
 
 // Templated on the destination array type — accepts both ``array_t<T>``
-// and ``baked_array_t<T, NTTPs...>``.  For baked sources, the
-// ``tile_global_t`` is instantiated with ``Src=baked_array_t<...>`` so
+// and ``static_array_t<T, NTTPs...>``.  For baked sources, the
+// ``tile_global_t`` is instantiated with ``Src=static_array_t<...>`` so
 // the static shape/stride NTTPs flow through ``index_from_coord``'s
 // ``strides_at<I>`` dispatch.
 // compiler struggles with these if they are one line
@@ -2906,7 +2900,7 @@ inline CUDA_CALLABLE auto tile_atomic_add(ArrT& dest, int x, int y, int z, int w
 }
 
 // Templated on the destination array type — accepts both ``array_t<T>``
-// and ``baked_array_t<T, NTTPs...>``.  ndim-wrapper variants below
+// and ``static_array_t<T, NTTPs...>``.  ndim-wrapper variants below
 // follow the same generalization.
 template <int M, typename ArrT, typename Tile, typename Coord>
 inline CUDA_CALLABLE auto tile_atomic_add_indexed(
@@ -6042,7 +6036,3 @@ template <typename T, int Capacity> inline CUDA_CALLABLE int tile_stack_count(ti
 
 }  // namespace wp
 
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

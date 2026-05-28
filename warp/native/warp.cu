@@ -4299,7 +4299,7 @@ size_t wp_cuda_compile_program(
     if (!check_nvrtc(res))
         return size_t(res);
 
-    // Phase AA: register C++ name expressions (e.g.
+    // Register C++ name expressions (e.g.
     // ``"axpy_kernel<256, 4, ..., 2.0f>"``) so NVRTC instantiates the
     // requested templated kernels and we can later retrieve their
     // mangled symbols via nvrtcGetLoweredName.
@@ -4460,8 +4460,8 @@ size_t wp_cuda_compile_program(
                 res = nvrtcResult(-1);
             }
 
-            // Phase AA: write the lowered (mangled) symbol names for
-            // all registered name expressions to ``<output_path>.symbols``.
+            // Write the lowered (mangled) symbol names for all
+            // registered name expressions to ``<output_path>.symbols``.
             // The Python launch path reads this to find the CUmodule
             // function symbol corresponding to the desired template
             // instantiation.

@@ -42,12 +42,6 @@
 
 #include "tile.h"
 
-#ifdef __clang__
-// disable warnings related to C++17 extensions on CPU JIT builds
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc++17-extensions"
-#endif  // __clang__
-
 namespace wp {
 
 namespace partitioned_gemm {
@@ -407,7 +401,3 @@ void adj_tile_cholesky_solve_inplace(
 
 
 }  // namespace wp
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

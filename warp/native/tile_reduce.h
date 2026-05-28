@@ -5,12 +5,6 @@
 
 #include "tile.h"
 
-#ifdef __clang__
-// disable warnings related to C++17 extensions on CPU JIT builds
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc++17-extensions"
-#endif  // __clang__
-
 #define WP_TILE_WARP_SIZE 32
 
 namespace wp {
@@ -897,8 +891,3 @@ template <typename Tile> auto tile_argmin(Tile& t) { return tile_arg_reduce(min,
 
 
 }  // namespace wp
-
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

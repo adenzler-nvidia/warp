@@ -293,57 +293,33 @@ template <typename T> struct array_t {
 };
 
 
-// Compile-time array proxy used by the kernel-specialize codegen for
-// the "baked array passed by value" pattern (`wp::view(arr, ...)`,
-// `wp::where(arr, a, b)`, `if (arr)`).  Inherits from `array_t<T>` so:
-//
-//   - All consumers of `array_t<T>&` (`tile_load`, `tile_store`,
-//     the variadic-slice `wp::view`, indexedarray, ...) accept a
-//     baked_array_t via base-class upcast at no runtime cost.  No
-//     conversion operator, no `array_t<T> tmp = src;` materialisation
-//     in the kernel body — the upcast is purely a type change.
-//   - The inherited shape / strides / ndim / flags fields are
-//     written exactly once at the baked_array_t ctor, from the
-//     compile-time template args.  NVRTC folds those writes via
-//     constexpr-init, so downstream ``src.shape[i]`` / ``src.strides[i]``
-//     reads inside generic consumers fold to constants.
-//
-// Templated overloads of `view` below fire ahead of the generic
-// `array_t<T>&` versions when the static baked type is preserved at
-// the call site.  Those overloads bypass the inherited fields entirely
-// and read shape / stride from the template args directly, which is
-// what the user sees as "no constructed shape_t" for the int-indexed
-// view path.
+// Compile-time array proxy used by the kernel-specialize codegen.
+// Inherits from ``array_t<T>`` so any consumer taking
+// ``array_t<T>&`` accepts a static_array_t via base-class upcast — no
+// conversion operator, no struct rematerialization.  The inherited
+// runtime fields are populated once in the ctor from the template
+// args; NVRTC folds those constexpr writes so downstream reads of
+// ``src.shape[i]`` / ``src.strides[i]`` collapse to literals.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-struct baked_array_t : array_t<T> {
-    // Static accessors exposing the template args as constexpr
-    // values so generic templated consumers (e.g. `tile_global_t`,
-    // `is_baked_array_t` traits) can route shape / stride reads
-    // through compile-time constants without an SFINAE/specialisation
-    // dance.  Reads of `Src::baked_strides[i]` with a constexpr `i`
-    // (after WP_PRAGMA_UNROLL) collapse to immediates at ptxas, so
-    // tile_global_t::index() no longer depends on NVRTC dataflow
-    // analysis to fold the inherited `data.strides[i]` field reads.
+struct static_array_t : array_t<T> {
+    // ``static constexpr`` mirrors of the template args.  Looking
+    // these up by a constexpr index gives an unconditional literal
+    // (no reliance on NVRTC inlining of field reads), which is what
+    // ``BakedArrayLike`` and ``shape_at<I>`` below depend on.
     static constexpr int baked_ndim = Ndim;
     static constexpr int baked_shape[ARRAY_MAX_DIMS] = { S0, S1, S2, S3 };
     static constexpr int baked_strides[ARRAY_MAX_DIMS] = { St0, St1, St2, St3 };
 
-    // Default ctor: leaves inherited array_t<T> default-initialized
-    // (data=nullptr, fields zero).  Used when codegen declares a
-    // view-result local as `baked_array_t<...> var_X;` and assigns
-    // the return value of `wp::view(...)` later — the write-once
-    // assignment overwrites all fields, NVRTC eliminates the dead
-    // zero-init writes.  Lets the local carry its static type
-    // through downstream consumers (tile_load, etc.) instead of
-    // being slice-assigned to a plain `array_t<T>`.
-    CUDA_CALLABLE baked_array_t() = default;
+    // Default ctor leaves the inherited fields zero-init.  Required
+    // so codegen can declare a view-result local and assign the
+    // ``wp::view(...)`` return value into it later — the assignment
+    // overwrites every field, and the dead init writes drop out.
+    CUDA_CALLABLE static_array_t() = default;
 
-    // Single-arg ctor: take the runtime data pointer; populate the
-    // inherited array_t<T> fields from the compile-time template args.
-    // The writes are constexpr-known values, so NVRTC folds them
-    // away and any subsequent `src.shape[i]` / `src.strides[i]` /
-    // `src.ndim` read in a generic consumer collapses to a literal.
-    CUDA_CALLABLE baked_array_t(T* data_ptr)
+    // Populate the inherited ``array_t<T>`` runtime fields from the
+    // template args so a base-class read of ``src.shape[i]`` /
+    // ``src.strides[i]`` / ``src.ndim`` folds to a literal.
+    CUDA_CALLABLE static_array_t(T* data_ptr)
     {
         this->data = data_ptr;
         this->grad = nullptr;
@@ -361,33 +337,14 @@ struct baked_array_t : array_t<T> {
 };
 
 
-// ---- Concepts for array-like proxies ----
-//
-// ``ArrayLike``       — any Warp array proxy with the inherited
-//                       ``array_t<T>`` shape/strides/data layout.
-//                       Witnessed by direct field access; both
-//                       ``array_t<T>`` and ``baked_array_t<T,...>``
-//                       (which derives from ``array_t<T>``) satisfy
-//                       it.  Other Warp array kinds
-//                       (``indexedarray_t``, ``fabricarray_t``, ...)
-//                       have different field layouts and do NOT
-//                       satisfy ArrayLike — they go through their
-//                       own ``index()`` overloads.
-// ``BakedArrayLike``  — refinement of ArrayLike that exposes the
-//                       spec-feature's static NTTPs (``baked_ndim`` /
-//                       ``baked_shape`` / ``baked_strides``).  Used
-//                       by the ``if constexpr`` branch in
-//                       ``shape_at<I>`` / ``strides_at<I>`` below
-//                       and a defensive ``static_assert`` to catch
-//                       contract drift.
-//
-// Gated on C++20: the JIT CUDA build uses ``--std=c++20`` so NVRTC
-// gets the concept check.  The CPU clang build is C++17 by default
-// and never instantiates ``baked_array_t`` anyway (spec is CUDA-only)
-// — concept definitions are skipped there.  No ``<concepts>`` /
-// ``<type_traits>`` dependencies (NVRTC's kernel environment doesn't
-// pull those in).
-#if __cplusplus >= 202002L
+// ``ArrayLike`` is satisfied by ``array_t<T>`` and its
+// ``static_array_t<T,...>`` subclass — the two proxies that share the
+// ``data`` / ``shape`` / ``strides`` layout.  ``indexedarray_t``,
+// ``fabricarray_t``, etc. have different layouts and stay on their
+// own ``index()`` overloads.  ``BakedArrayLike`` refines ArrayLike
+// with the static NTTPs ``baked_ndim`` / ``baked_shape`` /
+// ``baked_strides`` and gates the ``if constexpr`` branch in
+// ``shape_at<I>`` / ``strides_at<I>``.
 template <typename A>
 concept ArrayLike = requires(A a) {
     typename A::Type;
@@ -402,28 +359,13 @@ concept BakedArrayLike = ArrayLike<A> && requires {
     A::baked_shape[0];
     A::baked_strides[0];
 };
-#endif
 
 
-// ---- Compile-time-indexed shape/stride access ----
-//
-// ``shape_at<I>(a)`` and ``strides_at<I>(a)`` are the per-axis
-// accessors used by the unified ``address`` / ``array_store`` /
-// ``atomic_*`` path and by ``tile_global_t::index_from_coord`` /
-// ``compute_index``.  ``I`` is a template parameter — guaranteed
-// constant expression by the C++ standard.
-//
-// For ``BakedArrayLike`` (``baked_array_t<...>``), the ``if constexpr``
-// branch selects ``A::baked_shape[I]`` / ``A::baked_strides[I]``,
-// which are ``static constexpr`` array members.  The result is a
-// literal NTTP value at compile time — no runtime ternary, no
-// dependency on NVRTC inlining or unroll heuristics.
-//
-// For runtime arrays (``array_t<T>``), the read is ``a.shape[I]`` /
-// ``a.strides[I]``: a runtime field access at a compile-time index.
-// CPU build (C++17) only ever instantiates these for ``array_t<T>``;
-// the baked branch is gated behind C++20.
-#if __cplusplus >= 202002L
+// Per-axis shape/stride accessor with a compile-time index.  For
+// ``BakedArrayLike`` it resolves to the static NTTP mirror (an
+// unconditional literal); for plain ``array_t<T>`` it falls back to
+// the runtime field.  ``I`` is a template parameter so the constexpr
+// branch is unambiguous.
 template <int I, typename A>
 constexpr int shape_at(const A& a)
 {
@@ -443,13 +385,6 @@ constexpr int strides_at(const A& a)
         return a.strides[I];
     }
 }
-#else
-template <int I, typename A>
-inline int shape_at(const A& a) { return a.shape[I]; }
-
-template <int I, typename A>
-inline int strides_at(const A& a) { return a.strides[I]; }
-#endif
 
 
 // Required when compiling adjoints.
@@ -989,19 +924,12 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int 
 }
 
 
-// view() overloads for baked_array_t with int indices.  The result is
-// itself a baked_array_t whose template args are shifted dims/strides
-// from the source — the new shape/strides are pure rearrangements of
-// the source's compile-time values, so they stay template-encoded.
-// Only the runtime data pointer (offset by the index args) carries
-// runtime info.  No `array_t<T>` materialisation, no `shape_t` field
-// writes in the C++ source.  Downstream consumers taking `array_t<T>&`
-// accept the returned baked_array_t via base-class upcast (the
-// inherited fields are populated by the returned baked_array_t's
-// ctor — those writes are constexpr and NVRTC folds them).
+// All-int ``view`` on a baked source returns another baked array
+// with shifted template args.  Shapes and strides stay encoded in
+// the type; only the data pointer carries runtime info.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 1, S1, S2, S3, 0, St1, St2, St3, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i)
+CUDA_CALLABLE inline static_array_t<T, Ndim - 1, S1, S2, S3, 0, St1, St2, St3, 0>
+view(const static_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i)
 {
     static_assert(Ndim > 1, "view(arr, int) requires ndim > 1");
     assert(i >= -S0 && i < S0);
@@ -1014,8 +942,8 @@ view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int 
 }
 
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 2, S2, S3, 0, 0, St2, St3, 0, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j)
+CUDA_CALLABLE inline static_array_t<T, Ndim - 2, S2, S3, 0, 0, St2, St3, 0, 0>
+view(const static_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j)
 {
     static_assert(Ndim > 2, "view(arr, int, int) requires ndim > 2");
     assert(i >= -S0 && i < S0);
@@ -1032,8 +960,8 @@ view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int 
 }
 
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 3, S3, 0, 0, 0, St3, 0, 0, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j, int k)
+CUDA_CALLABLE inline static_array_t<T, Ndim - 3, S3, 0, 0, 0, St3, 0, 0, 0>
+view(const static_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j, int k)
 {
     static_assert(Ndim > 3, "view(arr, int, int, int) requires ndim > 3");
     assert(i >= -S0 && i < S0);
@@ -1479,37 +1407,27 @@ inline CUDA_CALLABLE void array_store(const A<T>& buf, int i, int j, int k, int 
 }
 
 // Contracts: ``array_t<T>`` must satisfy ``ArrayLike`` and
-// ``baked_array_t<T,...>`` must satisfy ``BakedArrayLike``.  Verified
+// ``static_array_t<T,...>`` must satisfy ``BakedArrayLike``.  Verified
 // once here so a future refactor that drops a required member fails
 // compile right at the struct rather than silently mis-resolving
-// overloads at every call site.  CUDA-only (CPU build is C++17).
-#if __cplusplus >= 202002L
+// overloads at every call site.
 static_assert(ArrayLike<array_t<float>>,
               "array_t<T> must satisfy ArrayLike concept");
-static_assert(BakedArrayLike<baked_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
-              "baked_array_t must satisfy BakedArrayLike concept");
-#endif
+static_assert(BakedArrayLike<static_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
+              "static_array_t must satisfy BakedArrayLike concept");
 
 
-// ---- Unified address / array_store / atomic_* for ArrayLike sources ----
-//
-// One body per (op, ndim) handles both ``array_t<T>`` (runtime
-// shape/strides) and ``baked_array_t<T, NTTPs...>`` (compile-time
-// NTTPs).  Per-axis stride/shape access goes through ``shape_at<I>``
-// / ``strides_at<I>`` — template indices, with ``if constexpr``
-// selecting the NTTP for baked or the runtime field for generic.
-// Guaranteed compile-time resolution where applicable (no
-// PRAGMA_UNROLL, no NVRTC inlining assumption).
-//
-// Overload precedence: the ``ArrayLike``-constrained templates below
-// outrank the legacy ``template<template<typename> class A, typename T>``
-// overloads earlier in this file (C++20 partial ordering rules), so
-// ``array_t<T>`` and ``baked_array_t<T,...>`` both resolve here.
-// ``indexedarray_t<T>``, ``fabricarray_t<T>``, etc. have different
-// field layouts and don't satisfy ``ArrayLike`` — they fall through
-// to the legacy path's ``index()`` overloads.
-#if __cplusplus >= 202002L
-
+// Unified ``address`` / ``array_store`` / ``atomic_*`` for any
+// ``ArrayLike`` source.  One body per (op, ndim) covers both
+// ``array_t<T>`` (runtime shape/strides) and
+// ``static_array_t<T, NTTPs...>`` (compile-time mirrors) — the
+// ``shape_at<I>`` / ``strides_at<I>`` helpers pick the right read.
+// The C++20 partial-ordering rules let these constrained overloads
+// outrank the older ``template<template<typename> class A, typename T>``
+// overloads earlier in this file, so ``array_t<T>`` and
+// ``static_array_t<T,...>`` resolve here while ``indexedarray_t``,
+// ``fabricarray_t``, etc. (which don't satisfy ``ArrayLike``) keep
+// using their own ``index()`` overloads.
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i)
 {
@@ -1581,8 +1499,6 @@ template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, i
 template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, int j, int k, typename A::Type o, typename A::Type n)         { return atomic_cas(address(a, i, j, k), o, n); }
 template <ArrayLike A> inline CUDA_CALLABLE auto atomic_cas(const A& a, int i, int j, int k, int l, typename A::Type o, typename A::Type n)  { return atomic_cas(address(a, i, j, k, l), o, n); }
 
-#endif  // __cplusplus >= 202002L
-
 template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 {
     FP_VERIFY_FWD(value)
@@ -1590,18 +1506,18 @@ template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
     *address = value;
 }
 
-// Specific overload for storing a baked_array_t value into an
+// Specific overload for storing a static_array_t value into an
 // ``array_t<T>*`` slot (e.g. ``geom1.vert = mesh_vert`` where the
 // struct field is ``array_t<vec3>`` and the kernel arg ``mesh_vert``
-// is declared as ``baked_array_t<vec3, ...>``).  Without this,
+// is declared as ``static_array_t<vec3, ...>``).  Without this,
 // ``wp::store(T*, T)`` fails template deduction because the two args'
-// Ts (``array_t<vec3>`` vs ``baked_array_t<vec3, ...>``) don't match
+// Ts (``array_t<vec3>`` vs ``static_array_t<vec3, ...>``) don't match
 // — implicit conversion isn't considered during deduction.  The
 // slicing assignment to the base subobject preserves data + the
 // inherited runtime fields populated by the baked ctor.
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
 inline CUDA_CALLABLE void
-store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& value)
+store(array_t<T>* address, const static_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& value)
 {
     *address = value;
 }

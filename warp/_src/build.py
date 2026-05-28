@@ -74,7 +74,7 @@ def build_cuda(
         pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
         arch_suffix_bytes = arch_suffix.encode("utf-8")
 
-        # Phase AA: NVRTC name expressions for templated spec kernels.
+        # NVRTC name expressions for templated spec kernels.
         if name_expressions:
             expr_bytes = [e.encode("utf-8") for e in name_expressions]
             arr_expr = (ctypes.c_char_p * len(expr_bytes))(*expr_bytes)
