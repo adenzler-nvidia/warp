@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import inspect
+import linecache
+import math
 import sys
 import unittest
+from unittest import mock
 
 import warp as wp
 from warp.tests.unittest_utils import *
@@ -1321,7 +1325,418 @@ def test_augassign_no_double_eval_both(test, device):
     test.assertAlmostEqual(data.numpy()[0][0], 15.0)
 
 
+@wp.func
+def func_to_local_double(a: float):
+    return a * 2.0
+
+
+@wp.func
+def func_to_local_square(a: float):
+    return a * a
+
+
+@wp.func
+def func_to_local_halve(a: float):
+    return a * 0.5
+
+
+func_to_local_handlers = {"double": func_to_local_double, "square": func_to_local_square}
+
+
+# Binding a @wp.func to a local and calling through it should behave like calling it directly.
+@wp.kernel
+def assign_function_to_local_kernel(out: wp.array(dtype=float)):
+    f = func_to_local_double
+    out[0] = f(3.0)
+
+
+# A function reached through wp.static(...) can be bound to a local and called.
+@wp.kernel
+def assign_static_function_to_local_kernel(out: wp.array(dtype=float)):
+    add = wp.static(func_to_local_handlers["double"])
+    sq = wp.static(func_to_local_handlers["square"])
+    out[0] = add(3.0)
+    out[1] = sq(3.0)
+
+
+# wp.grad() of a function that was first bound to a local should match wp.grad() of the function.
+@wp.kernel(enable_backward=False)
+def grad_of_function_bound_to_local_kernel(out: wp.array(dtype=float)):
+    f = func_to_local_square
+    g = wp.grad(f)
+    out[0] = g(3.0)  # d/da a^2 = 2a = 6 at a = 3
+
+
+def test_assign_function_to_local(test, device):
+    out = wp.zeros(1, dtype=float, device=device)
+    wp.launch(assign_function_to_local_kernel, dim=1, outputs=[out], device=device)
+    test.assertEqual(out.numpy()[0], 6.0)
+
+
+def test_assign_static_function_to_local(test, device):
+    out = wp.zeros(2, dtype=float, device=device)
+    wp.launch(assign_static_function_to_local_kernel, dim=1, outputs=[out], device=device)
+    test.assertEqual(out.numpy()[0], 6.0)
+    test.assertEqual(out.numpy()[1], 9.0)
+
+
+def test_grad_of_function_bound_to_local(test, device):
+    out = wp.zeros(1, dtype=float, device=device)
+    wp.launch(grad_of_function_bound_to_local_kernel, dim=1, outputs=[out], device=device)
+    test.assertEqual(out.numpy()[0], 6.0)
+
+
+# Rebinding a function-valued local to a different function has no codegen-able meaning
+# (Warp has no function pointers) and should raise a clear error rather than miscompile.
+def test_rebind_function_local_errors(test, device):
+    @wp.kernel
+    def rebind_function_local_kernel(out: wp.array(dtype=float)):
+        f = func_to_local_double
+        f = func_to_local_halve
+        out[0] = f(3.0)
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "rebinding function-valued local"):
+        wp.launch(rebind_function_local_kernel, dim=1, outputs=[wp.zeros(1, dtype=float, device=device)], device=device)
+
+
+# Rebinding a function-valued local to a non-function value (e.g. `f = some_func; f = 1.0`) has no
+# codegen-able meaning either and should raise a clear error rather than fail on the generic type check.
+def test_rebind_function_local_to_value_errors(test, device):
+    @wp.kernel
+    def rebind_function_local_to_value_kernel(out: wp.array(dtype=float)):
+        f = func_to_local_double
+        f = 1.0
+        out[0] = f
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "rebinding function-valued local.*non-function"):
+        wp.launch(
+            rebind_function_local_to_value_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+@wp.func
+def gradwrapper_rebind_square(x: float):
+    return x * x
+
+
+def test_rebind_gradwrapper_local_to_value_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_to_value_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g = 1.0
+        out[0] = g
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_to_value_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+def test_rebind_gradwrapper_local_through_tuple_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_through_tuple_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g, x = (1.0, 2.0)
+        out[0] = x
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_through_tuple_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+def test_rebind_gradwrapper_local_through_augassign_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_through_augassign_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g += 1.0
+        out[0] = 1.0
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_through_augassign_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+F64_CONST = wp.constant(wp.float64(2.0 * math.pi))
+I64_CONST = wp.constant(wp.int64(7))
+
+
+@wp.kernel(module="test_unary_minus_on_64bit_constant_f64")
+def _unary_minus_f64_kernel(values: wp.array(dtype=wp.float64), out: wp.array(dtype=wp.float64)):
+    b = values[0]
+    c = values[1]
+    out[0] = -F64_CONST * b / (c * c)
+
+
+@wp.kernel(module="test_unary_minus_on_64bit_constant_i64")
+def _unary_minus_i64_kernel(values: wp.array(dtype=wp.int64), out: wp.array(dtype=wp.int64)):
+    out[0] = -I64_CONST * values[0]
+
+
+def test_unary_minus_on_64bit_constant(test, device):
+    b, c = 3.0, 5.0
+    expected_f64 = -(2.0 * math.pi) * b / (c * c)
+    values_f64 = wp.array([b, c], dtype=wp.float64, device=device)
+    out_f64 = wp.zeros(1, dtype=wp.float64, device=device)
+    wp.launch(_unary_minus_f64_kernel, dim=1, inputs=[values_f64, out_f64], device=device)
+
+    values_i64 = wp.array([2], dtype=wp.int64, device=device)
+    out_i64 = wp.zeros(1, dtype=wp.int64, device=device)
+    wp.launch(_unary_minus_i64_kernel, dim=1, inputs=[values_i64, out_i64], device=device)
+
+    np.testing.assert_allclose(out_f64.numpy(), [expected_f64], rtol=1e-15)
+    np.testing.assert_array_equal(out_i64.numpy(), [-7 * 2])
+
+
 class TestCodeGen(unittest.TestCase):
+    def _make_adjoint_with_filename(self, filename):
+        source = "def kernel_fn(x: int):\n    y = x + 1\n    return y\n"
+        linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+        namespace = {}
+        try:
+            exec(compile(source, filename, "exec"), namespace)
+            adj = wp._src.codegen.Adjoint(namespace["kernel_fn"])
+            adj.builder_options = {"lineinfo": True, "line_directives": True, "mode": "release"}
+            return adj
+        finally:
+            linecache.cache.pop(filename, None)
+
+    def test_line_directive_escapes_filename(self):
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, 'warp_poc"\n\r\t\x00\x1f\x7fint injected_from_filename;\n//.py')
+            adj = self._make_adjoint_with_filename(os.path.join(tmpdir, "warp_poc.py"))
+            adj.filename = filename
+
+            directive = adj.get_line_directive("int x;", 0)
+
+            normalized_dir = tmpdir.replace("\\", "/")
+            self.assertEqual(
+                directive,
+                f'#line 1 "{normalized_dir}/warp_poc\\"\\n\\r\\t\\000\\037\\177int injected_from_filename;\\n//.py"',
+            )
+            self.assertEqual(directive.count("\n"), 0)
+
+    def test_line_directive_preserves_normalized_path(self):
+        filename = "C:\\warp\\kernels\\example.py"
+        adj = self._make_adjoint_with_filename(filename)
+
+        directive = adj.get_line_directive("int x;", 0)
+
+        self.assertEqual(directive, '#line 1 "C:/warp/kernels/example.py"')
+
+    def test_extract_function_source_slow_path_when_fast_returns_none(self):
+        """When ``_try_extract_function_source`` returns ``None`` (e.g. for an
+        ``exec``-defined function with no linecache entry), ``extract_function_source``
+        falls through to ``inspect.getsourcelines`` exactly once and parses its result.
+        """
+        from warp._src import codegen  # noqa: PLC0415
+
+        slow_source = "def generated():\n    return 42\n"
+
+        with mock.patch.object(codegen.Adjoint, "_try_extract_function_source", return_value=None):
+            with mock.patch.object(codegen.inspect, "getsourcelines", return_value=([slow_source], 123)) as get_lines:
+                source, lineno, tree = codegen.Adjoint.extract_function_source(lambda: None)
+
+        self.assertEqual(source, slow_source)  # already at column 0; dedent is a no-op
+        self.assertEqual(lineno, 123)
+        self.assertEqual(tree.body[0].name, "generated")
+        get_lines.assert_called_once()
+
+    def test_extract_function_source_fast_path_patterns(self):
+        """Every fixture in ``aux_test_extract_source_patterns`` is served by the
+        fast path. We force a hard failure if ``inspect.getsourcelines`` is ever
+        called, so each ``subTest`` proves the corresponding branch of the forward
+        walk produced a parseable slice on its own.
+        """
+        from warp._src import codegen  # noqa: PLC0415
+        from warp.tests import aux_test_extract_source_patterns as patterns  # noqa: PLC0415
+
+        fixtures = [
+            patterns.plain,
+            patterns.multiline_paren_return,
+            patterns.with_multiline_docstring,
+            patterns.with_indented_body_multiline_string,
+            patterns.with_nested_def,
+            patterns.trailing_body_comment,
+            patterns.async_function,
+            patterns.the_function_that_follows_the_comment,
+            patterns.plain_with_trailing_blanks,
+        ]
+
+        for fn in fixtures:
+            with self.subTest(fixture=fn.__name__):
+                # Sanity: the fast extractor produces *some* slice for the fixture.
+                fast = codegen.Adjoint._try_extract_function_source(fn.__code__)
+                self.assertIsNotNone(fast, f"fast extractor returned None for {fn.__name__}")
+
+                # Now run the full extraction with inspect.getsourcelines mocked to
+                # raise — if it gets called, the fast path failed for this pattern.
+                with mock.patch.object(
+                    codegen.inspect,
+                    "getsourcelines",
+                    side_effect=AssertionError(f"inspect.getsourcelines must not run for {fn.__name__}"),
+                ):
+                    _source, lineno, tree = codegen.Adjoint.extract_function_source(fn)
+
+                self.assertEqual(lineno, fn.__code__.co_firstlineno)
+                self.assertGreaterEqual(len(tree.body), 1)
+                self.assertIn(type(tree.body[0]), (ast.FunctionDef, ast.AsyncFunctionDef))
+                # body[0].name == co_name follows from the proof in extract_function_source's
+                # docstring; assert it as a regression check.
+                self.assertEqual(tree.body[0].name, fn.__code__.co_name)
+
+    def test_extract_function_source_unwraps_like_inspect(self):
+        """``extract_function_source`` follows ``__wrapped__`` so the fast path is
+        a true substitute for ``inspect.getsourcelines`` on ``functools.wraps``-style
+        decorators.
+        """
+        import functools  # noqa: PLC0415
+        import textwrap as _tw  # noqa: PLC0415
+
+        from warp._src import codegen  # noqa: PLC0415
+
+        def real_kernel():
+            return 42
+
+        @functools.wraps(real_kernel)
+        def wrapper():
+            return real_kernel()
+
+        # Confirm the fixture actually exercises the wrap: __code__ differs but
+        # __wrapped__ points back at real_kernel.
+        self.assertIs(wrapper.__wrapped__, real_kernel)
+        self.assertIsNot(wrapper.__code__, real_kernel.__code__)
+
+        reference_lines, _ = inspect.getsourcelines(wrapper)
+        reference_dedented = _tw.dedent("".join(reference_lines))
+
+        with mock.patch.object(codegen.inspect, "getsourcelines", side_effect=AssertionError("fast path should run")):
+            source, lineno, tree = codegen.Adjoint.extract_function_source(wrapper)
+
+        self.assertEqual(source, reference_dedented)
+        self.assertEqual(lineno, real_kernel.__code__.co_firstlineno)
+        self.assertEqual(tree.body[0].name, "real_kernel")
+
+    def test_adjoint_recovers_from_truncated_fast_extract(self):
+        """When the fast extractor truncates a multi-line string, the parse-time
+        fallback inside :meth:`extract_function_source` recovers via
+        ``inspect.getsourcelines``.
+        """
+        from warp._src import codegen  # noqa: PLC0415
+        from warp.tests.aux_test_extract_source_patterns import contains_truncating_string  # noqa: PLC0415
+
+        # Sanity: the fast path really does produce a truncated, unparsable slice
+        # for this fixture (otherwise the test would silently pass without exercising
+        # the fallback).
+        fast = codegen.Adjoint._try_extract_function_source(contains_truncating_string.__code__)
+        self.assertIsNotNone(fast)
+        with self.assertRaises(SyntaxError):
+            ast.parse(fast[0])
+
+        # The full extract must transparently fall back; tree, source, and the
+        # constructed Adjoint must all reflect the inspect-recovered source.
+        source, _lineno, tree = codegen.Adjoint.extract_function_source(contains_truncating_string)
+        self.assertEqual(tree.body[0].name, "contains_truncating_string")
+        import textwrap as _tw  # noqa: PLC0415
+
+        self.assertEqual(source, _tw.dedent(inspect.getsource(contains_truncating_string)))
+
+        adj = codegen.Adjoint(contains_truncating_string)
+        self.assertEqual(adj.tree.body[0].name, "contains_truncating_string")
+        self.assertEqual(adj.source, _tw.dedent(inspect.getsource(contains_truncating_string)))
+
+    def test_extract_function_source_refreshes_stale_linecache(self):
+        """The fast path must not accept stale ``linecache`` content for a file that
+        was rewritten and recompiled in the same process.
+        """
+        import linecache  # noqa: PLC0415
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        from warp._src import codegen  # noqa: PLC0415
+
+        def load_function(path, source):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(source)
+            namespace = {"__file__": path, "__name__": "stale_linecache_fixture"}
+            exec(compile(source, path, "exec"), namespace)
+            return namespace["stale_func"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "stale_linecache_fixture.py")
+            source_a = "def stale_func():\n    return 1\n"
+            source_b = "def stale_func():\n    return 22\n"
+
+            try:
+                func_a = load_function(path, source_a)
+                first_source, _, _ = codegen.Adjoint.extract_function_source(func_a)
+                self.assertEqual(first_source, source_a)
+
+                func_b = load_function(path, source_b)
+
+                source, _lineno, tree = codegen.Adjoint.extract_function_source(func_b)
+                self.assertEqual(source, source_b)
+                self.assertEqual(tree.body[0].name, "stale_func")
+            finally:
+                linecache.cache.pop(path, None)
+
+    def test_extract_function_source_rejects_non_function_fast_slice(self):
+        """If malformed line metadata makes the fast slice start inside a function,
+        the parse may still succeed. That slice must be rejected and recovered via
+        ``inspect.getsourcelines``.
+        """
+        import linecache  # noqa: PLC0415
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+        import types  # noqa: PLC0415
+
+        from warp._src import codegen  # noqa: PLC0415
+
+        source = "def line_shifted():\n    x = 1\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "line_metadata_fixture.py")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(source)
+                namespace = {"__file__": path, "__name__": "line_metadata_fixture"}
+                exec(compile(source, path, "exec"), namespace)
+
+                func = namespace["line_shifted"]
+                shifted_code = func.__code__.replace(co_firstlineno=func.__code__.co_firstlineno + 1)
+                shifted_func = types.FunctionType(shifted_code, func.__globals__, func.__name__)
+
+                with mock.patch.object(
+                    codegen.Adjoint,
+                    "_inspect_extract_function_source",
+                    return_value=(source, func.__code__.co_firstlineno),
+                ) as slow_extract:
+                    extracted_source, lineno, tree = codegen.Adjoint.extract_function_source(shifted_func)
+
+                self.assertEqual(extracted_source, source)
+                self.assertEqual(lineno, func.__code__.co_firstlineno)
+                self.assertIn(type(tree.body[0]), (ast.FunctionDef, ast.AsyncFunctionDef))
+                self.assertEqual(tree.body[0].name, "line_shifted")
+                slow_extract.assert_called_once_with(shifted_func)
+            finally:
+                linecache.cache.pop(path, None)
+
     def test_extract_lambda_source_parenthesized_multiline_body(self):
         from warp._src.codegen import Adjoint  # noqa: PLC0415
 
@@ -1333,6 +1748,61 @@ class TestCodeGen(unittest.TestCase):
         self.assertTrue(body.strip().endswith(")"))
         self.assertIn("q[0] == 0.0", body)
         ast.parse(f"def generated(q, qd):\n    return {body}\n")
+
+    def test_replace_static_expressions_replaces_call_in_ast(self):
+        """The walker actually mutates ``adj.tree``: every resolvable ``wp.static``
+        Call gets replaced with an ``ast.Constant`` (or ``ast.Name`` for a
+        Function result). This pins the deferred-replacement application step,
+        which is the only behavioural difference vs upstream's in-flight
+        replacement.
+        """
+        from warp._src import codegen  # noqa: PLC0415
+
+        _value_a = 7
+        _value_b = 13
+
+        def _kernel_with_two_statics(out: wp.array(dtype=int)):
+            i = wp.tid()
+            out[i] = wp.static(_value_a)
+            out[i] += wp.static(_value_b)
+
+        adj = codegen.Adjoint(_kernel_with_two_statics)
+
+        # No wp.static Calls should remain in the tree after replacement.
+        remaining_static_calls = [
+            node
+            for node in ast.walk(adj.tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "static"
+        ]
+        self.assertEqual(remaining_static_calls, [])
+
+        # Both constants should appear as ast.Constant nodes in the tree.
+        constants = {node.value for node in ast.walk(adj.tree) if isinstance(node, ast.Constant)}
+        self.assertIn(_value_a, constants)
+        self.assertIn(_value_b, constants)
+
+    def test_replace_static_expressions_defers_loop_var_reference(self):
+        """A ``wp.static`` call inside a ``for`` body that references the loop
+        variable must be deferred — ``has_unresolved_static_expressions`` set,
+        Call left in the AST for codegen-time resolution. This pins the
+        loop-variable tracking in ``visit_For`` / ``visit_Call``.
+        """
+        from warp._src import codegen  # noqa: PLC0415
+
+        def _kernel_with_loop_var_static(out: wp.array(dtype=int)):
+            for i in range(10):
+                out[i] = wp.static(i + 1)
+
+        adj = codegen.Adjoint(_kernel_with_loop_var_static)
+
+        self.assertTrue(adj.has_unresolved_static_expressions)
+        # wp.static(i + 1) should still be a Call in the AST (not eagerly replaced).
+        remaining_static_calls = [
+            node
+            for node in ast.walk(adj.tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "static"
+        ]
+        self.assertEqual(len(remaining_static_calls), 1)
 
 
 devices = get_test_devices()
@@ -1532,6 +2002,44 @@ add_function_test(
     TestCodeGen,
     "test_augassign_no_double_eval_both",
     test_augassign_no_double_eval_both,
+    devices=devices,
+)
+add_function_test(TestCodeGen, "test_assign_function_to_local", test_assign_function_to_local, devices=devices)
+add_function_test(
+    TestCodeGen, "test_assign_static_function_to_local", test_assign_static_function_to_local, devices=devices
+)
+add_function_test(
+    TestCodeGen, "test_grad_of_function_bound_to_local", test_grad_of_function_bound_to_local, devices=devices
+)
+add_function_test(TestCodeGen, "test_rebind_function_local_errors", test_rebind_function_local_errors, devices=devices)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_function_local_to_value_errors",
+    test_rebind_function_local_to_value_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_to_value_errors",
+    test_rebind_gradwrapper_local_to_value_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_through_tuple_errors",
+    test_rebind_gradwrapper_local_through_tuple_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_through_augassign_errors",
+    test_rebind_gradwrapper_local_through_augassign_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_unary_minus_on_64bit_constant",
+    test_unary_minus_on_64bit_constant,
     devices=devices,
 )
 

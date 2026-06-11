@@ -56,7 +56,9 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
@@ -159,7 +161,9 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
@@ -200,6 +204,12 @@ jobs:
               echo "uv Version:"
               uv --version
               echo ""
+              echo "CMake Version:"
+              cmake --version
+              echo ""
+              echo "Ninja Version:"
+              ninja --version
+              echo ""
               echo "Architecture:"
               uname -m
               echo ""
@@ -210,6 +220,16 @@ jobs:
               uv run build_lib.py --llvm-path /opt/llvm
               echo ""
               echo "=== Build Complete ==="
+              ls -lh warp/bin/
+              echo ""
+              echo "=== Building Warp with CMake ==="
+              rm -rf warp/bin _build/cmake-image
+              uv sync --no-install-project
+              export WARP_CACHE_ROOT="/tmp/warp-cache-cmake-image-${{ github.run_id }}-${{ matrix.cuda_version }}-${{ matrix.arch }}"
+              export WARP_CACHE_PATH="${WARP_CACHE_ROOT}"
+              cmake -S . -B _build/cmake-image -G Ninja -DWARP_LLVM_PATH=/opt/llvm
+              cmake --build _build/cmake-image --parallel
+              uv run python -c "import warp; info = warp.print_diagnostics(); assert not info[\"warp_native\"].startswith(\"unknown\"); assert not info[\"warp_clang\"].startswith(\"unknown\")"
               ls -lh warp/bin/
               echo ""
               echo "=== Building Python Wheel ==="

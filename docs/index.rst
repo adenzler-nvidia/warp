@@ -181,6 +181,7 @@ warp/examples/tile
     user_guide/tiles
     user_guide/interoperability
     user_guide/configuration
+    user_guide/cpp_cuda_workflows
     user_guide/debugging
     user_guide/limitations
     user_guide/contribution_guide
@@ -215,7 +216,6 @@ warp/examples/tile
     api_reference/warp_autograd
     api_reference/warp_config
     api_reference/warp_fem
-    api_reference/warp_jax
     api_reference/warp_optim
     api_reference/warp_render
     api_reference/warp_sparse

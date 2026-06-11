@@ -128,8 +128,6 @@ nitpick_ignore_regex = [
         r"py:obj",
         r".*\.(conjugate|bit_length|bit_count|to_bytes|from_bytes|as_integer_ratio|is_integer|real|imag|numerator|denominator)",
     ),
-    # jax_callable lives in warp.jax (jax itself is mocked)
-    (r"py:func", r"warp\.jax\.jax_callable"),
 ]
 
 
@@ -276,7 +274,9 @@ autosummary_filename_map = {
 }
 
 AUTOSUMMARY_ANNOTATION_OVERRIDES = {
-    "warp.config.launch_verification_mode": ": LaunchVerificationMode = warp.LaunchVerificationMode.RELAXED",
+    "warp.config.launch_array_access_mode": (
+        ": warp.config.LaunchArrayAccessMode = warp.config.LaunchArrayAccessMode.RELAXED"
+    ),
     "warp.config.log_level": ": int = warp.LOG_INFO",
 }
 
@@ -401,7 +401,7 @@ intersphinx_mapping = {
     "jax": ("https://docs.jax.dev/en/latest", None),
     "numpy": ("https://numpy.org/doc/stable", None),
     "python": ("https://docs.python.org/3", None),
-    "pytorch": ("https://pytorch.org/docs/stable", None),
+    "pytorch": ("https://docs.pytorch.org/docs/stable", None),
 }
 
 

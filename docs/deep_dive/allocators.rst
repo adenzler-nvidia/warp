@@ -246,7 +246,7 @@ Limitations
 Mempool-to-Mempool Copies Between GPUs During Graph Capture
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Copying data between different GPUs will fail during graph capture if the source and destination are allocated using mempool allocators and mempool access is not enabled between devices.  Note that this only applies to capturing mempool-to-mempool copies in a graph; copies done outside of graph capture are not affected.  Copies within the same mempool (i.e., same device) are also not affected.
+Copying data between different GPUs will fail during graph capture if the source and destination are allocated using mempool allocators and mempool access is not enabled between devices.  Note that this only applies to capturing mempool-to-mempool copies in a graph.  Copies done outside of graph capture are not affected.  Copies within the same mempool (i.e., same device) are also not affected.
 
 There are two workarounds.  If mempool access is supported, you can simply enable mempool access between the devices prior to graph capture, as shown in :ref:`mempool_access`.
 
@@ -332,8 +332,77 @@ during CUDA graph capture.
 
 See ``warp/examples/core/example_custom_allocator.py`` for a complete example.
 
-RMM Integration
-~~~~~~~~~~~~~~~
+.. _pytorch-cuda-caching-allocator:
+
+PyTorch CUDA Caching Allocator
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+PyTorch exposes low-level CUDA caching allocator functions that can be used by
+other frameworks. If an application wants Warp CUDA arrays to be allocated from
+PyTorch's cache, implement a small custom allocator that calls
+``torch.cuda.caching_allocator_alloc()`` and releases pointers with
+``torch.cuda.caching_allocator_delete()``:
+
+.. code:: python
+
+    import torch
+    import warp as wp
+
+
+    class TorchCachingAllocator:
+        """Route Warp CUDA array allocations through PyTorch."""
+
+        def __init__(self):
+            self._active_allocations = {}
+
+        @staticmethod
+        def _current_warp_device_and_stream():
+            device = wp.get_cuda_device()
+            stream = device.stream.cuda_stream
+            return device.ordinal, int(stream) if stream is not None else 0
+
+        def allocate(self, size_in_bytes: int) -> int:
+            if size_in_bytes == 0:
+                return 0
+
+            device, stream = self._current_warp_device_and_stream()
+            ptr = torch.cuda.caching_allocator_alloc(size_in_bytes, device=device, stream=stream)
+            ptr = int(ptr)
+            self._active_allocations[ptr] = size_in_bytes
+            return ptr
+
+        def deallocate(self, ptr: int, size_in_bytes: int) -> None:
+            if ptr == 0:
+                return
+
+            allocated_size = self._active_allocations.get(ptr)
+            if allocated_size is None:
+                raise RuntimeError(f"Unrecognized allocation pointer {ptr:#x}")
+            if allocated_size != size_in_bytes:
+                raise RuntimeError(
+                    f"Allocation size mismatch for pointer {ptr:#x}: "
+                    f"allocated {allocated_size}, deallocating {size_in_bytes}"
+                )
+
+            del self._active_allocations[ptr]
+            torch.cuda.caching_allocator_delete(ptr)
+
+
+    allocator = TorchCachingAllocator()
+    wp.set_cuda_allocator(allocator)
+    try:
+        a = wp.zeros(1000, dtype=wp.float32, device="cuda:0")
+    finally:
+        wp.set_cuda_allocator(None)
+
+PyTorch tracks the device and stream for pointers returned by
+``caching_allocator_alloc()``, so ``caching_allocator_delete()`` only needs the
+pointer. The ``_active_allocations`` dictionary above is for validation and
+debugging. Applications can customize this tracking for their own accounting,
+thread-safety, or distributed runtime needs.
+
+RAPIDS Memory Manager (RMM) Integration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 `RAPIDS Memory Manager (RMM) <https://github.com/rapidsai/rmm>`_ provides high-performance
 pooled allocators for CUDA. Warp includes a built-in adapter, :class:`~warp.utils.AllocatorRmm`, that

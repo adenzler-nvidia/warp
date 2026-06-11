@@ -84,7 +84,6 @@ from warp._src.texture import TextureResourceFlags as TextureResourceFlags
 from warp._src.texture import GLTextureResource as GLTextureResource
 from warp._src.texture import TextureFilterMode as TextureFilterMode
 from warp._src.texture import TextureAddressMode as TextureAddressMode
-from warp.config import LaunchVerificationMode as LaunchVerificationMode
 from warp._src.context import init as init
 from warp._src.context import is_cpu_available as is_cpu_available
 from warp._src.context import is_cubql_available as is_cubql_available
@@ -221,6 +220,11 @@ from warp._src.jax import dtype_from_jax as dtype_from_jax
 from warp._src.jax import dtype_to_jax as dtype_to_jax
 from warp._src.jax import device_from_jax as device_from_jax
 from warp._src.jax import device_to_jax as device_to_jax
+from warp._src.jax.ffi import JaxCallableGraphMode as JaxCallableGraphMode
+from warp._src.jax.ffi import JaxModulePreloadMode as JaxModulePreloadMode
+from warp._src.jax.ffi import clear_jax_callable_graph_cache as clear_jax_callable_graph_cache
+from warp._src.jax.ffi import jax_callable as jax_callable
+from warp._src.jax.ffi import jax_kernel as jax_kernel
 from warp._src.torch import from_torch as from_torch
 from warp._src.torch import to_torch as to_torch
 from warp._src.torch import dtype_from_torch as dtype_from_torch
@@ -5090,7 +5094,7 @@ def volume_world_to_index_dir(id: uint64, xyz: vec3d) -> vec3d:
     ...
 
 @over
-def texture_sample(tex: Texture1D, u: float32, dtype: Any) -> Any:
+def texture_sample(tex: Texture1D, u: float32, dtype: Any, lod: float32) -> Any:
     """Sample the 1D texture at the given U coordinate.
 
     .. admonition:: Experimental
@@ -5102,6 +5106,10 @@ def texture_sample(tex: Texture1D, u: float32, dtype: Any) -> Any:
         u: U coordinate. Range is [0, 1] if the texture was created with
             ``normalized_coords=True`` (default), or [0, width] if ``normalized_coords=False``.
         dtype: The return type (``float``, :class:`warp.vec2f`, or :class:`warp.vec4f`).
+        lod: Mipmap level-of-detail as a float. When omitted, the base mip level is sampled
+            using the non-LOD code path. Fractional values blend between neighbouring mip
+            levels when ``mip_filter_mode`` is :attr:`warp.TextureFilterMode.LINEAR`.
+            Ignored for textures created with a single mip level.
 
     Returns:
         The sampled value of the specified ``dtype``.
@@ -5110,7 +5118,7 @@ def texture_sample(tex: Texture1D, u: float32, dtype: Any) -> Any:
     ...
 
 @over
-def texture_sample(tex: Texture2D, uv: vec2f, dtype: Any) -> Any:
+def texture_sample(tex: Texture2D, uv: vec2f, dtype: Any, lod: float32) -> Any:
     """Sample the 2D texture at the given UV coordinates.
 
     .. admonition:: Experimental
@@ -5122,6 +5130,10 @@ def texture_sample(tex: Texture2D, uv: vec2f, dtype: Any) -> Any:
         uv: UV coordinates as a :class:`warp.vec2f`. Range is [0, 1] if the texture was created with
             ``normalized_coords=True`` (default), or [0, width] x [0, height] if ``normalized_coords=False``.
         dtype: The return type (``float``, :class:`warp.vec2f`, or :class:`warp.vec4f`).
+        lod: Mipmap level-of-detail as a float. When omitted, the base mip level is sampled
+            using the non-LOD code path. Fractional values blend between neighbouring mip
+            levels when ``mip_filter_mode`` is :attr:`warp.TextureFilterMode.LINEAR`.
+            Ignored for textures created with a single mip level.
 
     Returns:
         The sampled value of the specified ``dtype``.
@@ -5130,7 +5142,7 @@ def texture_sample(tex: Texture2D, uv: vec2f, dtype: Any) -> Any:
     ...
 
 @over
-def texture_sample(tex: Texture2D, u: float32, v: float32, dtype: Any) -> Any:
+def texture_sample(tex: Texture2D, u: float32, v: float32, dtype: Any, lod: float32) -> Any:
     """Sample the 2D texture at the given UV coordinates.
 
     .. admonition:: Experimental
@@ -5144,6 +5156,10 @@ def texture_sample(tex: Texture2D, u: float32, v: float32, dtype: Any) -> Any:
         v: V coordinate. Range is [0, 1] if the texture was created with
             ``normalized_coords=True`` (default), or [0, height] if ``normalized_coords=False``.
         dtype: The return type (``float``, :class:`warp.vec2f`, or :class:`warp.vec4f`).
+        lod: Mipmap level-of-detail as a float. When omitted, the base mip level is sampled
+            using the non-LOD code path. Fractional values blend between neighbouring mip
+            levels when ``mip_filter_mode`` is :attr:`warp.TextureFilterMode.LINEAR`.
+            Ignored for textures created with a single mip level.
 
     Returns:
         The sampled value of the specified ``dtype``.
@@ -5152,7 +5168,7 @@ def texture_sample(tex: Texture2D, u: float32, v: float32, dtype: Any) -> Any:
     ...
 
 @over
-def texture_sample(tex: Texture3D, uvw: vec3f, dtype: Any) -> Any:
+def texture_sample(tex: Texture3D, uvw: vec3f, dtype: Any, lod: float32) -> Any:
     """Sample the 3D texture at the given UVW coordinates.
 
     .. admonition:: Experimental
@@ -5164,6 +5180,10 @@ def texture_sample(tex: Texture3D, uvw: vec3f, dtype: Any) -> Any:
         uvw: UVW coordinates as a :class:`warp.vec3f`. Range is [0, 1] if the texture was created with
             ``normalized_coords=True`` (default), or [0, width] x [0, height] x [0, depth] if ``normalized_coords=False``.
         dtype: The return type (``float``, :class:`warp.vec2f`, or :class:`warp.vec4f`).
+        lod: Mipmap level-of-detail as a float. When omitted, the base mip level is sampled
+            using the non-LOD code path. Fractional values blend between neighbouring mip
+            levels when ``mip_filter_mode`` is :attr:`warp.TextureFilterMode.LINEAR`.
+            Ignored for textures created with a single mip level.
 
     Returns:
         The sampled value of the specified ``dtype``.
@@ -5172,7 +5192,7 @@ def texture_sample(tex: Texture3D, uvw: vec3f, dtype: Any) -> Any:
     ...
 
 @over
-def texture_sample(tex: Texture3D, u: float32, v: float32, w: float32, dtype: Any) -> Any:
+def texture_sample(tex: Texture3D, u: float32, v: float32, w: float32, dtype: Any, lod: float32) -> Any:
     """Sample the 3D texture at the given UVW coordinates.
 
     .. admonition:: Experimental
@@ -5188,6 +5208,10 @@ def texture_sample(tex: Texture3D, u: float32, v: float32, w: float32, dtype: An
         w: W coordinate. Range is [0, 1] if the texture was created with
             ``normalized_coords=True`` (default), or [0, depth] if ``normalized_coords=False``.
         dtype: The return type (``float``, :class:`warp.vec2f`, or :class:`warp.vec4f`).
+        lod: Mipmap level-of-detail as a float. When omitted, the base mip level is sampled
+            using the non-LOD code path. Fractional values blend between neighbouring mip
+            levels when ``mip_filter_mode`` is :attr:`warp.TextureFilterMode.LINEAR`.
+            Ignored for textures created with a single mip level.
 
     Returns:
         The sampled value of the specified ``dtype``.
@@ -5414,6 +5438,8 @@ def tid() -> int | tuple[int, int] | tuple[int, int, int] | tuple[int, int, int,
     The indices correspond to the thread's position in the kernel launch grid.
     If fewer indices are requested than the launch dimensionality, only the
     leading indices are returned.
+    For multi-dimensional launches, the linear thread order is unraveled in
+    row-major order, with the last launch dimension varying fastest.
 
     This function may not be called from user-defined Warp functions."""
     ...

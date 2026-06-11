@@ -23,43 +23,6 @@ actively maintained set of Warp tutorials:
           :target: https://colab.research.google.com/github/NVIDIA/accelerated-computing-hub/blob/32fe3d5a448446fd52c14a6726e1b867cbfed2d9/Accelerated_Python_User_Guide/notebooks/Chapter_12.1_IsingModel_In_Warp.ipynb
           :alt: Open In Colab
 
-Additionally, several notebooks in the `notebooks <https://github.com/NVIDIA/warp/tree/main/notebooks>`_ directory
-provide additional examples and cover key Warp features:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Notebook
-     - Colab Link
-   * - `Warp Core Tutorial: Basics <https://github.com/NVIDIA/warp/blob/main/notebooks/core_01_basics.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/core_01_basics.ipynb
-          :alt: Open In Colab
-   * - `Warp Core Tutorial: Generics <https://github.com/NVIDIA/warp/blob/main/notebooks/core_02_generics.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/core_02_generics.ipynb
-          :alt: Open In Colab
-   * - `Warp Core Tutorial: Points <https://github.com/NVIDIA/warp/blob/main/notebooks/core_03_points.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/core_03_points.ipynb
-          :alt: Open In Colab
-   * - `Warp Core Tutorial: Meshes <https://github.com/NVIDIA/warp/blob/main/notebooks/core_04_meshes.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/core_04_meshes.ipynb
-          :alt: Open In Colab
-   * - `Warp Core Tutorial: Volumes <https://github.com/NVIDIA/warp/blob/main/notebooks/core_05_volumes.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/core_05_volumes.ipynb
-          :alt: Open In Colab
-   * - `Warp PyTorch Tutorial: Basics <https://github.com/NVIDIA/warp/blob/main/notebooks/pytorch_01_basics.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/pytorch_01_basics.ipynb
-          :alt: Open In Colab
-   * - `Warp PyTorch Tutorial: Custom Operators <https://github.com/NVIDIA/warp/blob/main/notebooks/pytorch_02_custom_operators.ipynb>`_
-     - .. image:: https://colab.research.google.com/assets/colab-badge.svg
-          :target: https://colab.research.google.com/github/NVIDIA/warp/blob/main/notebooks/pytorch_02_custom_operators.ipynb
-          :alt: Open In Colab
-
 .. _warp-initialization:
 
 Initialization
@@ -154,6 +117,48 @@ We retrieve a 2D thread index inside the kernel by using multiple assignment whe
         # get thread index
         i, j = wp.tid()
 
+.. _large_launch_indexing:
+
+Large array indexing
+^^^^^^^^^^^^^^^^^^^^
+
+For multi-dimensional launches, Warp derives the coordinates from a linear
+thread order in row-major form, with the last dimension varying fastest. This
+matches the default contiguous Warp array layout, so adjacent threads that
+differ only in the last index access adjacent array elements. On CUDA devices,
+this is the preferred pattern for coalesced global memory access.
+
+This is also useful when a logical data set has more than :math:`2^{31}-1`
+elements. Because each array dimension must fit in a signed 32-bit integer,
+store the data across multiple dimensions, launch over the array shape, and
+construct a 64-bit linear index when the algorithm is naturally expressed in
+1D:
+
+.. code-block:: python
+
+    @wp.kernel
+    def process_large_array(values: wp.array2d[wp.float32], logical_size: wp.int64):
+        i, j = wp.tid()
+
+        linear = wp.int64(i) * wp.int64(values.shape[1]) + wp.int64(j)
+        if linear < logical_size:
+            values[i, j] = float(linear % wp.int64(1024))
+
+    rows = 1 << 20
+    cols = 1 << 12
+    logical_size = (1 << 32) - 123
+    values = wp.empty((rows, cols), dtype=wp.float32, device="cuda")
+    wp.launch(
+        process_large_array,
+        dim=values.shape,
+        inputs=[values, wp.int64(logical_size)],
+        device=values.device,
+    )
+
+Here, the array shape pads the allocation beyond ``logical_size``. The bounds
+check skips those padded elements while preserving coalesced access for the
+contiguous region.
+
 Arrays
 ------
 
@@ -207,6 +212,40 @@ This will automatically synchronize with the GPU to ensure that any outstanding 
 copy the array back to CPU memory where it is passed to NumPy.
 Calling :func:`array.numpy` on a CPU array will return a zero-copy NumPy view
 onto the Warp data.
+
+At Python scope, slicing a Warp array returns a zero-copy view into the same
+allocation. Views can be non-contiguous when the slice changes the memory
+stride:
+
+.. testcode::
+
+    a = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), dtype=wp.float32, device="cpu")
+
+    view = a[:, ::2]
+    print(view)
+    print(view.is_contiguous)
+
+    view.fill_(-1.0)
+    print(a)
+
+.. testoutput::
+
+    [[ 0.  2.]
+     [ 4.  6.]
+     [ 8. 10.]]
+    False
+    [[-1.  1. -1.  3.]
+     [-1.  5. -1.  7.]
+     [-1.  9. -1. 11.]]
+
+Scalar item indexing is intentionally not supported on ``wp.array`` objects at
+Python scope, so ``a[0, 0]`` raises an error. Use slicing to create array views,
+or convert to NumPy with :meth:`array.numpy <warp.array.numpy>` when reading
+individual values on the host. Inside kernels, arrays still support element-wise
+indexing.
+
+This keeps host-side behavior consistent across CPU and GPU arrays and avoids
+encouraging per-element device synchronization or copies.
 
 Common operators such as ``+``, ``-``, ``*``, and ``/`` are overloaded for Warp arrays.
 For example, we can add two arrays together using the ``+`` operator:
@@ -311,8 +350,9 @@ determine the tile argument type:
 
 See :ref:`Generic Functions` for details on using ``typing.Any`` in user function signatures.
 
-See :doc:`differentiability` for details on how to define custom gradient functions,
-custom replay functions, and custom native functions.
+See :doc:`differentiability` for details on custom gradient and replay
+functions. See :doc:`cpp_cuda_workflows` for native C++/CUDA snippets and
+other non-Python integration workflows.
 
 User Structs
 --------------

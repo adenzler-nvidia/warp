@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import builtins
 import ctypes
 import errno
 import hashlib
@@ -22,6 +23,11 @@ _wp_module_name_ = "warp.build"
 nvJitLink_input_type = {"cubin": 1, "ptx": 2, "ltoir": 3, "fatbin": 4, "object": 5, "library": 6}
 
 warp_home = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+
+# LTO cache files use a truncated SHA-256 prefix. Sixteen hex characters give a
+# 64-bit key space, moving the birthday-bound 50% collision point to about
+# 5.1 billion unique symbols while keeping filenames compact.
+LTO_CACHE_KEY_LENGTH = 16
 
 
 # builds cuda source to PTX or CUBIN using NVRTC (output type determined by output_path extension)
@@ -53,8 +59,7 @@ def build_cuda(
     output_path = output_path.encode("utf-8")
 
     if llvm_cuda:
-        warp._src.context.runtime.llvm.wp_compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
-
+        err = warp._src.context.runtime.llvm.wp_compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
     else:
         if ltoirs is None:
             ltoirs = []
@@ -109,8 +114,8 @@ def build_cuda(
             num_expr,
             arr_expr,
         )
-        if err != 0:
-            raise Exception(f"CUDA kernel build failed with error code {err}")
+    if err != 0:
+        raise Exception(f"CUDA kernel build failed with error code {err}")
 
 
 # load PTX or CUBIN as a CUDA runtime module (input type determined by input_path extension)
@@ -308,13 +313,23 @@ def get_cached_lto(path):
 
 
 def get_cached_lto_meta(path, symbol):
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return None
+
+    try:
         with open(path) as f:
             keys = json.load(f)
-        value = keys[symbol]
-        return value
-    else:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return None
+
+    if not isinstance(keys, dict):
+        return None
+
+    value = keys.get(symbol)
+    if type(value) is not builtins.int or value < 0:
+        return None
+
+    return value
 
 
 def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
@@ -341,9 +356,9 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
         extra_files = {}
 
     # Hash symbol and set up paths
-    h = hash_symbol(lto_symbol)
+    h = hash_symbol(lto_symbol)[:LTO_CACHE_KEY_LENGTH]
     lto_dir = get_lto_cache_dir()
-    lto_name = f"{h[:7]}.lto"
+    lto_name = f"{h}.lto"
     lto_path = os.path.join(lto_dir, lto_name)
 
     # Set up paths for extra files
@@ -351,11 +366,13 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
     temp_file_paths = {}
 
     for ext, _ in extra_files.items():
-        name = f"{h[:7]}{ext}"
+        name = f"{h}{ext}"
         file_paths[ext] = os.path.join(lto_dir, name)
 
-    # Check if already built but not cached
+    # Check the persistent LTO cache before compiling.
     lto_code_data = get_cached_lto(lto_path)
+    cached_extra_files = {}
+    invalid_extra_files = set()
     if lto_code_data is not None:
         # Get the cached data for the extra files and early return
         all_files_cached = True
@@ -363,9 +380,10 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
             if getter and os.path.exists(file_paths[ext]):
                 cached_data = getter(file_paths[ext])
                 if cached_data is None:
+                    invalid_extra_files.add(ext)
                     all_files_cached = False
                     break
-                extra_files[ext] = cached_data
+                cached_extra_files[ext] = cached_data
             elif getter:  # If there's a getter but file doesn't exist
                 all_files_cached = False
                 break
@@ -374,7 +392,11 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
             if not extra_files:
                 return (True, lto_code_data)
             else:
-                return (True, lto_code_data, *[extra_files[ext] for ext in extra_files.keys()])
+                return (
+                    True,
+                    lto_code_data,
+                    *[cached_extra_files.get(ext) for ext in extra_files.keys()],
+                )
 
     # Create process-dependent temporary build directory
     build_dir = f"{lto_dir}_p{os.getpid()}_t{threading.get_ident()}"
@@ -402,8 +424,15 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
 
         # If build_dir couldn't be moved by a rename, move the outputs one-by-one to lto_dir
         if os.path.exists(lto_dir):
+            replace_lto = len(invalid_extra_files) > 0
             for ext, path in file_paths.items():
-                if not os.path.exists(path):
+                if (replace_lto and ext == ".lto") or ext in invalid_extra_files:
+                    try:
+                        # Replace inconsistent cache outputs so future processes hit a coherent entry.
+                        os.replace(temp_file_paths[ext], path)
+                    except OSError:
+                        pass
+                elif not os.path.exists(path):
                     try:
                         # copy output file to the destination lto dir
                         os.rename(temp_file_paths[ext], path)

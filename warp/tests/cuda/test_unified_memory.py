@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for cross-device array access and launch verification modes.
+"""Tests for cross-device array access and launch array access modes.
 
 These tests cover Warp's conservative memory-access capability reporting,
 default launch behavior for mixed-device array arguments, and opt-in launch
-verification through ``wp.config.launch_verification_mode`` enum modes. They
-also check that checked verification uses allocation-specific CUDA access rules
+array access checks through ``wp.config.launch_array_access_mode`` enum modes. They
+also check that checked mode uses allocation-specific CUDA access rules
 where possible: ordinary CPU memory, pinned CPU memory, default CUDA
 allocations, CUDA memory pool allocations, and array views backed by a parent
 allocation.
@@ -20,19 +20,20 @@ import numpy as np
 
 import warp as wp
 import warp._src.context as warp_context
+from warp._src.utils import check_p2p
 from warp.tests.unittest_utils import *
 
 
 @contextlib.contextmanager
-def launch_verification_mode(mode: wp.LaunchVerificationMode):
+def launch_array_access_mode(mode: wp.config.LaunchArrayAccessMode):
     """Temporarily set launch array-access verification mode and restore the previous value."""
 
-    old_value = wp.config.launch_verification_mode
-    wp.config.launch_verification_mode = mode
+    old_value = wp.config.launch_array_access_mode
+    wp.config.launch_array_access_mode = mode
     try:
         yield
     finally:
-        wp.config.launch_verification_mode = old_value
+        wp.config.launch_array_access_mode = old_value
 
 
 @contextlib.contextmanager
@@ -103,28 +104,28 @@ def test_unified_memory_device_capabilities(test, device):
         test.assertFalse(device.is_cpu_gpu_atomic_supported)
 
 
-def test_unified_memory_launch_verification_mode_config(test, device):
-    """Launch verification mode is an enum-backed public config setting."""
+def test_unified_memory_launch_array_access_mode_config(test, device):
+    """Launch array access mode is an enum-backed public config setting."""
 
-    test.assertIs(wp.LaunchVerificationMode, wp.config.LaunchVerificationMode)
-    test.assertEqual(int(wp.LaunchVerificationMode.RELAXED), 0)
-    test.assertEqual(int(wp.LaunchVerificationMode.CHECKED), 1)
-    test.assertEqual(int(wp.LaunchVerificationMode.STRICT), 2)
-    test.assertIs(wp.config.launch_verification_mode, wp.LaunchVerificationMode.RELAXED)
+    test.assertFalse(hasattr(wp, "LaunchArrayAccessMode"))
+    test.assertEqual(int(wp.config.LaunchArrayAccessMode.RELAXED), 0)
+    test.assertEqual(int(wp.config.LaunchArrayAccessMode.CHECKED), 1)
+    test.assertEqual(int(wp.config.LaunchArrayAccessMode.STRICT), 2)
+    test.assertIs(wp.config.launch_array_access_mode, wp.config.LaunchArrayAccessMode.RELAXED)
     old_config_name = "verify_launch_" + "array_access"
     test.assertFalse(hasattr(wp.config, old_config_name))
 
-    old_value = wp.config.launch_verification_mode
+    old_value = wp.config.launch_array_access_mode
     try:
-        for mode in wp.LaunchVerificationMode:
-            wp.config.launch_verification_mode = mode
-            test.assertIs(wp.config.launch_verification_mode, mode)
+        for mode in wp.config.LaunchArrayAccessMode:
+            wp.config.launch_array_access_mode = mode
+            test.assertIs(wp.config.launch_array_access_mode, mode)
 
         for value in (False, True, 0, 1, 2, 999, "checked"):
-            with test.assertRaisesRegex(ValueError, "launch_verification_mode"):
-                wp.config.launch_verification_mode = value
+            with test.assertRaisesRegex(ValueError, "launch_array_access_mode"):
+                wp.config.launch_array_access_mode = value
     finally:
-        wp.config.launch_verification_mode = old_value
+        wp.config.launch_array_access_mode = old_value
 
 
 def test_unified_memory_can_access(test, device):
@@ -174,7 +175,7 @@ def test_unified_memory_can_access(test, device):
 
 
 def test_unified_memory_checked_rejects_indexedarray_with_inaccessible_indices(test, device):
-    """Indexed array launch verification must validate both data and index arrays."""
+    """Indexed array checks must validate both data and index arrays."""
 
     data = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device="cpu", pinned=True)
     indices = wp.array(np.array([0, 1, 2, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
@@ -186,7 +187,7 @@ def test_unified_memory_checked_rejects_indexedarray_with_inaccessible_indices(t
 
     with emulate_non_coherent_uva_cuda_device(device):
         test.assertFalse(wp.can_access(device, src))
-        with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+        with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
             with test.assertRaisesRegex(RuntimeError, "array allocation is not accessible or cannot be verified"):
                 wp.launch(read_indexed_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device)
 
@@ -202,14 +203,14 @@ def test_unified_memory_record_cmd_skips_default_access_check(test, device):
     src = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device="cpu")
     dst = wp.empty(4, dtype=wp.float32, device=device)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.RELAXED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.RELAXED):
         cmd = wp.launch(read_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device, record_cmd=True)
 
     test.assertIsInstance(cmd, wp.Launch)
 
 
 def test_unified_memory_verify_rejects_gpu_reading_cpu_when_unsupported(test, device):
-    """Opt-in launch verification catches unsupported GPU access to CPU memory."""
+    """Opt-in array access checks catch unsupported GPU access to CPU memory."""
 
     if device.is_cpu_memory_access_from_gpu_supported:
         test.skipTest(f"{device} can access CPU memory")
@@ -217,7 +218,7 @@ def test_unified_memory_verify_rejects_gpu_reading_cpu_when_unsupported(test, de
     src = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device="cpu")
     dst = wp.empty(4, dtype=wp.float32, device=device)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         with test.assertRaisesRegex(RuntimeError, "array allocation is not accessible or cannot be verified"):
             wp.launch(read_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device, record_cmd=True)
 
@@ -233,7 +234,7 @@ def test_unified_memory_verify_rejects_cpu_reading_gpu_when_unsupported(test, de
     src = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device=device)
     dst = wp.empty(4, dtype=wp.float32, device="cpu")
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         with test.assertRaisesRegex(RuntimeError, "array allocation is not accessible or cannot be verified"):
             wp.launch(read_gpu_write_cpu, dim=src.size, inputs=[src], outputs=[dst], device="cpu", record_cmd=True)
 
@@ -244,7 +245,7 @@ def test_unified_memory_relaxed_allows_cpu_launch_with_gpu_array(test, device):
     src = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device=device)
     dst = wp.empty(4, dtype=wp.float32, device="cpu")
 
-    with launch_verification_mode(wp.LaunchVerificationMode.RELAXED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.RELAXED):
         cmd = wp.launch(read_gpu_write_cpu, dim=src.size, inputs=[src], outputs=[dst], device="cpu", record_cmd=True)
 
     test.assertIsInstance(cmd, wp.Launch)
@@ -259,7 +260,7 @@ def test_unified_memory_strict_rejects_cuda_launch_with_pinned_cpu_array(test, d
     src = wp.array(np.arange(4, dtype=np.float32), dtype=wp.float32, device="cpu", pinned=True)
     dst = wp.empty(4, dtype=wp.float32, device=device)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.STRICT):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.STRICT):
         with test.assertRaisesRegex(RuntimeError, "is on device=cpu"):
             wp.launch(read_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device, record_cmd=True)
 
@@ -274,7 +275,7 @@ def test_unified_memory_cuda_launch_reads_cpu_array_when_supported(test, device)
     src = wp.array(src_np, dtype=wp.float32, device="cpu")
     dst = wp.empty(src.size, dtype=wp.float32, device=device)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         wp.launch(read_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device)
 
     np.testing.assert_allclose(dst.numpy(), src_np * 2.0)
@@ -288,7 +289,7 @@ def test_unified_memory_cuda_launch_writes_cpu_array_when_supported(test, device
 
     dst = wp.empty(8, dtype=wp.float32, device="cpu")
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         wp.launch(write_output_array, dim=dst.size, outputs=[dst], device=device)
 
     # dst is CPU memory written by the GPU; CPU-backed .numpy() does not synchronize the launch.
@@ -308,7 +309,7 @@ def test_unified_memory_cuda_launch_reads_pinned_cpu_array_when_uva_supported(te
 
     test.assertTrue(src.pinned)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         wp.launch(read_cpu_write_gpu, dim=src.size, inputs=[src], outputs=[dst], device=device)
 
     np.testing.assert_allclose(dst.numpy(), src_np * 2.0)
@@ -324,7 +325,7 @@ def test_unified_memory_cuda_launch_writes_pinned_cpu_array_when_uva_supported(t
 
     test.assertTrue(dst.pinned)
 
-    with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+    with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
         wp.launch(write_output_array, dim=dst.size, outputs=[dst], device=device)
 
     # dst is CPU memory written by the GPU; CPU-backed .numpy() does not synchronize the launch.
@@ -333,10 +334,10 @@ def test_unified_memory_cuda_launch_writes_pinned_cpu_array_when_uva_supported(t
 
 
 def test_unified_memory_array_view_allocator_lookup_uses_parent_array(test, device):
-    """Array views must use the base allocation when launch verification checks access.
+    """Array views must use the base allocation when launch array access checks run.
 
     Sliced arrays do not own the allocation and may not carry an allocator
-    directly. Launch verification needs to walk back to the parent array so
+    directly. Launch array access checks need to walk back to the parent array so
     slices inherit the same cross-device access rules as the storage owner.
     """
 
@@ -393,7 +394,7 @@ class TestUnifiedMemory(unittest.TestCase):
 
         self.assertFalse(wp.can_access(cpu, src))
 
-        with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+        with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
             with patch("warp._src.context.log_warning") as mock_log_warning:
                 cmd0 = wp.launch(read_gpu_write_cpu, dim=n, inputs=[src], outputs=[dst], device=cpu, record_cmd=True)
                 cmd1 = wp.launch(read_gpu_write_cpu, dim=n, inputs=[src], outputs=[dst], device=cpu, record_cmd=True)
@@ -423,7 +424,7 @@ class TestUnifiedMemory(unittest.TestCase):
             src = wp.array(np.arange(n, dtype=np.float32), dtype=wp.float32, device=device)
         dst = wp.empty(n, dtype=wp.float32, device=cpu)
 
-        with launch_verification_mode(wp.LaunchVerificationMode.STRICT):
+        with launch_array_access_mode(wp.config.LaunchArrayAccessMode.STRICT):
             with self.assertRaisesRegex(RuntimeError, "is on device="):
                 wp.launch(read_gpu_write_cpu, dim=n, inputs=[src], outputs=[dst], device=cpu, record_cmd=True)
 
@@ -445,7 +446,7 @@ class TestUnifiedMemory(unittest.TestCase):
             src = wp.array(np.arange(n, dtype=np.float32), dtype=wp.float32, device=device)
         dst = wp.empty(n, dtype=wp.float32, device=cpu)
 
-        with launch_verification_mode(wp.LaunchVerificationMode.RELAXED):
+        with launch_array_access_mode(wp.config.LaunchArrayAccessMode.RELAXED):
             with patch("warp._src.context.log_warning") as mock_log_warning:
                 cmd = wp.launch(read_gpu_write_cpu, dim=n, inputs=[src], outputs=[dst], device=cpu, record_cmd=True)
 
@@ -456,12 +457,13 @@ class TestUnifiedMemory(unittest.TestCase):
         self.assertEqual(len(matching), 0)
 
     @unittest.skipUnless(get_cuda_device_pair_with_peer_access_support(), "Requires devices with peer access support")
+    @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_unified_memory_verify_uses_peer_access_for_default_cuda_allocations(self):
         """Default CUDA allocations use peer-access state for cross-GPU verification.
 
         Peer access and mempool access are separate CUDA capabilities. When the
         source array was allocated through Warp's default CUDA allocator,
-        checked launch verification should accept the launch based on peer
+        checked launch array access mode should accept the launch based on peer
         access even if mempool access is disabled.
         """
 
@@ -482,8 +484,8 @@ class TestUnifiedMemory(unittest.TestCase):
             self.assertTrue(wp.can_access(peer_device, src))
 
             wp.load_module(device=peer_device)
-            wp.synchronize_device(target_device)
-            with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+            peer_device.stream.wait_stream(target_device.stream)
+            with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
                 wp.launch(read_cpu_write_gpu, dim=n, inputs=[src], outputs=[dst], device=peer_device)
 
             np.testing.assert_allclose(dst.numpy(), np.arange(n, dtype=np.float32) * 2.0)
@@ -492,6 +494,7 @@ class TestUnifiedMemory(unittest.TestCase):
             wp.set_mempool_access_enabled(target_device, peer_device, mempool_access_saved)
 
     @unittest.skipUnless(get_cuda_device_pair_with_peer_access_support(), "Requires devices with peer access support")
+    @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_unified_memory_verify_uses_parent_allocator_for_default_cuda_slices(self):
         """Slices of default CUDA allocations should follow the base array's allocator.
 
@@ -518,8 +521,8 @@ class TestUnifiedMemory(unittest.TestCase):
             self.assertIs(src._ref, src_base)
 
             wp.load_module(device=peer_device)
-            wp.synchronize_device(target_device)
-            with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+            peer_device.stream.wait_stream(target_device.stream)
+            with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
                 wp.launch(read_cpu_write_gpu, dim=n, inputs=[src], outputs=[dst], device=peer_device)
 
             np.testing.assert_allclose(dst.numpy(), np.arange(1, n + 1, dtype=np.float32) * 2.0)
@@ -561,12 +564,16 @@ class TestUnifiedMemory(unittest.TestCase):
     @unittest.skipUnless(
         get_cuda_device_pair_with_mempool_access_support(), "Requires devices with mempool access support"
     )
+    @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_unified_memory_verify_uses_mempool_access_for_cuda_mempool_allocations(self):
         """CUDA mempool allocations use mempool-access state for cross-GPU verification.
 
         An array allocated while the source device's mempool is enabled needs
-        the CUDA mempool access predicate. This test keeps peer access disabled
-        so acceptance can only come from the allocation-specific mempool rule.
+        the CUDA mempool access predicate. The companion rejection test keeps
+        peer access enabled while mempool access is disabled, so the pair
+        isolates the allocation-specific mempool rule without executing this
+        peer kernel in a recently changed pool-access state with peer access
+        disabled.
         """
 
         target_device, peer_device = get_cuda_device_pair_with_mempool_access_support()
@@ -575,7 +582,7 @@ class TestUnifiedMemory(unittest.TestCase):
         peer_access_saved = wp.is_peer_access_enabled(target_device, peer_device)
         mempool_access_saved = wp.is_mempool_access_enabled(target_device, peer_device)
         try:
-            wp.set_peer_access_enabled(target_device, peer_device, False)
+            wp.set_peer_access_enabled(target_device, peer_device, True)
             wp.set_mempool_access_enabled(target_device, peer_device, True)
 
             with wp.ScopedMempool(target_device, True):
@@ -586,8 +593,8 @@ class TestUnifiedMemory(unittest.TestCase):
             self.assertTrue(wp.can_access(peer_device, src))
 
             wp.load_module(device=peer_device)
-            wp.synchronize_device(target_device)
-            with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+            peer_device.stream.wait_stream(target_device.stream)
+            with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
                 wp.launch(read_cpu_write_gpu, dim=n, inputs=[src], outputs=[dst], device=peer_device)
 
             np.testing.assert_allclose(dst.numpy(), np.arange(n, dtype=np.float32) * 2.0)
@@ -598,6 +605,7 @@ class TestUnifiedMemory(unittest.TestCase):
     @unittest.skipUnless(
         get_cuda_device_pair_with_mempool_access_support(), "Requires devices with mempool access support"
     )
+    @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_unified_memory_verify_uses_parent_allocator_for_cuda_mempool_slices(self):
         """Slices of CUDA mempool allocations should follow the base array's allocator.
 
@@ -612,7 +620,7 @@ class TestUnifiedMemory(unittest.TestCase):
         peer_access_saved = wp.is_peer_access_enabled(target_device, peer_device)
         mempool_access_saved = wp.is_mempool_access_enabled(target_device, peer_device)
         try:
-            wp.set_peer_access_enabled(target_device, peer_device, False)
+            wp.set_peer_access_enabled(target_device, peer_device, True)
             wp.set_mempool_access_enabled(target_device, peer_device, True)
 
             with wp.ScopedMempool(target_device, True):
@@ -624,8 +632,8 @@ class TestUnifiedMemory(unittest.TestCase):
             self.assertIs(src._ref, src_base)
 
             wp.load_module(device=peer_device)
-            wp.synchronize_device(target_device)
-            with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
+            peer_device.stream.wait_stream(target_device.stream)
+            with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
                 wp.launch(read_cpu_write_gpu, dim=n, inputs=[src], outputs=[dst], device=peer_device)
 
             np.testing.assert_allclose(dst.numpy(), np.arange(1, n + 1, dtype=np.float32) * 2.0)
@@ -641,34 +649,49 @@ class TestUnifiedMemory(unittest.TestCase):
 
         Default CUDA allocations and CUDA mempool allocations have different
         cross-device access switches. A mempool-backed source array should be
-        rejected in checked mode when mempool access is disabled, even if normal
-        peer access between the devices is enabled.
+        rejected in checked mode when Warp observes mempool access as disabled,
+        even if normal peer access between the devices is enabled.
+
+        The mempool access predicate is mocked instead of toggling the actual
+        CUDA pool access state because CUDA recommends keeping pool
+        accessibility stable over the lifetime of the pool.
         """
 
         target_device, peer_device = get_cuda_device_pair_with_mempool_access_support()
         n = 8
 
         peer_access_saved = wp.is_peer_access_enabled(target_device, peer_device)
-        mempool_access_saved = wp.is_mempool_access_enabled(target_device, peer_device)
         try:
             wp.set_peer_access_enabled(target_device, peer_device, True)
-            wp.set_mempool_access_enabled(target_device, peer_device, False)
 
             with wp.ScopedMempool(target_device, True):
                 src = wp.array(np.arange(n, dtype=np.float32), dtype=wp.float32, device=target_device)
             dst = wp.empty(n, dtype=wp.float32, device=peer_device)
 
             self.assertEqual(type(src._allocator).__name__, "CudaMempoolAllocator")
-            self.assertFalse(wp.can_access(peer_device, src))
 
-            with launch_verification_mode(wp.LaunchVerificationMode.CHECKED):
-                with self.assertRaisesRegex(RuntimeError, "array allocation is not accessible or cannot be verified"):
-                    wp.launch(
-                        read_cpu_write_gpu, dim=n, inputs=[src], outputs=[dst], device=peer_device, record_cmd=True
-                    )
+            # Do not toggle the real CUDA default pool access here. CUDA recommends keeping pool accessibility
+            # stable, and toggling it in this rejection test can make later real peer-read tests flaky on some drivers.
+            with patch.object(warp_context, "is_mempool_access_enabled", return_value=False) as mock_access:
+                self.assertFalse(wp.can_access(peer_device, src))
+                mock_access.assert_called_with(target_device, peer_device)
+
+                with launch_array_access_mode(wp.config.LaunchArrayAccessMode.CHECKED):
+                    mock_access.reset_mock()
+                    with self.assertRaisesRegex(
+                        RuntimeError, "array allocation is not accessible or cannot be verified"
+                    ):
+                        wp.launch(
+                            read_cpu_write_gpu,
+                            dim=n,
+                            inputs=[src],
+                            outputs=[dst],
+                            device=peer_device,
+                            record_cmd=True,
+                        )
+                    mock_access.assert_called_with(target_device, peer_device)
         finally:
             wp.set_peer_access_enabled(target_device, peer_device, peer_access_saved)
-            wp.set_mempool_access_enabled(target_device, peer_device, mempool_access_saved)
 
 
 add_function_test(
@@ -679,8 +702,8 @@ add_function_test(
 )
 add_function_test(
     TestUnifiedMemory,
-    "test_unified_memory_launch_verification_mode_config",
-    test_unified_memory_launch_verification_mode_config,
+    "test_unified_memory_launch_array_access_mode_config",
+    test_unified_memory_launch_array_access_mode_config,
     devices=[wp.get_device("cpu")],
 )
 add_function_test(

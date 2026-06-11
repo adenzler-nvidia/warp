@@ -200,8 +200,6 @@ from warp._src.texture import TextureAddressMode as TextureAddressMode
 
 # category: Runtime
 
-from warp.config import LaunchVerificationMode as LaunchVerificationMode
-
 from warp._src.context import init as init
 
 from warp._src.context import is_cpu_available as is_cpu_available
@@ -430,6 +428,11 @@ from warp._src.jax import dtype_from_jax as dtype_from_jax
 from warp._src.jax import dtype_to_jax as dtype_to_jax
 from warp._src.jax import device_from_jax as device_from_jax
 from warp._src.jax import device_to_jax as device_to_jax
+from warp._src.jax.ffi import JaxCallableGraphMode as JaxCallableGraphMode
+from warp._src.jax.ffi import JaxModulePreloadMode as JaxModulePreloadMode
+from warp._src.jax.ffi import clear_jax_callable_graph_cache as clear_jax_callable_graph_cache
+from warp._src.jax.ffi import jax_callable as jax_callable
+from warp._src.jax.ffi import jax_kernel as jax_kernel
 
 
 # category: PyTorch Interop

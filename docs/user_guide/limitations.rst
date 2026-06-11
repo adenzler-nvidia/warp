@@ -60,16 +60,18 @@ Arrays
 
 * Arrays can have a maximum of four dimensions.
 * Each dimension of a Warp array cannot be greater than the maximum value representable by a 32-bit signed integer,
-  :math:`2^{31}-1`.
+  :math:`2^{31}-1`. As a result, one-dimensional Warp arrays cannot represent larger logical data sets; split them
+  across multiple dimensions instead. See :ref:`large-array launch indexing <large_launch_indexing>` for the launch
+  and indexing pattern.
 * There are currently no data types that support complex numbers.
-* ``wp.config.launch_verification_mode = wp.LaunchVerificationMode.CHECKED``
+* ``wp.config.launch_array_access_mode = wp.config.LaunchArrayAccessMode.CHECKED``
   only fully verifies cross-device :class:`wp.array <warp.array>` arguments when
   Warp can determine the allocation kind. Arrays backed by custom or externally
   wrapped allocators warn and proceed in checked mode; use
-  ``wp.LaunchVerificationMode.STRICT`` to reject cross-device launches before
+  ``wp.config.LaunchArrayAccessMode.STRICT`` to reject cross-device launches before
   checking allocator provenance. Directly passed ``__array_interface__`` or
   ``__cuda_array_interface__`` objects are not fully allocation-verified. See
-  :ref:`launch_verification` for details.
+  :ref:`launch_array_access_checks` for details.
 
 Structs
 -------

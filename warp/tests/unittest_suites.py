@@ -85,6 +85,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
 
     Intended to be modified to create additional test suites
     """
+    from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
     from warp.tests.cuda.test_async import TestAsync
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
@@ -128,7 +129,12 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.matrix.test_mat_lite import TestMatLite
     from warp.tests.test_adam import TestAdam
     from warp.tests.test_allocation_tracker import TestAllocTracker
-    from warp.tests.test_allocator import TestAllocatorProtocol, TestCustomAllocator, TestRmmAllocator
+    from warp.tests.test_allocator import (
+        TestAllocatorProtocol,
+        TestCustomAllocator,
+        TestRmmAllocator,
+        TestTorchAllocator,
+    )
     from warp.tests.test_apic import TestApic
     from warp.tests.test_apic_mesh import TestApicMesh
     from warp.tests.test_arithmetic import TestArithmetic
@@ -187,7 +193,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_math import TestMath
     from warp.tests.test_module_contamination import TestModuleContamination
     from warp.tests.test_module_hashing import TestModuleHashing
-    from warp.tests.test_module_parallel_load import TestModuleParallelLoad
+    from warp.tests.test_module_parallel_load import TestModuleParallelLoad, TestParallelLoadSharedHelper
     from warp.tests.test_modules_lite import TestModuleLite
     from warp.tests.test_noise import TestNoise
     from warp.tests.test_operators import TestOperators
@@ -199,6 +205,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_reload import TestReload
     from warp.tests.test_rounding import TestRounding
     from warp.tests.test_runlength_encode import TestRunlengthEncode
+    from warp.tests.test_sanitize import TestSanitize
     from warp.tests.test_scalar_ops import TestScalarOps
     from warp.tests.test_sgd import TestSGD
     from warp.tests.test_smoothstep import TestSmoothstep
@@ -231,6 +238,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.tile.test_tile_fft_no_mathdx import TestTileFFTNoMathDx
     from warp.tests.tile.test_tile_func_arg import TestTileFuncArg
     from warp.tests.tile.test_tile_fused_ops import TestTileFusedOps
+    from warp.tests.tile.test_tile_large_offsets import TestTileLargeOffsets
     from warp.tests.tile.test_tile_load import TestTileLoad
     from warp.tests.tile.test_tile_mathdx import TestTileMathDx
     from warp.tests.tile.test_tile_matmul import TestTileMatmul
@@ -251,6 +259,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestApicMesh,
         TestArithmetic,
         TestArray,
+        TestArrayFillCapture,
         TestArrayReduce,
         TestAsync,
         TestKernelSpecialize,
@@ -346,6 +355,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestOperators,
         TestOptions,
         TestOverwrite,
+        TestParallelLoadSharedHelper,
         TestPeer,
         TestPinned,
         TestPrint,
@@ -355,6 +365,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestRmmAllocator,
         TestRounding,
         TestRunlengthEncode,
+        TestSanitize,
         TestScalarOps,
         TestSGD,
         TestSmoothstep,
@@ -378,6 +389,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTileFFTNoMathDx,
         TestTileFuncArg,
         TestTileFusedOps,
+        TestTileLargeOffsets,
         TestTileLoad,
         TestTileMathDx,
         TestTileMatmul,
@@ -390,6 +402,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTileStack,
         TestTileView,
         TestTorch,
+        TestTorchAllocator,
         TestTransientModule,
         TestTriangleClosestPoint,
         TestTypes,

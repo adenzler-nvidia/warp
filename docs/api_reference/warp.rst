@@ -22,7 +22,6 @@ These modules must be explicitly imported (e.g., ``import warp.autograd``).
 
 - :mod:`warp.autograd`
 - :mod:`warp.fem`
-- :mod:`warp.jax`
 - :mod:`warp.optim`
 - :mod:`warp.render`
 - :mod:`warp.sparse`
@@ -254,7 +253,6 @@ Runtime
    :nosignatures:
    :toctree: _generated
 
-   LaunchVerificationMode
    clear_kernel_cache
    clear_lto_cache
    init
@@ -512,11 +510,16 @@ JAX Interop
    :nosignatures:
    :toctree: _generated
 
+   JaxCallableGraphMode
+   JaxModulePreloadMode
+   clear_jax_callable_graph_cache
    device_from_jax
    device_to_jax
    dtype_from_jax
    dtype_to_jax
    from_jax
+   jax_callable
+   jax_kernel
    to_jax
 
 PyTorch Interop

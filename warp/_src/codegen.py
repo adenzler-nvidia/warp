@@ -12,11 +12,13 @@ import functools
 import hashlib
 import inspect
 import itertools
+import linecache
 import math
 import re
 import textwrap
 import threading
 import types
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, get_args, get_origin
 
@@ -29,6 +31,28 @@ _wp_module_name_ = "warp.codegen"
 # used as a globally accessible copy
 # of current compile options (block_dim) etc
 options = {}
+
+
+def _escape_line_directive_filename(filename: str) -> str:
+    """Return ``filename`` escaped for the quoted filename field of a C/CUDA ``#line`` directive."""
+
+    escaped = []
+    for c in filename.replace("\\", "/"):
+        if c == '"':
+            escaped.append('\\"')
+        elif c == "\n":
+            escaped.append("\\n")
+        elif c == "\r":
+            escaped.append("\\r")
+        elif c == "\t":
+            escaped.append("\\t")
+        elif ord(c) < 32 or ord(c) == 127:
+            # Use fixed-width octal so following filename characters cannot be consumed by the escape.
+            escaped.append(f"\\{ord(c):03o}")
+        else:
+            escaped.append(c)
+
+    return "".join(escaped)
 
 
 def get_node_name_safe(node):
@@ -306,6 +330,28 @@ def _is_tid_call(node) -> bool:
     return isinstance(node, ast.Call) and hasattr(node.func, "attr") and node.func.attr == "tid"
 
 
+def iter_ast_nodes_of_types(root: ast.AST, *types: type):
+    """Like ``(n for n in ast.walk(root) if type(n) in types)`` but faster.
+
+    Inlines ``ast.walk``'s field iteration over a ``deque``, preserving its
+    breadth-first order, so it is a drop-in even where order matters. Exact-type
+    match; AST node classes are never subclassed in practice.
+    """
+    todo = deque((root,))
+    while todo:
+        node = todo.popleft()
+        if type(node) in types:
+            yield node
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if type(value) is list:
+                for child in value:
+                    if isinstance(child, ast.AST):
+                        todo.append(child)
+            elif isinstance(value, ast.AST):
+                todo.append(value)
+
+
 def _is_texture_type(var_type: type) -> bool:
     """Check if var_type is a Texture subclass (Texture2D, Texture3D, etc.)."""
     from warp._src.texture import Texture  # noqa: PLC0415
@@ -339,17 +385,23 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
             setattr(inst._ctype, field, array_t())
         else:
             # wp.array
-            assert isinstance(value, array)
-            assert types_equal(value.dtype, var_type.dtype), (
-                f"assign to struct member variable {field} failed, expected type {type_repr(var_type.dtype)}, got type {type_repr(value.dtype)}"
-            )
+            if not isinstance(value, array):
+                raise TypeError(f"Struct field '{field}' expects a Warp array, got {type(value).__name__}")
+            if not types_equal(value.dtype, var_type.dtype):
+                raise TypeError(
+                    f"Struct field '{field}' expects dtype {type_repr(var_type.dtype)}, got {type_repr(value.dtype)}"
+                )
             setattr(inst._ctype, field, value.__ctype__())
 
-            # workaround to prevent gradient buffers being garbage collected
-            # since users can do struct.array.requires_grad = False the gradient array
-            # would be collected while the struct ctype still holds a reference to it
-            if value.requires_grad:
-                cls.__setattr__(inst, "_" + field + "_grad", value.grad)
+        # Keep gradient buffers alive while the struct's native array
+        # descriptor may reference them. Clear any previous keepalive when
+        # this field no longer points at a grad-tracked array.
+        grad_attr = "_" + field + "_grad"
+        if value is not None and value.requires_grad:
+            cls.__setattr__(inst, grad_attr, value.grad)
+        else:
+            # clear any previous keepalive
+            cls.__setattr__(inst, grad_attr, None)
 
         cls.__setattr__(inst, field, value)
 
@@ -357,10 +409,12 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
         if value is None:
             setattr(inst._ctype, field, var_type.__ctype__())
         else:
-            assert isinstance(value, indexedarray)
-            assert types_equal(value.dtype, var_type.dtype), (
-                f"assign to struct member variable {field} failed, expected type {type_repr(var_type.dtype)}, got type {type_repr(value.dtype)}"
-            )
+            if not isinstance(value, indexedarray):
+                raise TypeError(f"Struct field '{field}' expects a Warp indexed array, got {type(value).__name__}")
+            if not types_equal(value.dtype, var_type.dtype):
+                raise TypeError(
+                    f"Struct field '{field}' expects dtype {type_repr(var_type.dtype)}, got {type_repr(value.dtype)}"
+                )
             setattr(inst._ctype, field, value.__ctype__())
 
         # workaround to prevent gradient buffers being garbage collected
@@ -1096,16 +1150,39 @@ def get_arg_value(arg: Any) -> Any:
     return arg
 
 
-# decorator for synchronizing function calls (reentrant critical section)
-def synchronized(func):
-    lock = threading.RLock()
+# Re-entrant lock guarding mutation and reading of shared per-Adjoint
+# state. ``@wp.func`` helpers share one ``Adjoint`` object across every
+# module that references them; ``Adjoint.build`` rewrites ``adj.blocks``,
+# ``adj.symbols``, ``adj.variables``, ``adj.deferred_static_expressions``
+# from scratch, and ``ModuleBuilder.codegen`` later reads those same
+# fields. Holding this lock across the full build+emit window in
+# ``Module._compile`` stops a parallel ``Module.load`` (e.g. from
+# ``wp.force_load(max_workers > 1)``) from clobbering the state mid-emit.
+# Re-entrant so ``Module._compile`` -> ``ModuleBuilder.build_kernel`` ->
+# ``Adjoint.build`` on the same thread doesn't deadlock.
+_codegen_lock = threading.RLock()
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        with lock:
-            return func(*args, **kwargs)
 
-    return wrapper
+def synchronized(rlock: threading.RLock | None = None):
+    """Decorator that serializes calls to the wrapped function under a re-entrant lock.
+
+    ``@synchronized()`` mints a fresh private ``RLock`` for this decoration.
+    ``@synchronized(rlock)`` uses the given ``RLock``; pass the same lock to
+    every decoration that must mutually exclude. The lock is re-entrant, so
+    nested calls from the same thread do not deadlock.
+    """
+    if rlock is None:
+        rlock = threading.RLock()
+
+    def decorator(func):
+        @functools.wraps(func)
+        def locked_call(*args, **kwargs):
+            with rlock:
+                return func(*args, **kwargs)
+
+        return locked_call
+
+    return decorator
 
 
 class Adjoint:
@@ -1149,26 +1226,23 @@ class Adjoint:
         adj.filename = inspect.getsourcefile(func) or "unknown source file"
         # get source file line number where function starts
         adj.fun_lineno = 0
-        adj.source = source
-        if adj.source is None:
-            adj.source, adj.fun_lineno = adj.extract_function_source(func)
+        if source is None:
+            adj.source, adj.fun_lineno, adj.tree = adj.extract_function_source(func)
+        else:
+            # ensures that indented class methods can be parsed as kernels
+            adj.source = textwrap.dedent(source)
+            adj.tree = ast.parse(adj.source)
 
         assert adj.source is not None, f"Failed to extract source code for function {func.__name__}"
 
         # Indicates where the function definition starts (excludes decorators)
         adj.fun_def_lineno = None
 
-        # get function source code
-        # ensures that indented class methods can be parsed as kernels
-        adj.source = textwrap.dedent(adj.source)
-
         adj.source_lines = adj.source.splitlines()
 
         if transformers is None:
             transformers = []
 
-        # build AST and apply node transformers
-        adj.tree = ast.parse(adj.source)
         adj.transformers = transformers
         for transformer in transformers:
             adj.tree = transformer.visit(adj.tree)
@@ -1243,21 +1317,9 @@ class Adjoint:
         # for unit testing errors being spit out from kernels.
         adj.skip_build = False
 
-        # Infer kernel_dim before hashing because it selects the
-        # ``launch_bounds_t<N>`` type in generated C++.
-        adj.kernel_dim = adj._infer_kernel_dim()
-
-    def _infer_kernel_dim(adj) -> int:
-        max_dim = 0
-        for node in ast.walk(adj.tree):
-            if isinstance(node, ast.Assign) and _is_tid_call(node.value):
-                target = node.targets[0]
-                if isinstance(target, ast.Tuple):
-                    max_dim = max(max_dim, len(target.elts))
-                else:
-                    max_dim = max(max_dim, 1)
-
-        return max_dim if max_dim > 0 else 1
+        # Cache of reference-candidate AST nodes, materialized once by ``reference_nodes()``.
+        # Reset to None if ``adj.tree`` is ever mutated after the cache is populated.
+        adj._reference_nodes = None
 
     # allocate extra space for a function call that requires its
     # own shared memory space, we treat shared memory as a stack
@@ -1281,19 +1343,136 @@ class Adjoint:
         return total_shared + adj.max_required_extra_shared_memory
 
     @staticmethod
-    def extract_function_source(func: Callable) -> tuple[str, int]:
+    def extract_function_source(func: Callable) -> tuple[str, int, ast.Module]:
+        """Extract a function's source as ``inspect.getsourcelines`` would, but faster.
+
+        Uses a ``co_lines()``-based heuristic to find the function's source slice
+        without tokenizing, then verifies the slice by parsing it and checking
+        that the parsed block starts with the target function. On any parse or
+        validation failure the implementation falls back transparently to
+        ``inspect.getsourcelines`` — so the only observable difference from the
+        upstream behavior is throughput.
+
+        Returns ``(source, fun_lineno, tree)`` where ``source`` is dedented and
+        ``tree == ast.parse(source)``. Callers can rely on ``tree.body[0]`` being
+        a ``FunctionDef`` / ``AsyncFunctionDef`` with ``name == func.__code__.co_name``.
+
+        ``inspect.unwrap`` is applied before reading ``__code__`` so the fast path
+        matches ``inspect.getsourcelines``'s semantics for ``__wrapped__`` chains
+        (e.g. ``functools.wraps``-decorated functions).
+
+        **Correctness.** The fast path's slice either parses to the target
+        function or it is rejected. The argument:
+
+        - The slice always covers ``[co_firstlineno, max_line]`` where
+          ``max_line = max(line for *,*,line in code.co_lines())``. By PEP 626
+          every bytecode instruction has a line in ``co_lines()``, so the slice
+          contains every executable statement of ``func``.
+        - If ``ast.parse`` succeeds and ``body[0]`` is a ``FunctionDef`` /
+          ``AsyncFunctionDef`` whose ``name == code.co_name``, the parsed block
+          starts at the target function and its body contains every executable
+          statement of ``func``. Any content the forward walk overshot into
+          ``body[1:]`` is ignored by downstream code, which only ever reads
+          ``body[0]``.
+        - The slice can be *wrong* only if the forward walk stops *inside* the
+          function body. The walk stops at the first non-blank line at indent
+          ``<= base_indent`` (a comment at that indent counts — it terminates
+          the suite just as code would), and it only ever scans forward from
+          ``max_line``, the last line carrying bytecode. So by Python's grammar
+          such a stop can land inside the function only if the line lies within
+          an unclosed multi-line string or bracket expression that began at or
+          before ``max_line``. Either case leaves the slice ending in an
+          unclosed token, so ``ast.parse`` raises ``SyntaxError``.
+        - ``SyntaxError`` triggers the fallback to
+          :meth:`_inspect_extract_function_source`, which is the upstream
+          ``inspect.getsourcelines`` behavior.
+
+        So: parse + target-function validation success ⟹ correct slice; parse or
+        validation failure ⟹ fallback. The slow path is also parsed; if *that*
+        fails, the function itself has a syntax error and we let it propagate.
+        """
         try:
-            _, fun_lineno = inspect.getsourcelines(func)
-            source = inspect.getsource(func)
+            code = inspect.unwrap(func).__code__
+        except (AttributeError, ValueError):
+            code = None
+        if code is not None:
+            fast = Adjoint._try_extract_function_source(code)
+            if fast is not None:
+                fast_source, fast_lineno = fast
+                dedented = textwrap.dedent(fast_source)
+                try:
+                    tree = ast.parse(dedented)
+                except SyntaxError:
+                    pass
+                else:
+                    if (
+                        tree.body
+                        and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and tree.body[0].name == code.co_name
+                    ):
+                        return dedented, fast_lineno, tree
+        source, fun_lineno = Adjoint._inspect_extract_function_source(func)
+        dedented = textwrap.dedent(source)
+        return dedented, fun_lineno, ast.parse(dedented)
+
+    @staticmethod
+    def _inspect_extract_function_source(func: Callable) -> tuple[str, int]:
+        """Tokenizer-driven extraction via ``inspect.getsourcelines``. Default slow
+        path for :meth:`extract_function_source` and the recovery path used when
+        the fast extractor produces an unparsable slice.
+        """
+        try:
+            source_lines, fun_lineno = inspect.getsourcelines(func)
         except OSError as e:
             raise RuntimeError(
                 "Directly evaluating Warp code defined as a string using `exec()` is not supported, "
                 "please save it to a file and use `importlib` if needed."
             ) from e
-        return source, fun_lineno
+        return "".join(source_lines), fun_lineno
+
+    @staticmethod
+    def _try_extract_function_source(code: types.CodeType) -> tuple[str, int] | None:
+        """Best-effort extraction of a function's source slice via ``co_lines()`` + linecache.
+
+        Returns ``None`` when the file isn't in ``linecache``, ``co_firstlineno``
+        is out of range, the def line is blank, or ``max_line < co_firstlineno``.
+        Otherwise returns ``(source, co_firstlineno)`` where ``source`` covers
+        ``[co_firstlineno, end]`` for some ``end >= max_line``. The slice is *not*
+        guaranteed parseable — the parse-time fallback in
+        :meth:`extract_function_source` catches every heuristic miss (see that
+        method's docstring for the proof).
+        """
+        if not (code.co_filename.startswith("<") and code.co_filename.endswith(">")):
+            linecache.checkcache(code.co_filename)
+        lines = linecache.getlines(code.co_filename)
+        start = code.co_firstlineno - 1
+        if not lines or not (0 <= start < len(lines)):
+            return None
+        first = lines[start]
+        stripped = first.lstrip()
+        if not stripped:
+            return None
+        base_indent = len(first) - len(stripped)
+
+        max_line = max((ln for _, _, ln in code.co_lines() if ln is not None), default=0)
+        if max_line < code.co_firstlineno:
+            return None
+
+        # End at the first non-blank line at indent <= base_indent past max_line.
+        end = max_line
+        while end < len(lines):
+            s = lines[end].lstrip()
+            if s and len(lines[end]) - len(s) <= base_indent:
+                break
+            end += 1
+        # inspect.getblock excludes trailing blanks; match that.
+        while end > max_line and not lines[end - 1].strip():
+            end -= 1
+
+        return "".join(lines[start:end]), code.co_firstlineno
 
     # generate function ssa form and adjoint
-    @synchronized
+    @synchronized(_codegen_lock)
     def build(adj, builder, default_builder_options=None, baked_params=None):
         # arg Var read/write flags are held during module rebuilds, so we reset here even when skipping a build
         for arg in adj.args:
@@ -1594,9 +1773,8 @@ class Adjoint:
             is_comment = statement.strip().startswith("//")
             if not is_comment:
                 line = relative_lineno + adj.fun_lineno
-                # Convert backslashes to forward slashes for CUDA compatibility
-                normalized_path = adj.filename.replace("\\", "/")
-                return f'#line {line} "{normalized_path}"'
+                escaped_path = _escape_line_directive_filename(adj.filename)
+                return f'#line {line} "{escaped_path}"'
         return None
 
     def add_forward(adj, statement: str, replay: str | None = None, skip_replay: builtins.bool = False) -> None:
@@ -1774,7 +1952,12 @@ class Adjoint:
         # parameter) because emit_Assign maps symbols directly to the Var
         # returned here, and a const-qualified C++ variable cannot be passed
         # by non-const reference to functions that write through it.
-        if func.is_builtin() and func.value_type in (float64, int64, uint64) and len(bound_args) == 1:
+        if (
+            func.is_builtin()
+            and func.value_type in (float64, int64, uint64)
+            and func.native_func == func.value_type.__name__
+            and len(bound_args) == 1
+        ):
             arg = next(iter(bound_args.values()))
             if isinstance(arg, Var) and arg.constant is not None:
                 raw = arg.constant
@@ -2511,6 +2694,12 @@ class Adjoint:
         return output
 
     def emit_Name(adj, node):
+        # a static expression that resolved to a Warp function is rewritten to an `__warp_func__`
+        # Name node carrying the function on `warp_func` (see StaticExpressionReplacer). Return it
+        # directly so it can be bound to a local, e.g. `func = wp.static(...)`.
+        if hasattr(node, "warp_func"):
+            return node.warp_func
+
         # lookup symbol, if it has already been assigned to a variable then return the existing mapping
         if node.id in adj.symbols:
             return adj.symbols[node.id]
@@ -3559,6 +3748,13 @@ class Adjoint:
             out = rhs
             for name, rhs in zip(names, out, strict=True):
                 if name in adj.symbols:
+                    if isinstance(adj.symbols[name], warp._src.context.GradWrapper):
+                        raise WarpCodegenError(
+                            f"Cannot reassign local '{name}' after binding it to wp.grad(...). Warp treats "
+                            "wp.grad(...) results as static function handles; use a different local variable "
+                            "for the new value."
+                        )
+
                     if not types_equal(rhs.type, adj.symbols[name].type):
                         raise WarpCodegenTypeError(
                             f"Error, assigning to existing symbol {name} ({adj.symbols[name].type}) with different type ({rhs.type})"
@@ -3598,8 +3794,41 @@ class Adjoint:
                 adj.symbols[name] = rhs
                 return
 
+            # handle Warp functions specially - bind the name directly to the function
+            # so later calls through the local resolve to it. This covers `f = my_func`,
+            # `f = mod.func`, and `f = wp.static(...)` returning a function. Without this the
+            # function would be routed through Var-shaped logic and miscompiled.
+            if isinstance(rhs, warp._src.context.Function):
+                if name in adj.symbols and isinstance(adj.symbols[name], warp._src.context.Function):
+                    if adj.symbols[name] is not rhs:
+                        raise WarpCodegenError(
+                            f"Error, rebinding function-valued local '{name}' to a different function is not "
+                            "supported. Warp does not have function pointers, so a local bound to a function "
+                            "must refer to the same function throughout the kernel."
+                        )
+                adj.symbols[name] = rhs
+                return
+
             # check type matches if symbol already defined
             if name in adj.symbols:
+                # a local previously bound to a function cannot be reassigned to a value. Warp does
+                # not have function pointers, so a mixed function/value local has no codegen-able
+                # meaning. Guard here before the generic type check below, which would otherwise read
+                # `adj.symbols[name].type` and fail with an opaque AttributeError on the Function.
+                if isinstance(adj.symbols[name], warp._src.context.Function):
+                    raise WarpCodegenError(
+                        f"Error, rebinding function-valued local '{name}' to a non-function value is not "
+                        "supported. Warp does not have function pointers, so a local bound to a function "
+                        "must refer to a function throughout the kernel."
+                    )
+
+                if isinstance(adj.symbols[name], warp._src.context.GradWrapper):
+                    raise WarpCodegenError(
+                        f"Cannot reassign local '{name}' after binding it to wp.grad(...). Warp treats "
+                        "wp.grad(...) results as static function handles; use a different local variable "
+                        "for the new value."
+                    )
+
                 if not types_equal(strip_reference(rhs.type), adj.symbols[name].type):
                     raise WarpCodegenTypeError(
                         f"Error, assigning to existing symbol {name} ({adj.symbols[name].type}) with different type ({rhs.type})"
@@ -4060,6 +4289,12 @@ class Adjoint:
         if isinstance(lhs, ast.Name):
             rhs = adj.eval(node.value)
             target = adj.eval(lhs)
+            if isinstance(target, warp._src.context.GradWrapper):
+                raise WarpCodegenError(
+                    f"Cannot reassign local '{lhs.id}' after binding it to wp.grad(...). Warp treats "
+                    "wp.grad(...) results as static function handles; use a different local variable "
+                    "for the new value."
+                )
 
             # In-place tile ops mutate target directly; no symbol table update needed.
             if is_tile(target.type) and is_tile(rhs.type):
@@ -4577,71 +4812,114 @@ class Adjoint:
     # try to replace wp.static() expressions by their evaluated value if the
     # expression can be evaluated
     def replace_static_expressions(adj):
-        class StaticExpressionReplacer(ast.NodeTransformer):
-            def __init__(self):
-                # Track loop variable names from enclosing for loops. This prevents
-                # wp.static() from capturing a global variable that shadows a loop variable.
-                # Uses a counter (not a set) to handle nested loops that reuse the same variable name.
-                self.loop_vars = {}
+        # ``visit_For`` and ``visit_Call`` below are the upstream
+        # ``ast.NodeTransformer`` subclass's methods lifted into closures —
+        # bodies are unchanged except for the trailing ``self.generic_visit(node)``,
+        # which becomes ``_walk_children(node)`` in ``visit_For`` and ``None`` in
+        # ``visit_Call`` (where ``None`` means "no replacement, recurse normally").
+        # ``_walk_children`` replaces ``generic_visit``: same DFS over
+        # ``node._fields``, but dispatching Calls/Fors inline by class identity
+        # (no ``'visit_' + cls.__name__`` + ``getattr``) and mutating list
+        # fields in place only when a replacement actually occurred.
+        # Replacements are collected as ``(container, key, new_node)`` and
+        # applied after the walk so the walk sees an unmutated tree.
+        loop_vars = {}  # was: self.loop_vars
+        replacements = []  # (container, key, new_node); applied after the walk
 
-            def visit_For(self, node):
-                # Track loop variable while visiting loop body (simple names only;
-                # tuple unpacking like `for x, y in ...` is rare in Warp kernels)
-                var_name = node.target.id if isinstance(node.target, ast.Name) else None
-                if var_name:
-                    self.loop_vars[var_name] = self.loop_vars.get(var_name, 0) + 1
-                result = self.generic_visit(node)
-                if var_name:
-                    self.loop_vars[var_name] -= 1
-                    if self.loop_vars[var_name] == 0:
-                        del self.loop_vars[var_name]
-                return result
+        def _walk_children(node):
+            for field_name in node._fields:
+                value = getattr(node, field_name, None)
+                if value is None:
+                    continue
+                if type(value) is list:
+                    for i, child in enumerate(value):
+                        if not isinstance(child, ast.AST):
+                            continue
+                        cls = type(child)
+                        if cls is ast.Call:
+                            result = visit_Call(child)
+                            if result is not None:
+                                replacements.append((value, i, result))
+                                continue
+                        elif cls is ast.For:
+                            visit_For(child)
+                            continue
+                        _walk_children(child)
+                elif isinstance(value, ast.AST):
+                    cls = type(value)
+                    if cls is ast.Call:
+                        result = visit_Call(value)
+                        if result is not None:
+                            replacements.append((node, field_name, result))
+                            continue
+                    elif cls is ast.For:
+                        visit_For(value)
+                        continue
+                    _walk_children(value)
 
-            def visit_Call(self, node):
-                func, _ = adj.resolve_static_expression(node.func, eval_types=False)
-                if adj.is_static_expression(func):
-                    # If the static expression references an enclosing loop variable,
-                    # defer evaluation to codegen time when the loop constant is available
-                    expr_node = node.args[0] if node.args else (node.keywords[0].value if node.keywords else None)
-                    if expr_node:
-                        referenced = {n.id for n in ast.walk(expr_node) if isinstance(n, ast.Name)}
-                        if referenced & self.loop_vars.keys():
-                            adj.has_unresolved_static_expressions = True
-                            return self.generic_visit(node)
+        def visit_For(node):
+            # Track loop variable while visiting loop body (simple names only;
+            # tuple unpacking like `for x, y in ...` is rare in Warp kernels)
+            var_name = node.target.id if isinstance(node.target, ast.Name) else None
+            if var_name:
+                loop_vars[var_name] = loop_vars.get(var_name, 0) + 1
+            _walk_children(node)  # was: self.generic_visit(node)
+            if var_name:
+                loop_vars[var_name] -= 1
+                if loop_vars[var_name] == 0:
+                    del loop_vars[var_name]
 
-                    try:
-                        # the static expression will execute as long as the static expression is valid and
-                        # only depends on global or captured variables
-                        obj, code = adj.evaluate_static_expression(node)
-                        if code is not None:
-                            adj.resolved_static_expressions[code] = obj
-                            if isinstance(obj, warp._src.context.Function):
-                                name_node = ast.Name("__warp_func__")
-                                # we add a pointer to the Warp function here so that we can refer to it later at
-                                # codegen time (note that the function key itself is not sufficient to uniquely
-                                # identify the function, as the function may be redefined between the current time
-                                # of wp.static() declaration and the time of codegen during module building)
-                                name_node.warp_func = obj
-                                return ast.copy_location(name_node, node)
-                            else:
-                                return ast.copy_location(ast.Constant(value=obj), node)
-                    except Exception:
-                        # Ignoring failing static expressions should generally not be an issue because only
-                        # one of these cases should be possible:
-                        #   1) the static expression itself is invalid code, in which case the module cannot be
-                        #      built all,
-                        #   2) the static expression contains a reference to a local (even if constant) variable
-                        #      (and is therefore not executable and raises this exception), in which
-                        #      case changing the constant, or the code affecting this constant, would lead to
-                        #      a different module hash anyway.
-                        # In any case, we mark this Adjoint to have unresolvable static expressions.
-                        # This will trigger a code generation step even if the module hash is unchanged.
+        def visit_Call(node):
+            func, _ = adj.resolve_static_expression(node.func, eval_types=False)
+            if adj.is_static_expression(func):
+                # If the static expression references an enclosing loop variable,
+                # defer evaluation to codegen time when the loop constant is available
+                expr_node = node.args[0] if node.args else (node.keywords[0].value if node.keywords else None)
+                if expr_node:
+                    referenced = {n.id for n in ast.walk(expr_node) if isinstance(n, ast.Name)}
+                    if referenced & loop_vars.keys():
                         adj.has_unresolved_static_expressions = True
-                        pass
+                        return None  # was: return self.generic_visit(node)
 
-                return self.generic_visit(node)
+                try:
+                    # the static expression will execute as long as the static expression is valid and
+                    # only depends on global or captured variables
+                    obj, code = adj.evaluate_static_expression(node)
+                    if code is not None:
+                        adj.resolved_static_expressions[code] = obj
+                        if isinstance(obj, warp._src.context.Function):
+                            name_node = ast.Name("__warp_func__")
+                            # we add a pointer to the Warp function here so that we can refer to it later at
+                            # codegen time (note that the function key itself is not sufficient to uniquely
+                            # identify the function, as the function may be redefined between the current time
+                            # of wp.static() declaration and the time of codegen during module building)
+                            name_node.warp_func = obj
+                            return ast.copy_location(name_node, node)
+                        else:
+                            return ast.copy_location(ast.Constant(value=obj), node)
+                except Exception:
+                    # Ignoring failing static expressions should generally not be an issue because only
+                    # one of these cases should be possible:
+                    #   1) the static expression itself is invalid code, in which case the module cannot be
+                    #      built all,
+                    #   2) the static expression contains a reference to a local (even if constant) variable
+                    #      (and is therefore not executable and raises this exception), in which
+                    #      case changing the constant, or the code affecting this constant, would lead to
+                    #      a different module hash anyway.
+                    # In any case, we mark this Adjoint to have unresolvable static expressions.
+                    # This will trigger a code generation step even if the module hash is unchanged.
+                    adj.has_unresolved_static_expressions = True
 
-        adj.tree = StaticExpressionReplacer().visit(adj.tree)
+            return None  # was: return self.generic_visit(node)
+
+        # Walk the tree, then apply replacements in one pass. ``adj.tree`` is
+        # always a Module, so we go straight into ``_walk_children``.
+        _walk_children(adj.tree)
+        for container, key, new_node in replacements:
+            if isinstance(container, list):
+                container[key] = new_node
+            else:
+                setattr(container, key, new_node)
 
     # Evaluates a static expression that does not depend on runtime values
     # if eval_types is True, try resolving the path using evaluated type information as well
@@ -4710,16 +4988,49 @@ class Adjoint:
         # return the Python code corresponding to the given AST node
         return ast.get_source_segment(adj.source, node)
 
+    def reference_nodes(adj) -> tuple[ast.AST, ...]:
+        """Return the cached ``Name``/``Attribute``/``Call``/``Assign`` nodes of ``adj.tree``.
+
+        Both ``Adjoint.get_references`` (module hashing) and ``Module._find_references``
+        (dependency tracking) walk the kernel AST to find references. They run at different
+        times (hashing versus registration), so they cannot share the resolution of those
+        nodes, but they can share the traversal: the tree is walked once here and the node
+        tuple is reused, each caller resolving from it at its own time.
+
+        Sharing the resolution would be wrong in either direction. Resolving at hash time and
+        reusing the result for dependency tracking would miss the dependency edges of modules
+        that are only reached transitively, so reloading such a module would not unload its
+        dependents. Resolving at registration time and reusing the result for hashing would
+        make a regular kernel's hash stale if a referenced global or constant is rebound
+        before the kernel is first built.
+
+        This cache assumes ``adj.tree`` is structurally final before the first call. Any code
+        that mutates ``adj.tree`` afterwards must reset ``adj._reference_nodes`` to ``None``.
+        """
+        if adj._reference_nodes is None:
+            adj._reference_nodes = tuple(
+                iter_ast_nodes_of_types(adj.tree, ast.Name, ast.Attribute, ast.Call, ast.Assign)
+            )
+        return adj._reference_nodes
+
     def get_references(adj) -> tuple[dict[str, Any], dict[Any, Any], dict[warp._src.context.Function, Any]]:
-        """Traverses ``adj.tree`` and returns referenced constants, types, and user-defined functions."""
+        """Traverse ``adj.tree`` for referenced constants, types, and user-defined functions.
+
+        As a side effect, also sets ``adj.kernel_dim`` (the thread-grid dimension inferred from
+        ``wp.tid()``). It is folded into this traversal rather than walked separately because
+        ``get_references`` already visits every ``Assign`` and runs for every adjoint during
+        module hashing -- which precedes any code generation or launch that reads ``kernel_dim``.
+        """
 
         local_variables = set()  # Track local variables appearing on the LHS so we know when variables are shadowed
 
         constants: dict[str, Any] = {}
         types: dict[Struct | type, Any] = {}
         functions: dict[warp._src.context.Function, Any] = {}
+        max_dim = 0  # thread-grid dimension, inferred from wp.tid() unpack arity
 
-        for node in ast.walk(adj.tree):
+        # Shared single traversal (see reference_nodes); resolved here at hash time.
+        for node in adj.reference_nodes():
             if isinstance(node, ast.Name) and node.id not in local_variables:
                 # look up in closure/global variables
                 obj = adj.resolve_external_reference(node.id)
@@ -4744,6 +5055,21 @@ class Adjoint:
                     types[func] = None
 
             elif isinstance(node, ast.Assign):
+                # Infer the thread-grid dimension from `i[, j, ...] = wp.tid()` unpack arity.
+                if _is_tid_call(node.value):
+                    target = node.targets[0]
+                    max_dim = max(max_dim, len(target.elts) if isinstance(target, ast.Tuple) else 1)
+
+                # A function bound to a local (`f = mod.func`) or to several locals via tuple
+                # unpacking (`f, g = mod.a, mod.b`) is referenced only through the local(s)
+                # afterwards, so it would otherwise be missed here and left out of the module
+                # hash. Register each bound function explicitly to keep the hash sound.
+                rhs_nodes = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
+                for rhs_node in rhs_nodes:
+                    rhs_func, _ = adj.resolve_static_expression(rhs_node, eval_types=False)
+                    if isinstance(rhs_func, warp._src.context.Function) and not rhs_func.is_builtin():
+                        functions[rhs_func] = None
+
                 # Add the LHS names to the local_variables so we know any subsequent uses are shadowed
                 lhs = node.targets[0]
                 if isinstance(lhs, ast.Tuple):
@@ -4753,6 +5079,7 @@ class Adjoint:
                 elif isinstance(lhs, ast.Name):
                     local_variables.add(lhs.id)
 
+        adj.kernel_dim = max_dim if max_dim > 0 else 1
         return constants, types, functions
 
 
