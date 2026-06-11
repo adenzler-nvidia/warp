@@ -3220,12 +3220,13 @@ class Module:
         return f"{self.get_module_identifier(block_dim=block_dim)}.meta"
 
     @synchronized(_codegen_lock)
-    def _run_codegen(self, options: dict, is_cpu: bool) -> tuple[str, str, dict, list, list]:
+    def _run_codegen(self, options: dict, is_cpu: bool) -> tuple[str, str, dict, list, list, list]:
         """Run the Python-side codegen window.
 
-        Returns ``(source, ext, meta, ltoirs, fatbins)``: the emitted C++/CUDA
-        source, its file extension, the metadata dict, and snapshots of the
-        builder's LTO-IR and fatbin collections.
+        Returns ``(source, ext, meta, ltoirs, fatbins, name_expressions)``: the
+        emitted C++/CUDA source, its file extension, the metadata dict,
+        snapshots of the builder's LTO-IR and fatbin collections, and the list
+        of NVRTC name expressions registered for templated spec kernels.
 
         Held under ``_codegen_lock`` so concurrent ``Module._compile`` callers
         cannot interleave ``adj.build`` writes and ``codegen()`` reads on a
@@ -3245,7 +3246,14 @@ class Module:
             ext = "cu"
             source = builder.codegen("cuda")
         meta = builder.build_meta()
-        return source, ext, meta, list(builder.ltoirs.values()), list(builder.fatbins.values())
+        return (
+            source,
+            ext,
+            meta,
+            list(builder.ltoirs.values()),
+            list(builder.fatbins.values()),
+            list(builder.name_expressions),
+        )
 
     def _compile(
         self,
@@ -3340,7 +3348,9 @@ class Module:
         # ``failed_builds`` the next ``Module.load`` on the same device
         # short-circuits with ``return None`` and subsequent unrelated
         # kernels in the same module silently fail to launch.
-        source_str, source_code_ext, meta, ltoir_values, fatbin_values = self._run_codegen(options, is_cpu)
+        source_str, source_code_ext, meta, ltoir_values, fatbin_values, name_expressions = self._run_codegen(
+            options, is_cpu
+        )
 
         meta_path = os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim))
 
@@ -3408,7 +3418,7 @@ class Module:
                         pch_dir=runtime.get_nvrtc_pch_dir(),
                         llvm_cuda=options["llvm_cuda"],
                         use_precompiled_headers=options["use_precompiled_headers"],
-                        name_expressions=builder.name_expressions or None,
+                        name_expressions=name_expressions or None,
                     )
 
         except Exception as e:
