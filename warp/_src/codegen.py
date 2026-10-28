@@ -9136,7 +9136,7 @@ def codegen_kernel(kernel, device, options):
         # Spec mode: emit a C++ template kernel with NTTPs for every
         # baked value; non-spec uses the plain extern "C" form.
         baked_args = kernel.options.get("baked_args")
-        if isinstance(baked_args, dict) and "dim" in baked_args:
+        if (isinstance(baked_args, dict) and "dim" in baked_args) or kernel.options.get("align_spec"):
             template_forward = (
                 cuda_spec_kernel_template_forward_grid_stride if kernel.grid_stride else cuda_spec_kernel_template_forward
             )
@@ -9300,6 +9300,9 @@ def codegen_kernel(kernel, device, options):
                 forward_args.append(arg.ctype() + " var_" + arg.label)
         forward_args.extend(adj.deterministic.kernel_args())
     else:
+        # Alignment-specialized kernels keep the runtime array ABI, but take the arrays as
+        # ``aligned_array_t`` so their element accesses can be widened.
+        align_spec = kernel.options.get("align_spec") if device == "cuda" else None
         # build forward signature
         forward_args = []
         if not is_external_constant_params_entry:
@@ -9308,7 +9311,13 @@ def codegen_kernel(kernel, device, options):
             forward_args.append("size_t task_index")
         elif not is_external_constant_params_entry:
             for arg in adj.args:
-                forward_args.append(arg.ctype() + " var_" + arg.label)
+                if align_spec and arg.label in align_spec:
+                    elem_ctype = Var.type_to_ctype(arg.type.dtype)
+                    forward_args.append(f"wp::aligned_array_t<{elem_ctype}, {arg.label}_align> var_{arg.label}")
+                    kernel_template_params.append(f"int {arg.label}_align")
+                    kernel_template_values.append(str(align_spec[arg.label]))
+                else:
+                    forward_args.append(arg.ctype() + " var_" + arg.label)
         elif len(adj.args) == 1 and is_external_constant_params_arg(adj.args[0]):
             arg = adj.args[0]
             template_fmt_args["constant_params_alias"] = (
@@ -9345,7 +9354,7 @@ def codegen_kernel(kernel, device, options):
             "forward_smem_spilling_str": forward_smem_spilling_str,
         }
     )
-    if specialize and device == "cuda":
+    if kernel_template_params and device == "cuda":
         template_fmt_args["template_params"] = ", ".join(kernel_template_params)
     template += template_forward
 
@@ -9390,7 +9399,7 @@ def codegen_kernel(kernel, device, options):
     # Spec mode emits a templated kernel: record the C++ name expression
     # so the module build can register it with NVRTC and look up the
     # lowered (mangled) symbol after compile.
-    if specialize and device == "cuda":
+    if kernel_template_params and device == "cuda":
         kernel.spec_name_expression = (
             f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(kernel_template_values)}>"
         )

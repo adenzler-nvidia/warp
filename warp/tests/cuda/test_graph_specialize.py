@@ -197,7 +197,7 @@ def _find_spec_cu(kernel_key):
     for cache_root in [wp.config.kernel_cache_dir, os.path.dirname(wp.config.kernel_cache_dir)]:
         for dirpath, _dirnames, filenames in os.walk(cache_root):
             for f in filenames:
-                if f.endswith(".cu") and "_spec_" in f and kernel_key in f:
+                if f.endswith(".cu") and ("_spec_" in f or "_align_" in f) and kernel_key in f:
                     return os.path.join(dirpath, f)
     return None
 
@@ -930,6 +930,59 @@ class TestKernelSpecialize(unittest.TestCase):
             expected[first : first + N * 4] = 2.0 * src_np[first : first + N * 4]
 
         np.testing.assert_array_equal(dst_buf.numpy(), expected)
+
+
+class TestAlignmentSpecialize(unittest.TestCase):
+    """Specialization on array alignment only, with runtime shapes and strides."""
+
+    def setUp(self):
+        self.saved = wp.config.enable_kernel_specialize
+        wp.config.enable_kernel_specialize = "alignment"
+
+    def tearDown(self):
+        wp.config.enable_kernel_specialize = self.saved
+
+    def test_aligned_and_misaligned_views(self):
+        N = 64
+        device = "cuda:0"
+        src_np = np.arange((N + 1) * 4, dtype=np.float32)
+        src_buf = wp.array(src_np, device=device)
+        dst_buf = wp.zeros((N + 1) * 4, dtype=float, device=device)
+
+        from warp._src.context import user_modules
+
+        expected = np.zeros_like(src_np)
+        for offset, specialized in ((0, True), (4, False)):
+            src = wp.array(ptr=src_buf.ptr + offset, dtype=wp.vec4, shape=(N,), device=device)
+            dst = wp.array(ptr=dst_buf.ptr + offset, dtype=wp.vec4, shape=(N,), device=device)
+            before = {k for k in user_modules if "_align_" in k}
+            wp.launch(scale_vec4, dim=N, inputs=[src, dst], device=device)
+            new_modules = {k for k in user_modules if "_align_" in k} - before
+            # Misaligned arrays use the regular module instead of compiling a variant.
+            self.assertEqual(len(new_modules), 1 if specialized else 0)
+            first = offset // 4
+            expected[first : first + N * 4] = 2.0 * src_np[first : first + N * 4]
+
+        np.testing.assert_array_equal(dst_buf.numpy(), expected)
+
+        cu_path = _find_spec_cu("scale_vec4_align")
+        self.assertIsNotNone(cu_path)
+        with open(cu_path) as f:
+            source = f.read()
+        self.assertIn("wp::aligned_array_t<wp::vec_t<4, wp::float32>, src_align> var_src", source)
+
+    def test_runtime_shapes_share_one_variant(self):
+        device = "cuda:0"
+        from warp._src.context import user_modules
+
+        before = {k for k in user_modules if "_align_" in k}
+        for n in (16, 32, 48):
+            src = wp.array(np.ones((n, 4), dtype=np.float32), dtype=wp.vec4, device=device)
+            dst = wp.zeros(n, dtype=wp.vec4, device=device)
+            wp.launch(scale_vec4, dim=n, inputs=[src, dst], device=device)
+            np.testing.assert_array_equal(dst.numpy(), 2.0 * np.ones((n, 4), dtype=np.float32))
+        new_modules = {k for k in user_modules if "_align_" in k} - before
+        self.assertLessEqual(len(new_modules), 1)
 
 
 if __name__ == "__main__":

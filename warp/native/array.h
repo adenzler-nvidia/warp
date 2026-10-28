@@ -363,6 +363,17 @@ struct baked_array_t : array_t<T> {
 };
 
 
+// Runtime-layout array whose data pointer and strides are known to be multiples of ``Align``
+// bytes. Kernels specialized on argument alignment take their arrays as this type so element
+// accesses can be widened, while shapes and strides stay runtime values.
+template <typename T, int Align> struct aligned_array_t : array_t<T> {
+    static constexpr int element_align = Align;
+
+    CUDA_CALLABLE aligned_array_t() = default;
+    CUDA_CALLABLE aligned_array_t(const array_t<T>& a) : array_t<T>(a) { }
+};
+
+
 // ---- Concepts for array-like proxies ----
 //
 // ``ArrayLike``       — any Warp array proxy with the inherited
@@ -1587,39 +1598,65 @@ template <ArrayLike A> inline CUDA_CALLABLE auto* aligned_data(const A& a)
     }
 }
 
+// Alignment shared by every element of an array, or 1 if unknown.
+template <typename A> constexpr int element_alignment()
+{
+    if constexpr (requires { A::element_align; }) {
+        return A::element_align;
+    } else if constexpr (requires { A::baked_align; }) {
+        int align = A::baked_align;
+        for (int d = 0; d < A::baked_ndim; ++d)
+            align = baked_view_align(align, A::baked_strides[d]);
+        return align;
+    } else {
+        return 1;
+    }
+}
+
+// Assuming the alignment of the final element address (rather than only the base pointer) keeps
+// it visible in functions that are not inlined.
+template <ArrayLike A, typename T> inline CUDA_CALLABLE T* aligned_element(const A&, T* ptr)
+{
+    constexpr int align = element_alignment<A>();
+    if constexpr (align > 1)
+        return static_cast<T*>(__builtin_assume_aligned(ptr, align));
+    else
+        return ptr;
+}
+
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
-        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a)));
+    return aligned_element(a, reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
+        + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))));
 }
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
+    return aligned_element(a, reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
-        + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a)));
+        + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))));
 }
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
+    return aligned_element(a, reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
         + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
-        + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a)));
+        + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a))));
 }
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k, int l)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
+    return aligned_element(a, reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
         + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
         + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a))
-        + ((l < 0 ? l + shape_at<3>(a) : l) * strides_at<3>(a)));
+        + ((l < 0 ? l + shape_at<3>(a) : l) * strides_at<3>(a))));
 }
 
 template <ArrayLike A> inline CUDA_CALLABLE void array_store(const A& a, int i, typename A::Type v)                       { *address(a, i) = v; }
@@ -1679,6 +1716,12 @@ template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align>
 inline CUDA_CALLABLE void
 store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3, Align>& value)
+{
+    *address = value;
+}
+
+template <typename T, int Align>
+inline CUDA_CALLABLE void store(array_t<T>* address, const aligned_array_t<T, Align>& value)
 {
     *address = value;
 }

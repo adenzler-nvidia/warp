@@ -2007,7 +2007,7 @@ def kernel(
     cluster_dim: int | None = None,
     module: Module | Literal["unique"] | str | None = None,
     module_options: dict[str, Any] | None = None,
-    specialize: bool | None = None,
+    specialize: bool | str | None = None,
     entry_point_abi: Literal["warp", "external_constant_params"] | None = None,
     grid_stride: bool | None = None,
 ):
@@ -4112,6 +4112,10 @@ class ModuleExec:
             # is set in ``_launch_specialized``; the ``.symbols``
             # mapping was parsed at module-load time.
             spec_expr = getattr(kernel, "spec_name_expression", None)
+            if options.get("align_spec"):
+                # Not set by codegen when the module was loaded from the cache.
+                aligns = ", ".join(str(a) for a in options["align_spec"].values())
+                spec_expr = f"{forward_name}<{aligns}>"
             if spec_expr is not None:
                 lookup_name = self.lowered_names.get(spec_expr, spec_expr)
             else:
@@ -12116,7 +12120,16 @@ def launch(
         # Per-kernel ``specialize`` option (set via @wp.kernel(specialize=...))
         # overrides the global flag when present.
         specialize_kernel = kernel.options.get("specialize", warp.config.enable_kernel_specialize)
-        if specialize_kernel and device.is_cuda and not adjoint and not record_cmd:
+        tape_kernel = kernel
+        if (
+            specialize_kernel == "alignment"
+            and device.is_cuda
+            and not adjoint
+            and not record_cmd
+            and _get_apic_capture_for_device(device) is None
+        ):
+            kernel = _get_alignment_specialization(kernel, fwd_args) or kernel
+        elif specialize_kernel is True and device.is_cuda and not adjoint and not record_cmd:
             if stream is None:
                 stream = device.stream
             # Detect graph capture context
@@ -12450,6 +12463,8 @@ def launch(
 
     # record on tape if one is active
     if runtime.tape and record_tape:
+        if total_dim_size > 0:
+            kernel = tape_kernel
         # record file, lineno, func as metadata
         frame = inspect.currentframe().f_back
         caller = {"file": frame.f_code.co_filename, "lineno": frame.f_lineno, "func": frame.f_code.co_name}
@@ -13620,6 +13635,68 @@ def _build_spec_name_expression(kernel, baked_args):
         _decls, lits = warp._src.codegen.format_baked_nttps(arg.label, v, warp_type=warp_type)
         values.extend(lits)
     return f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(values)}>"
+
+
+def _array_alignment(value) -> int:
+    """Return the alignment shared by an array's data pointer and strides, up to its element access width."""
+    size = warp._src.types.type_size_in_bytes(value.dtype)
+    width = min(16, size & -size)
+    bits = int(value.ptr or 0)
+    for stride in value.strides:
+        bits |= int(stride)
+    if bits == 0:
+        return width
+    return min(width, bits & -bits)
+
+
+def _get_alignment_specialization(kernel, args):
+    """Return a variant of ``kernel`` compiled for the alignment of its array arguments.
+
+    Returns ``None`` when no array argument is aligned beyond its scalar type, so the regular
+    module serves the launch.
+    """
+    align_spec = {}
+    for arg, value in zip(kernel.adj.args, args, strict=True):
+        if type(value) is not warp._src.types.array or not warp._src.types.matches_array_class(
+            arg.type, warp._src.types.array
+        ):
+            continue
+        align_spec[arg.label] = _array_alignment(value)
+
+    scalar_sizes = {
+        arg.label: warp._src.types.type_size_in_bytes(warp._src.types.type_scalar_type(arg.type.dtype))
+        for arg in kernel.adj.args
+        if arg.label in align_spec
+    }
+    if all(align <= scalar_sizes[label] for label, align in align_spec.items()):
+        return None
+
+    cache = kernel.__dict__.setdefault("_align_spec_kernels", {})
+    key = tuple(align_spec.values())
+    spec_kernel = cache.get(key)
+    if spec_kernel is not None:
+        return spec_kernel
+
+    h = hashlib.sha256(kernel.module.get_module_hash())
+    h.update(bytes(kernel.key, "utf-8"))
+    h.update(repr(sorted(align_spec.items())).encode())
+    spec_key = h.hexdigest()[:16]
+    module_name = f"{kernel.key}_align_{spec_key}"
+    module = get_module(module_name)
+    module.options.update(kernel.module.options)
+    module.options["enable_backward"] = False
+
+    overload_annotations = dict(kernel.adj.arg_types) if not kernel.is_generic else None
+    spec_kernel = Kernel(
+        func=kernel.func,
+        key=kernel.key,
+        module=module,
+        options=kernel.options | {"align_spec": align_spec, "spec_key": spec_key, "enable_backward": False},
+        source=kernel.adj.source,
+        overload_annotations=overload_annotations,
+    )
+    cache[key] = spec_kernel
+    return spec_kernel
 
 
 def _get_or_create_spec_kernel(module, module_name, kernel, baked_args, baked_hash):

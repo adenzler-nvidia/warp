@@ -102,7 +102,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
     from warp.tests.cuda.test_cluster_dim import TestClusterDim
     from warp.tests.cuda.test_cuda_arch_suffix import TestCudaArchSuffix
-    from warp.tests.cuda.test_graph_specialize import TestKernelSpecialize
+    from warp.tests.cuda.test_graph_specialize import TestAlignmentSpecialize, TestKernelSpecialize
     from warp.tests.cuda.test_cuda_max_registers import TestCudaMaxRegisters
     from warp.tests.cuda.test_cuda_smem_spilling import TestCudaSmemSpilling
     from warp.tests.cuda.test_kernel_attributes import TestKernelAttributes

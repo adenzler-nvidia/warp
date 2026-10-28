@@ -114,8 +114,11 @@ Prints information about each kernel launch including:
 Note: Enabling this flag impacts performance.
 """
 
-enable_kernel_specialize: bool = False
+enable_kernel_specialize: bool | str = False
 """Auto-specialize kernels during CUDA graph capture.
+
+Set to ``"alignment"`` to specialize only on the alignment of array arguments, keeping
+shapes, strides, and scalars as runtime values.
 
 When enabled, kernel launches within ``wp.capture_begin()``/``wp.capture_end()``
 automatically bake argument values as compile-time constants in the generated
