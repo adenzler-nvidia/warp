@@ -124,6 +124,14 @@ kernel execution.  First capture incurs additional JIT compilation time;
 subsequent captures with identical shapes/strides/scalars reuse cached binaries.
 """
 
+enable_kernel_specialize_alignment: bool = True
+"""Bake the alignment of array data pointers into specialized kernels.
+
+Lets the compiler use wide loads and stores for vector, matrix, and
+quaternion elements. Arrays with a different alignment compile their
+own specialization on first use.
+"""
+
 
 mode: str = "release"
 """Compilation mode for Warp kernels.

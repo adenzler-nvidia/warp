@@ -8358,6 +8358,8 @@ def format_baked_nttps(label, value, warp_type=None):
         lits = [str(int(value.shape[k])) if k < ndim else "0" for k in range(4)]
         lits += [str(int(value.strides[k])) if k < ndim else "0" for k in range(4)]
         lits.append(str(ndim))
+        decls.append(f"int {label}_align")
+        lits.append(str(baked_data_alignment(value)))
         return decls, lits
     if isinstance(value, ctypes._SimpleCData):
         if warp_type is None:
@@ -8374,6 +8376,16 @@ def format_baked_nttps(label, value, warp_type=None):
             lit = str(int(raw))
         return [f"{ctype_str} {label}"], [lit]
     raise ValueError(f"unsupported baked value for '{label}': {type(value).__name__}")
+
+
+def baked_data_alignment(value):
+    """Return the alignment of an array's data pointer to bake into a specialization, up to 16 bytes."""
+    if not warp.config.enable_kernel_specialize_alignment:
+        return 1
+    data = int(value.data or 0)
+    if data == 0:
+        return 16
+    return min(16, data & -data)
 
 
 def bake_scalar(ctype_str, var_name, label, pad="    "):
@@ -8402,7 +8414,7 @@ def bake_array_struct_decl(elem_ctype, value, label, pad="    "):
     stride_args = [f"{label}_stride_{i}" if i < value.ndim else "0" for i in range(4)]
     return (
         f"{pad}wp::baked_array_t<{elem_ctype}, {ndim_arg}, "
-        f"{', '.join(shape_args)}, {', '.join(stride_args)}> "
+        f"{', '.join(shape_args)}, {', '.join(stride_args)}, {label}_align> "
         f"var_{label}{{var_{label}_data}};\n"
     )
 

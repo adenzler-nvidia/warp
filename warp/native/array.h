@@ -314,8 +314,10 @@ template <typename T> struct array_t {
 // and read shape / stride from the template args directly, which is
 // what the user sees as "no constructed shape_t" for the int-indexed
 // view path.
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align = 1>
 struct baked_array_t : array_t<T> {
+    // Known alignment of ``data`` in bytes, so wide element accesses can be emitted.
+    static constexpr int baked_align = Align;
     // Static accessors exposing the template args as constexpr
     // values so generic templated consumers (e.g. `tile_global_t`,
     // `is_baked_array_t` traits) can route shape / stride reads
@@ -991,6 +993,13 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int 
 }
 
 
+// Alignment of a sub-array whose data pointer is offset by a multiple of ``stride``.
+constexpr int baked_view_align(int align, int stride)
+{
+    int low = stride & -stride;
+    return stride == 0 || low >= align ? align : low;
+}
+
 // view() overloads for baked_array_t with int indices.  The result is
 // itself a baked_array_t whose template args are shifted dims/strides
 // from the source — the new shape/strides are pure rearrangements of
@@ -1001,9 +1010,9 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int 
 // accept the returned baked_array_t via base-class upcast (the
 // inherited fields are populated by the returned baked_array_t's
 // ctor — those writes are constexpr and NVRTC folds them).
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 1, S1, S2, S3, 0, St1, St2, St3, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i)
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align>
+CUDA_CALLABLE inline baked_array_t<T, Ndim - 1, S1, S2, S3, 0, St1, St2, St3, 0, baked_view_align(Align, St0)>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3, Align>& src, int i)
 {
     static_assert(Ndim > 1, "view(arr, int) requires ndim > 1");
     assert(i >= -S0 && i < S0);
@@ -1015,9 +1024,9 @@ view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int 
     return { (T*)((char*)src.data + (size_t)i * St0) };
 }
 
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 2, S2, S3, 0, 0, St2, St3, 0, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j)
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align>
+CUDA_CALLABLE inline baked_array_t<T, Ndim - 2, S2, S3, 0, 0, St2, St3, 0, 0, baked_view_align(baked_view_align(Align, St0), St1)>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3, Align>& src, int i, int j)
 {
     static_assert(Ndim > 2, "view(arr, int, int) requires ndim > 2");
     assert(i >= -S0 && i < S0);
@@ -1033,9 +1042,9 @@ view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int 
     return { (T*)((char*)src.data + (size_t)i * St0 + (size_t)j * St1) };
 }
 
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
-CUDA_CALLABLE inline baked_array_t<T, Ndim - 3, S3, 0, 0, 0, St3, 0, 0, 0>
-view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& src, int i, int j, int k)
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align>
+CUDA_CALLABLE inline baked_array_t<T, Ndim - 3, S3, 0, 0, 0, St3, 0, 0, 0, baked_view_align(baked_view_align(baked_view_align(Align, St0), St1), St2)>
+view(const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3, Align>& src, int i, int j, int k)
 {
     static_assert(Ndim > 3, "view(arr, int, int, int) requires ndim > 3");
     assert(i >= -S0 && i < S0);
@@ -1566,18 +1575,30 @@ static_assert(BakedArrayLike<baked_array_t<float, 1, 4, 0, 0, 0, 4, 0, 0, 0>>,
 // to the legacy path's ``index()`` overloads.
 #if __cplusplus >= 202002L
 
+template <ArrayLike A> inline CUDA_CALLABLE auto* aligned_data(const A& a)
+{
+    if constexpr (requires { A::baked_align; }) {
+        if constexpr (A::baked_align > 1)
+            return static_cast<typename A::Type*>(__builtin_assume_aligned(a.data, A::baked_align));
+        else
+            return a.data;
+    } else {
+        return a.data;
+    }
+}
+
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a)));
 }
 template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
         + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a)));
 }
@@ -1585,7 +1606,7 @@ template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
         + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
         + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a)));
@@ -1594,7 +1615,7 @@ template <ArrayLike A>
 inline CUDA_CALLABLE auto* address(const A& a, int i, int j, int k, int l)
 {
     using T = typename A::Type;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(a.data)
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(aligned_data(a))
         + ((i < 0 ? i + shape_at<0>(a) : i) * strides_at<0>(a))
         + ((j < 0 ? j + shape_at<1>(a) : j) * strides_at<1>(a))
         + ((k < 0 ? k + shape_at<2>(a) : k) * strides_at<2>(a))
@@ -1655,9 +1676,9 @@ template <typename T> inline CUDA_CALLABLE void store(T* address, T value)
 // — implicit conversion isn't considered during deduction.  The
 // slicing assignment to the base subobject preserves data + the
 // inherited runtime fields populated by the baked ctor.
-template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3>
+template <typename T, int Ndim, int S0, int S1, int S2, int S3, int St0, int St1, int St2, int St3, int Align>
 inline CUDA_CALLABLE void
-store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3>& value)
+store(array_t<T>* address, const baked_array_t<T, Ndim, S0, S1, S2, S3, St0, St1, St2, St3, Align>& value)
 {
     *address = value;
 }

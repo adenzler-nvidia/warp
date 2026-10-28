@@ -13584,6 +13584,8 @@ def _hash_baked_args(baked_args, kernel_args, kernel_module_hash):
             for i in range(packed.ndim):
                 h.update(packed.shape[i].to_bytes(4, "little", signed=True))
                 h.update(packed.strides[i].to_bytes(4, "little", signed=True))
+            if warp.config.enable_kernel_specialize_alignment:
+                h.update(warp._src.codegen.baked_data_alignment(packed).to_bytes(4, "little"))
         else:
             h.update(bytes(packed))
     return h.hexdigest()[:16]

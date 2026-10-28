@@ -216,6 +216,12 @@ def _run_specialized(kernel, dim, inputs, device="cuda:0"):
     return new_specs
 
 
+@wp.kernel
+def scale_vec4(src: wp.array(dtype=wp.vec4), dst: wp.array(dtype=wp.vec4)):
+    i = wp.tid()
+    dst[i] = src[i] * 2.0
+
+
 class TestKernelSpecialize(unittest.TestCase):
     """Tests for kernel specialization."""
 
@@ -424,7 +430,7 @@ class TestKernelSpecialize(unittest.TestCase):
         # zero-padded since `bake_array_struct_decl` only fills 0..ndim).
         self.assertRegex(
             source,
-            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0, arr_shape_1, 0, 0, arr_stride_0, arr_stride_1, 0, 0>",
+            r"wp::baked_array_t<wp::float32, arr_ndim, arr_shape_0, arr_shape_1, 0, 0, arr_stride_0, arr_stride_1, 0, 0, arr_align>",
         )
         # Codegen passes the bare int index through to view (rather than
         # wrapping in slice_t(i, i, 0)).
@@ -905,6 +911,25 @@ class TestKernelSpecialize(unittest.TestCase):
         self.assertIn("scale_func_0(var_3, var_s)", source)
 
         np.testing.assert_allclose(out.numpy(), a.numpy() * 5.0, rtol=1e-5)
+
+    def test_misaligned_views_get_own_specialization(self):
+        """Views whose data pointer breaks the baked alignment compile their own specialization."""
+        N = 64
+        device = "cuda:0"
+        src_np = np.arange((N + 1) * 4, dtype=np.float32)
+        src_buf = wp.array(src_np, device=device)
+        dst_buf = wp.zeros((N + 1) * 4, dtype=float, device=device)
+
+        expected = np.zeros_like(src_np)
+        for offset in (0, 4):
+            src = wp.array(ptr=src_buf.ptr + offset, dtype=wp.vec4, shape=(N,), device=device)
+            dst = wp.array(ptr=dst_buf.ptr + offset, dtype=wp.vec4, shape=(N,), device=device)
+            new_specs = _run_specialized(scale_vec4, dim=N, inputs=[src, dst], device=device)
+            self.assertEqual(len(new_specs), 1)
+            first = offset // 4
+            expected[first : first + N * 4] = 2.0 * src_np[first : first + N * 4]
+
+        np.testing.assert_array_equal(dst_buf.numpy(), expected)
 
 
 if __name__ == "__main__":
