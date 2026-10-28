@@ -3326,6 +3326,9 @@ class ModuleHasher:
         # process but not across runs.
         ch.update(bytes(kernel.key, "utf-8"))
         for opt in sorted(kernel.options):
+            if opt == "baked_args":
+                # Its ctypes values stringify with addresses; "spec_key" hashes the baked values.
+                continue
             ch.update(bytes(f"{opt}:{kernel.options[opt]}", "utf-8"))
         ch.update(self.hash_adjoint(kernel.adj))
         ch.update(self._hash_kernel_return_annotation(kernel))
@@ -13619,7 +13622,7 @@ def _build_spec_name_expression(kernel, baked_args):
     return f"{kernel.get_mangled_name()}_cuda_kernel_forward<{', '.join(values)}>"
 
 
-def _get_or_create_spec_kernel(module, module_name, kernel, baked_args):
+def _get_or_create_spec_kernel(module, module_name, kernel, baked_args, baked_hash):
     """Module-level cache of the spec ``Kernel``.  Registering a fresh
     Kernel per launch used to churn ``_live_kernels``, force
     ``ModuleHasher`` to recompute a different hash each call, and
@@ -13642,7 +13645,7 @@ def _get_or_create_spec_kernel(module, module_name, kernel, baked_args):
             func=kernel.func,
             key=kernel.key,
             module=module,
-            options=kernel.options | {"baked_args": baked_args, "enable_backward": False},
+            options=kernel.options | {"baked_args": baked_args, "spec_key": baked_hash, "enable_backward": False},
             source=kernel.adj.source,
             overload_annotations=overload_annotations,
         )
@@ -13705,7 +13708,7 @@ def _launch_specialized(kernel, dim, inputs, device, block_dim, stream, max_bloc
         module.options["enable_backward"] = False
         module.options["_spec_initialized"] = True
 
-    spec_kernel = _get_or_create_spec_kernel(module, module_name, kernel, baked_args)
+    spec_kernel = _get_or_create_spec_kernel(module, module_name, kernel, baked_args, baked_hash)
 
     module_exec = module.load(device, block_dim)
     if not module_exec:
