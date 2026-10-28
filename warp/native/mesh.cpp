@@ -5,6 +5,7 @@
 
 #include "bvh.h"
 #include "cuda_util.h"
+#include "error.h"
 #include "mesh.h"
 
 #include <new>
@@ -12,15 +13,30 @@
 using namespace wp;
 
 #include <map>
+#include <mutex>
+#include <set>
 
 namespace {
 // host-side copy of mesh descriptors, maps GPU mesh address (id) to a CPU desc
 std::map<uint64_t, Mesh> g_mesh_descriptors;
+std::set<uint64_t> g_host_meshes;
+std::mutex g_host_meshes_mutex;
 
 }  // anonymous namespace
 
 
 namespace wp {
+
+bool mesh_get_descriptor_host(uint64_t id, Mesh& mesh)
+{
+    std::lock_guard<std::mutex> lock(g_host_meshes_mutex);
+    if (g_host_meshes.find(id) == g_host_meshes.end())
+        return false;
+    // Read the current descriptor: refit and set_points/set_velocities can
+    // update it after creation.
+    mesh = *reinterpret_cast<const Mesh*>(id);
+    return true;
+}
 
 bool mesh_get_descriptor(uint64_t id, Mesh& mesh)
 {
@@ -128,8 +144,7 @@ uint64_t wp_mesh_create_host(
 {
     Mesh* m
         = new (wp_alloc_host(sizeof(Mesh), "(native:mesh)")) Mesh(points, velocities, indices, num_points, num_tris);
-    const bool use_cubql = (constructor_type == CUBQL_MESH_CONSTRUCTOR_TYPE);
-    m->bvh_backend = use_cubql ? MESH_BVH_BACKEND_CUBQL : MESH_BVH_BACKEND_WARP;
+    const bool use_cubql = (constructor_type == BVH_CONSTRUCTOR_CUBQL);
 
     m->lowers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));
     m->uppers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));
@@ -156,35 +171,51 @@ uint64_t wp_mesh_create_host(
 
 #ifndef WP_DISABLE_CUBQL
     if (use_cubql) {
-        wp::cubql_bvh_create_host(m->lowers, m->uppers, num_tris, bvh_leaf_size, m->cubql_bvh);
+        wp::cubql_bvh_create_host(m->lowers, m->uppers, num_tris, bvh_leaf_size, m->bvh);
     } else
 #else
     if (use_cubql) {
-        fprintf(stderr, "Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)\n");
-        delete[] m->lowers;
-        delete[] m->uppers;
-        delete m;
+        wp::set_error_string("Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)");
+        wp_free_host(m->lowers);
+        wp_free_host(m->uppers);
+        m->~Mesh();
+        wp_free_host(m);
         return 0;
     }
 #endif
     {
         wp::bvh_create_host(m->lowers, m->uppers, num_tris, constructor_type, groups, bvh_leaf_size, m->bvh);
-
-        if (support_winding_number) {
-            int num_bvh_nodes = 2 * num_tris - 1;
-            m->solid_angle_props = static_cast<SolidAngleProps*>(
-                wp_alloc_host(sizeof(SolidAngleProps) * num_bvh_nodes, "(native:mesh)")
-            );
-            bvh_refit_with_solid_angle_host(m->bvh, *m);
-        }
     }
 
+    if (!m->bvh.node_lowers && num_tris > 0) {
+        wp_free_host(m->lowers);
+        wp_free_host(m->uppers);
+        m->~Mesh();
+        wp_free_host(m);
+        return 0;
+    }
+
+    if (support_winding_number) {
+        int num_bvh_nodes = 2 * num_tris - 1;
+        m->solid_angle_props
+            = static_cast<SolidAngleProps*>(wp_alloc_host(sizeof(SolidAngleProps) * num_bvh_nodes, "(native:mesh)"));
+        bvh_refit_with_solid_angle_host(m->bvh, *m);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_host_meshes_mutex);
+        g_host_meshes.insert(reinterpret_cast<uint64_t>(m));
+    }
     return (uint64_t)m;
 }
 
 
 void wp_mesh_destroy_host(uint64_t id)
 {
+    {
+        std::lock_guard<std::mutex> lock(g_host_meshes_mutex);
+        g_host_meshes.erase(id);
+    }
     Mesh* m = (Mesh*)(id);
 
     wp_free_host(m->lowers);
@@ -193,14 +224,7 @@ void wp_mesh_destroy_host(uint64_t id)
     if (m->solid_angle_props) {
         wp_free_host(m->solid_angle_props);
     }
-#ifndef WP_DISABLE_CUBQL
-    if (m->bvh_backend == MESH_BVH_BACKEND_CUBQL) {
-        wp::cubql_bvh_destroy_host(m->cubql_bvh);
-    } else
-#endif
-    {
-        wp::bvh_destroy_host(m->bvh);
-    }
+    wp::bvh_destroy_host(m->bvh);
 
     m->~Mesh();
     wp_free_host(m);
@@ -229,12 +253,7 @@ void wp_mesh_refit_host(uint64_t id)
     }
     m->average_edge_length = sum / (m->num_tris * 3);
 
-#ifndef WP_DISABLE_CUBQL
-    if (m->bvh_backend == MESH_BVH_BACKEND_CUBQL) {
-        wp::cubql_bvh_refit_host(m->cubql_bvh);
-    } else
-#endif
-        if (m->solid_angle_props) {
+    if (m->solid_angle_props) {
         // If solid angle were used, use refit solid angle
         bvh_refit_with_solid_angle_host(m->bvh, *m);
     } else {

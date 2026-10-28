@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warp-lang"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "NVIDIA Corporation", email = "warp-python@nvidia.com" }]
 description = "A Python framework for high-performance simulation and graphics programming"
 license = { text = "Apache-2.0" }
@@ -16,14 +16,14 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Natural Language :: English",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: 3 :: Only",
     "Environment :: GPU :: NVIDIA CUDA",
-    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
@@ -45,17 +45,18 @@ docs = [
     "myst_parser",
 ]
 benchmark = [
-    "usd-core>=25.5 ; platform_machine != 'aarch64' and python_version < '3.14'",
-    "usd-exchange>=2.2 ; python_version >= '3.10' and python_version < '3.13' and platform_machine == 'aarch64'",
+    "usd-core>=25.5 ; (sys_platform != 'linux' or platform_machine != 'aarch64') and (sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64' and platform_machine != 'aarch64'))",
+    "usd-exchange>=2.2 ; python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 examples = [
-    "blosc>=1.11.1",
+    "blosc>=1.11.1 ; sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64' and platform_machine != 'aarch64')",
     "matplotlib>=3.7.5",
+    "nlopt ; python_version < '3.15' and (sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64' and platform_machine != 'aarch64'))",
     "pillow>=10.4.0",
     "psutil>=7.1.0",
     "pyglet>=2.1.9",
-    "usd-core>=25.5 ; platform_machine != 'aarch64' and python_version < '3.14'",
-    "usd-exchange>=2.2 ; python_version >= '3.10' and python_version < '3.13' and platform_machine == 'aarch64'",
+    "usd-core>=25.5 ; (sys_platform != 'linux' or platform_machine != 'aarch64') and (sys_platform != 'win32' or (platform_machine != 'ARM64' and platform_machine != 'arm64' and platform_machine != 'aarch64'))",
+    "usd-exchange>=2.2 ; python_version < '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 torch-cu12 = [
     "warp-lang[examples]",
@@ -68,8 +69,8 @@ torch-cu13 = [
 dev = [
     "warp-lang[examples]",
     "warp-lang[docs]",
-    "nvtx",
-    "coverage[toml]",
+    "nvtx>=0.2.16",
+    "coverage",
     "ml-dtypes>=0.5.4",
 ]
 
@@ -86,9 +87,19 @@ cache-dir = ".cache/ruff"
 line-length = 120
 indent-width = 4
 extend-exclude = [
+    # Skill eval fixtures stand in for third-party codebases under assessment.
+    # Their shape is what the evals grade, so they are neither linted nor
+    # formatted.
+    "skills/*/evals/files",
     "warp/_src/thirdparty/appdirs.py",
     "warp/_src/thirdparty/dlpack.py",
-    "tools",
+    "tools/build",
+    "tools/ci/deploy_doc.py",
+    "tools/ci/publishing",
+    "tools/cmake",
+    "tools/packman",
+    "tools/pre-commit-hooks",
+    "tools/repoman",
 ]
 
 [tool.ruff.lint]
@@ -98,6 +109,7 @@ select = [
     "F",   # pyflakes
     "W",   # pycodestyle warnings
     "B",   # flake8-bugbear
+    "S101", # flake8-bandit: assert
     "C4",  # flake8-comprehensions
     "NPY", # NumPy-specific rules
     "PLC", # pylint convention
@@ -105,6 +117,11 @@ select = [
     "PLW", # pylint warning
     "UP",  # pyupgrade
     "RUF",
+    "D200", # One-line docstrings should fit on one line
+    "D205", # Separate summaries from descriptions with a blank line
+    "D400", # End summary lines with a period
+    "D401", # Write summary lines in the imperative mood
+    "D403", # Capitalize the first word of each docstring
 ]
 ignore = [
     "E501",    # Many lines are over 120 characters already
@@ -120,17 +137,34 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Enforce the selected pydocstyle rules only in the Warp test suite for now.
+"!warp/tests/**.py" = ["D200", "D205", "D400", "D401", "D403"]
 "__init__.py" = ["F401", "PLC0414"]
-"__init__.pyi" = ["E402", "I001"]
+"__init__.pyi" = ["B008", "E402", "I001"]
+# `warp/__init__.py` registers all Warp module source declarations before
+# importing implementation symbols, so the statement-before-import ordering is
+# intentional.
+"warp/__init__.py" = ["E402"]
 "warp/*.py" = ["PLC0414"]
 "warp/tests/*.py" = ["F841"]
+"warp/tests/**/*.py" = ["S101"]
+# Skill evaluation fixtures intentionally contain the defects agents must
+# find (e.g. a computed-but-never-consumed adjoint), so unused-variable
+# lints are expected there.
+"skills/warp-debug-gradients/evals/files/**/*.py" = ["F841", "RUF059"]
 "asv/benchmarks/**.py" = ["RUF012"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ruff.format]
-exclude = ["warp/__init__.pyi"]
+# These skill trees contain signed artifacts and must remain byte-for-byte
+# aligned with the skill-signing pipeline until formatting is coordinated there.
+exclude = [
+    "skills/warp-compile-time-optimizer/**",
+    "skills/warp-debug-gradients/**",
+    "warp/__init__.pyi",
+]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
@@ -138,6 +172,8 @@ line-ending = "auto"
 docstring-code-format = true
 
 [tool.coverage.run]
+# Use sys.monitoring on Python 3.12+ to reduce tracing overhead; Coverage.py falls back on older versions.
+core = "sysmon"
 source = ["warp", "warp.render"]
 disable_warnings = [
     "module-not-measured",
@@ -178,12 +214,6 @@ conflicts = [
     ],
 ]
 
-[[tool.uv.index]]
-name = "testpypi"
-url = "https://test.pypi.org/simple/"
-publish-url = "https://test.pypi.org/legacy/"
-explicit = true
-
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu126", extra = "torch-cu12" },
@@ -200,13 +230,57 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[tool.towncrier]
+directory = "changelog"
+filename = "CHANGELOG.md"
+start_string = "<!-- towncrier release notes start -->\n"
+title_format = "## [{version}] - {project_date}"
+issue_format = "[GH-{issue}](https://github.com/NVIDIA/warp/issues/{issue})"
+issue_pattern = "\\d+"
+wrap = false
+ignore = []
+
+[[tool.towncrier.type]]
+directory = "added"
+name = "Added"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "removed"
+name = "Removed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "deprecated"
+name = "Deprecated"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "changed"
+name = "Changed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "fixed"
+name = "Fixed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "documentation"
+name = "Documentation"
+showcontent = true
+
 [tool.typos]
-files.extend-exclude = ["/tools/packman", "/tools/repoman", "/PUBLICATIONS.md", "/licenses", "/warp/native/nanovdb", "/warp/native/cuBQL", "*.svg", "*.usda"]
+# Skill eval fixtures stand in for third-party codebases under assessment, so
+# their prose and identifiers are deliberately not held to Warp's conventions.
+files.extend-exclude = ["/tools/packman", "/tools/repoman", "/PUBLICATIONS.md", "/licenses", "/warp/native/nanovdb", "/warp/native/cuBQL", "*.svg", "*.usda", "/skills/*/evals/files"]
 
 [tool.typos.default]
 extend-ignore-re = [
     # MSVC compiler flags like /Fo, /Fe, /Fd, etc.
-    "/F[oedpircaOAu]"
+    "/F[oedpircaOAu]",
+    # Short-SHA commit links in design/deprecations.md, e.g. [ba7a865](https://github.com/NVIDIA/warp/commit/<sha>)
+    "\\[[0-9a-f]{7,40}\\]\\(https://github\\.com/NVIDIA/warp/commit/[0-9a-f]{7,40}\\)",
 ]
 
 [tool.typos.default.extend-words]

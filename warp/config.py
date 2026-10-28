@@ -14,71 +14,22 @@ setting documentation for details.
 For information on module-level and kernel-level settings, see :doc:`/user_guide/configuration`.
 """
 
+import os as _os
 import sys as _sys
 import types as _types
 from enum import IntEnum as _IntEnum
 
 from warp._src.logger import LOG_INFO as _LOG_INFO
-from warp._src.logger import log_warning as _log_warning
-
-_wp_module_name_ = "warp.config"
-
-_deprecated_verbose_warning_seen = False
-_deprecated_quiet_warning_seen = False
-_suppress_verbose_log_level_mapping = False
-
-
-def _is_internal_warp_config_access() -> bool:
-    try:
-        # Temporary verbose/quiet migration hook. Frame depth 3 assumes:
-        # _is_internal_warp_config_access -> _warn_deprecated_config_access
-        # -> module __getattribute__/__setattr__ -> caller. Remove this when
-        # verbose/quiet are removed.
-        module_name = _sys._getframe(3).f_globals.get("__name__", "")
-    except ValueError:
-        return False
-    return module_name == "warp" or module_name.startswith("warp.")
-
-
-def _warn_deprecated_config_access(name: str) -> None:
-    global _deprecated_verbose_warning_seen, _deprecated_quiet_warning_seen
-
-    if _is_internal_warp_config_access():
-        return
-
-    if name == "verbose":
-        if _deprecated_verbose_warning_seen:
-            return
-        message = "warp.config.verbose is deprecated; use warp.config.log_level = warp.LOG_DEBUG instead."
-    elif name == "quiet":
-        if _deprecated_quiet_warning_seen:
-            return
-        message = (
-            "warp.config.quiet is deprecated; use warp.config.log_level = warp.LOG_WARNING to suppress the init banner."
-        )
-    else:
-        return
-
-    _log_warning(message, category=DeprecationWarning, stacklevel=3)
-    if name == "verbose":
-        _deprecated_verbose_warning_seen = True
-    else:
-        _deprecated_quiet_warning_seen = True
 
 
 class _ConfigModule(_types.ModuleType):
-    def __getattribute__(self, name):
-        if name in ("verbose", "quiet"):
-            _warn_deprecated_config_access(name)
-        return super().__getattribute__(name)
-
     def __setattr__(self, name, value):
-        if name in ("verbose", "quiet"):
-            _warn_deprecated_config_access(name)
         if name == "launch_array_access_mode" and not isinstance(value, LaunchArrayAccessMode):
             raise ValueError(
                 f"warp.config.launch_array_access_mode must be a warp.config.LaunchArrayAccessMode value, got {value!r}"
             )
+        if name == "deterministic" and not isinstance(value, DeterministicMode):
+            raise ValueError(f"warp.config.deterministic must be a warp.DeterministicMode value, got {value!r}")
         super().__setattr__(name, value)
 
 
@@ -97,6 +48,19 @@ class LaunchArrayAccessMode(_IntEnum):
 
     STRICT = 2
     """Require every Warp array argument to be allocated on the launch device."""
+
+
+class DeterministicMode(_IntEnum):
+    """Deterministic execution modes for supported atomic operations."""
+
+    NOT_GUARANTEED = 0
+    """Use normal atomic execution without constraining atomic ordering."""
+
+    RUN_TO_RUN = 1
+    """Produce bit-exact repeated results on the same GPU architecture."""
+
+    GPU_TO_GPU = 2
+    """Use a stronger path intended to preserve results across GPU architectures."""
 
 
 launch_array_access_mode: LaunchArrayAccessMode = LaunchArrayAccessMode.RELAXED
@@ -119,7 +83,7 @@ Note: Strict and checked modes impact performance.
 """
 
 
-version: str = "1.15.0.dev0"
+version: str = "1.20.0.dev0"
 """Warp version string"""
 
 verify_fp: bool = False
@@ -160,6 +124,7 @@ kernel execution.  First capture incurs additional JIT compilation time;
 subsequent captures with identical shapes/strides/scalars reuse cached binaries.
 """
 
+
 mode: str = "release"
 """Compilation mode for Warp kernels.
 
@@ -183,24 +148,8 @@ Note: Higher optimization levels increase compilation time but may improve run-t
 This setting can be overridden at the module level by setting the ``"optimization_level"`` module option.
 """
 
-verbose: bool = False
-"""Enable detailed logging during code generation and compilation.
-
-.. deprecated::
-    Use ``warp.config.log_level = warp.LOG_DEBUG`` instead. Reading or setting
-    this flag emits a ``DeprecationWarning`` for external callers.
-"""
-
 verbose_warnings: bool = False
 """Enable extended warning messages with source location information."""
-
-quiet: bool = False
-"""Disable Warp module initialization messages.
-
-.. deprecated::
-    Use ``warp.config.log_level = warp.LOG_WARNING`` instead. Reading or setting
-    this flag emits a ``DeprecationWarning`` for external callers.
-"""
 
 log_level: int = _LOG_INFO
 """Log level threshold for Warp's logging infrastructure.
@@ -311,6 +260,22 @@ enable_backward: bool = True
 This setting can be overridden at the module level by setting the ``"enable_backward"`` module option.
 """
 
+enable_cpu_blocks: bool = False
+"""Enable experimental CPU kernel launches with more than one logical thread per block.
+
+When ``False``, CPU launch block dimensions greater than one resolve to one,
+preserving the historical CPU execution model. When ``True``, explicit CPU
+block dimensions from 2 through 1024 run with cooperative fibers.
+"""
+
+default_grid_stride: bool = True
+"""Default ``grid_stride`` for kernels that make no explicit choice.
+
+``False`` opts kernels into the lean launch path (no grid-stride loop, lower per-thread overhead and
+register pressure, but ``max_blocks`` cannot be capped). Lowest precedence: a per-kernel
+``@wp.kernel(grid_stride=...)`` argument or the module ``"default_grid_stride"`` option overrides it.
+"""
+
 enable_mathdx_gemm: bool = True
 """Use libmathdx (cuBLASDx) for tile_matmul on GPU when available.
 
@@ -347,23 +312,30 @@ This setting can be overridden at the module level by setting the
 ``"enable_mathdx_fft"`` module option.
 """
 
-cpu_compiler_flags: str | None = None
+cpu_compiler_flags: str | None = (
+    "-march=native -mllvm=-inline-threshold=9000 -mllvm=-inline-cold-callsite-threshold=3000"
+    " -mllvm=-slp-recursion-max-depth=4"
+)
 """Flags controlling CPU kernel compilation.
 
-Warp acts as a compiler driver for the embedded Clang frontend. The flag
-``-march=native`` is intercepted and triggers host CPU feature detection
-(equivalent to ``llvm::sys::getHostCPUName()`` + ``getHostCPUFeatures()``).
-All other flags are passed through to the Clang frontend as-is.
+The default detects host CPU features, raises LLVM's inlining thresholds,
+and limits SLP recursion depth to four instead of LLVM's default 12. Set this
+to ``None`` to retain host feature detection with LLVM's default inlining
+thresholds and SLP recursion depth.
+``""`` compiles for a generic CPU target. A flag string can include
+``-march=native``, Clang frontend flags, and LLVM arguments in either
+``-mllvm <option>`` or ``-mllvm=<option>`` form. Use ``-fno-vectorize`` to
+disable loop vectorization or ``-fno-slp-vectorize`` to disable SLP
+vectorization for a module.
 
-The value controls both CPU target detection and extra compiler flags:
+The ``"cpu_compiler_flags"`` module option replaces this global string for
+that module. Use ``"-march=native"`` to keep host feature detection while
+using LLVM's default inlining thresholds and SLP recursion depth. ``None`` at
+the module level inherits the global setting.
 
-- ``None`` (default): detect host CPU features (equivalent to ``"-march=native"``).
-- ``""``: disable host CPU detection; compile for a generic target.
-- ``"-march=native"``: explicitly detect host CPU features.
-- ``"-march=native -fno-vectorize"``: detect host CPU + pass ``-fno-vectorize``.
-- ``"-fno-vectorize"``: generic target + pass ``-fno-vectorize``.
-
-Changing this setting invalidates the kernel cache.
+The resolved flag string is part of the module cache key.
+LLVM options are a power-user feature with process-wide caveats; see
+:ref:`cpu-llvm-compiler-options`.
 """
 
 llvm_cuda: bool = False
@@ -375,8 +347,13 @@ enable_graph_capture_module_load_by_default: bool = True
 Only affects systems with CUDA driver versions below 12.3.
 """
 
-enable_mempools_at_init: bool = True
-"""Enable CUDA memory pools during device initialization when supported."""
+enable_mempools_at_init: bool = _os.environ.get("WARP_ENABLE_MEMPOOLS_AT_INIT", "1").lower() not in ("0", "false", "no")
+"""Enable CUDA memory pools during device initialization when supported.
+
+Set ``WARP_ENABLE_MEMPOOLS_AT_INIT`` to ``0``, ``false``, or ``no`` before
+importing Warp to disable automatic memory pool initialization (e.g. when
+sharing the process with a framework that owns its own GPU allocator).
+"""
 
 track_memory: bool = False
 """Enable tracking of memory allocations at initialization.
@@ -444,6 +421,42 @@ load_module_max_workers: int | None = 0
 For ``wp.load_module()`` and ``wp.force_load()``, if the ``max_workers`` parameter is not specified,
 the default number of worker threads is determined by this setting. ``0`` means serial loading.
 If ``None``, Warp determines the behavior (currently equal to ``min(os.cpu_count(), 4)``).
+"""
+
+deterministic: DeterministicMode = DeterministicMode.NOT_GUARANTEED
+"""Determinism guarantee for supported atomic operations.
+
+Accepted values are:
+
+- ``wp.DeterministicMode.NOT_GUARANTEED``: Default behavior.
+- ``wp.DeterministicMode.RUN_TO_RUN``: Bit-exact repeated results on the same GPU
+  architecture.
+- ``wp.DeterministicMode.GPU_TO_GPU``: Stronger cross-GPU reproducibility path.
+
+Set this before module creation/import for it to apply broadly. Existing
+modules can be changed by setting the ``"deterministic"`` module option.
+See :doc:`/user_guide/execution_and_performance/deterministic_execution` for supported patterns,
+performance considerations, and limitations.
+"""
+
+deterministic_max_records: int = 0
+"""Default per-target, per-thread record bound for deterministic atomics.
+
+The default ``0`` uses the code-generated lower bound. Increase this before
+module creation/import when kernels have data-dependent loops or repeated visits
+to the same atomic site that static analysis cannot bound.
+
+Modules can override this by setting the ``"deterministic_max_records"`` module
+option.
+"""
+
+deterministic_debug: bool = False
+"""Enable debug diagnostics for deterministic execution mode.
+
+When enabled, deterministic buffer overflows and slot-assignment mismatches may
+emit device-side diagnostics, including during CUDA graph replay.
+This setting is intended for debugging capacity issues and should remain disabled
+for normal execution, especially when CUDA graph capture is performance-critical.
 """
 
 _git_commit_hash: str | None = None

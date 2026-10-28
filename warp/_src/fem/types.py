@@ -5,8 +5,6 @@ from enum import IntEnum
 
 import warp as wp
 
-_wp_module_name_ = "warp.fem.types"
-
 # kept to avoid breaking existing example code, no longer used internally
 vec2i = wp.vec2i
 vec3i = wp.vec3i
@@ -181,3 +179,11 @@ class Domain:
 
     call_operator: "warp._src.fem.operator.Operator" = None  # noqa: F821 Set in operator.py
     """Current operator being resolved for this domain argument."""
+
+
+# register API functions so they appear in the documentation
+
+wp._src.context.register_api_function(
+    make_free_sample,
+    module="warp.fem",
+)

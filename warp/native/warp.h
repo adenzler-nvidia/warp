@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "api.h"
+
 // defines all crt + builtin types
 #include "builtin.h"
 
@@ -17,6 +19,21 @@
 #define WP_CUDA_GRAPH_CAPTURE_MODE_GLOBAL       0
 #define WP_CUDA_GRAPH_CAPTURE_MODE_THREAD_LOCAL 1
 #define WP_CUDA_GRAPH_CAPTURE_MODE_RELAXED      2
+
+enum wp_memory_kind {
+    WP_MEMORY_KIND_UNKNOWN = 0,
+    WP_MEMORY_KIND_HOST = 1,
+    WP_MEMORY_KIND_PINNED = 2,
+    WP_MEMORY_KIND_CUDA_DEVICE = 3,
+    WP_MEMORY_KIND_CUDA_MEMPOOL = 4,
+    WP_MEMORY_KIND_CUDA_MANAGED = 5,
+};
+
+enum wp_volume_validation_result {
+    WP_VOLUME_VALIDATION_INVALID = 0,
+    WP_VOLUME_VALIDATION_SUCCESS = 1,
+    WP_VOLUME_VALIDATION_UNSUPPORTED_LAYOUT = 2,
+};
 
 struct timing_result_t;
 
@@ -53,7 +70,9 @@ WP_API void* wp_alloc_host(size_t s, const char* tag = nullptr);
 WP_API void* wp_alloc_pinned(size_t s, const char* tag = nullptr);
 WP_API void* wp_alloc_device(void* context, size_t s, const char* tag = nullptr);
 WP_API void* wp_alloc_device_default(void* context, size_t s, const char* tag = nullptr);
-WP_API void* wp_alloc_device_async(void* context, size_t s, const char* tag = nullptr);
+WP_API void*
+wp_alloc_device_async(void* context, size_t s, void* stream = WP_CURRENT_STREAM, const char* tag = nullptr);
+WP_API void* wp_alloc_device_managed(void* context, size_t s, const char* tag = nullptr);
 
 WP_API void wp_free_host(void* ptr);
 WP_API void wp_free_pinned(void* ptr);
@@ -90,17 +109,6 @@ WP_API uint64_t wp_bvh_create_device(
 WP_API void wp_bvh_destroy_device(uint64_t id);
 WP_API void wp_bvh_refit_device(uint64_t id);
 WP_API void wp_bvh_rebuild_device(uint64_t id);
-
-WP_API uint64_t wp_cubql_bvh_create_host(wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size);
-WP_API void wp_cubql_bvh_destroy_host(uint64_t id);
-WP_API void wp_cubql_bvh_refit_host(uint64_t id);
-WP_API void wp_cubql_bvh_rebuild_host(uint64_t id);
-
-WP_API uint64_t
-wp_cubql_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size);
-WP_API void wp_cubql_bvh_destroy_device(uint64_t id);
-WP_API void wp_cubql_bvh_refit_device(uint64_t id);
-WP_API void wp_cubql_bvh_rebuild_device(uint64_t id);
 
 // create a user-accessible copy of the mesh, it is the
 // users responsibility to keep-alive the points/tris data for the duration of the mesh lifetime
@@ -142,18 +150,97 @@ WP_API void wp_mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> vel
 // Hash grid (type: 0=float16, 1=float32, 2=float64)
 WP_API uint64_t wp_hash_grid_create_host(int type, int dim_x, int dim_y, int dim_z);
 WP_API void wp_hash_grid_destroy_host(uint64_t id, int type);
-WP_API void wp_hash_grid_update_host(uint64_t id, int type, double cell_width, const void* points);
-WP_API void wp_hash_grid_reserve_host(uint64_t id, int type, int num_points);
+WP_API void wp_hash_grid_update_host(uint64_t id, int type, double cell_width, const void* points, const void* groups);
+WP_API void wp_hash_grid_reserve_host(uint64_t id, int type, int num_points, bool with_groups);
 
 WP_API uint64_t wp_hash_grid_create_device(void* context, int type, int dim_x, int dim_y, int dim_z);
 WP_API void wp_hash_grid_destroy_device(uint64_t id, int type);
-WP_API void wp_hash_grid_update_device(uint64_t id, int type, double cell_width, const void* points);
-WP_API void wp_hash_grid_reserve_device(uint64_t id, int type, int num_points);
+WP_API void
+wp_hash_grid_update_device(uint64_t id, int type, double cell_width, const void* points, const void* groups);
+WP_API void wp_hash_grid_reserve_device(uint64_t id, int type, int num_points, bool with_groups);
 
+WP_API int wp_volume_validate_host(const void* buf, uint64_t size);
 WP_API uint64_t wp_volume_create_host(void* buf, uint64_t size, bool copy, bool owner);
 WP_API void wp_volume_get_tiles_host(uint64_t id, void* buf);
 WP_API void wp_volume_get_voxels_host(uint64_t id, void* buf);
 WP_API void wp_volume_destroy_host(uint64_t id);
+
+WP_API uint64_t wp_volume_from_tiles_host(
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    const void* bg_value,
+    uint32_t bg_value_size,
+    const char* bg_value_type,
+    bool rebuildable,
+    uint32_t max_tiles,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
+);
+WP_API uint64_t wp_volume_index_from_tiles_host(
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    bool rebuildable,
+    uint32_t max_tiles,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
+);
+WP_API uint64_t wp_volume_from_active_voxels_host(
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    bool rebuildable,
+    uint32_t max_active_voxels,
+    uint32_t max_leaf_nodes,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
+);
+WP_API void wp_volume_rebuild_from_tiles_host(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    const void* bg_value,
+    uint32_t bg_value_size,
+    const char* bg_value_type,
+    uint32_t* status
+);
+WP_API void wp_volume_index_rebuild_from_tiles_host(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    uint32_t* status
+);
+WP_API void wp_volume_rebuild_from_active_voxels_host(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    uint32_t* status
+);
 
 WP_API uint64_t wp_volume_create_device(void* context, void* buf, uint64_t size, bool copy, bool owner);
 WP_API void wp_volume_get_tiles_device(uint64_t id, void* buf);
@@ -164,23 +251,88 @@ WP_API uint64_t wp_volume_from_tiles_device(
     void* context,
     void* points,
     int num_points,
+    const int32_t* point_mask,
     float transform[9],
     float translation[3],
     bool points_in_world_space,
     const void* bg_value,
     uint32_t bg_value_size,
-    const char* bg_value_type
+    const char* bg_value_type,
+    bool rebuildable,
+    uint32_t max_tiles,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
 );
 WP_API uint64_t wp_volume_index_from_tiles_device(
-    void* context, void* points, int num_points, float transform[9], float translation[3], bool points_in_world_space
+    void* context,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    bool rebuildable,
+    uint32_t max_tiles,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
 );
 WP_API uint64_t wp_volume_from_active_voxels_device(
-    void* context, void* points, int num_points, float transform[9], float translation[3], bool points_in_world_space
+    void* context,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    bool rebuildable,
+    uint32_t max_active_voxels,
+    uint32_t max_leaf_nodes,
+    uint32_t max_lower_nodes,
+    uint32_t max_upper_nodes,
+    uint32_t* status
+);
+WP_API void wp_volume_rebuild_from_tiles_device(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    const void* bg_value,
+    uint32_t bg_value_size,
+    const char* bg_value_type,
+    uint32_t* status
+);
+WP_API void wp_volume_index_rebuild_from_tiles_device(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    uint32_t* status
+);
+WP_API void wp_volume_rebuild_from_active_voxels_device(
+    uint64_t id,
+    void* points,
+    int num_points,
+    const int32_t* point_mask,
+    float transform[9],
+    float translation[3],
+    bool points_in_world_space,
+    uint32_t* status
 );
 
 WP_API void wp_volume_get_buffer_info(uint64_t id, void** buf, uint64_t* size);
 WP_API void wp_volume_get_voxel_size(uint64_t id, float* dx, float* dy, float* dz);
 WP_API void wp_volume_get_tile_and_voxel_count(uint64_t id, uint32_t& tile_count, uint64_t& voxel_count);
+WP_API void wp_volume_get_active_stats(
+    uint64_t id, uint64_t* voxel_count, uint32_t* leaf_count, uint32_t* lower_count, uint32_t* upper_count
+);
 WP_API const char* wp_volume_get_grid_info(
     uint64_t id,
     uint64_t* grid_size,
@@ -303,16 +455,16 @@ WP_API void wp_array_scan_double_host(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 );
 
-WP_API void wp_array_scan_int_device(
+WP_API bool wp_array_scan_int_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 );
-WP_API void wp_array_scan_int64_device(
+WP_API bool wp_array_scan_int64_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 );
-WP_API void wp_array_scan_float_device(
+WP_API bool wp_array_scan_float_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 );
-WP_API void wp_array_scan_double_device(
+WP_API bool wp_array_scan_double_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 );
 
@@ -346,7 +498,7 @@ wp_radix_sort_pairs_uint64_host(uint64_t keys, uint64_t values, int n, int begin
 WP_API void
 wp_radix_sort_pairs_uint64_device(uint64_t keys, uint64_t values, int n, int begin_bit, int end_bit, int value_size);
 
-WP_API void wp_segmented_sort_pairs_float_host(
+WP_API bool wp_segmented_sort_pairs_float_host(
     uint64_t keys,
     uint64_t values,
     int n,
@@ -363,7 +515,7 @@ WP_API void wp_segmented_sort_pairs_float_device(
     int num_segments
 );
 
-WP_API void wp_segmented_sort_pairs_int_host(
+WP_API bool wp_segmented_sort_pairs_int_host(
     uint64_t keys,
     uint64_t values,
     int n,
@@ -385,6 +537,41 @@ wp_runlength_encode_int_host(uint64_t values, uint64_t run_values, uint64_t run_
 WP_API void
 wp_runlength_encode_int_device(uint64_t values, uint64_t run_values, uint64_t run_lengths, uint64_t run_count, int n);
 
+// Deterministic mode: sort scatter buffer and apply component-wise segmented reduction.
+WP_API size_t
+wp_deterministic_sort_reduce_workspace_size(int count, int op, int scalar_type, int components, int determinism_level);
+WP_API void wp_deterministic_sort_reduce_device(
+    uint64_t keys,
+    uint64_t values,
+    int count,
+    uint64_t dest_array,
+    int dest_size,
+    int op,
+    int scalar_type,
+    int components,
+    int determinism_level,
+    uint64_t workspace,
+    size_t workspace_size
+);
+WP_API size_t wp_deterministic_counter_scan_workspace_size(int count);
+WP_API void wp_deterministic_counter_scan_device(
+    uint64_t keys,
+    uint64_t values,
+    int count,
+    uint64_t prefixes,
+    uint64_t counter_bases,
+    uint64_t counter_totals,
+    int counter_size,
+    uint64_t workspace,
+    size_t workspace_size
+);
+WP_API void wp_deterministic_counter_writeback_device(
+    uint64_t keys, int count, uint64_t counter_totals, uint64_t counters, int counter_size
+);
+WP_API void wp_deterministic_counter_validate_replay_device(
+    uint64_t expected_counts, uint64_t replay_counts, int count, uint64_t error, int debug
+);
+
 WP_API void wp_bsr_matrix_from_triplets_host(
     int block_size,
     int scalar_size_in_bytes,
@@ -401,9 +588,7 @@ WP_API void wp_bsr_matrix_from_triplets_host(
     int* summed_block_indices,
     int* bsr_offsets,
     const int* bsr_row_counts,
-    int* bsr_columns,
-    int* bsr_nnz,
-    void* bsr_nnz_event
+    int* bsr_columns
 );
 WP_API void wp_bsr_matrix_from_triplets_device(
     int block_size,
@@ -421,9 +606,7 @@ WP_API void wp_bsr_matrix_from_triplets_device(
     int* summed_block_indices,
     int* bsr_offsets,
     const int* bsr_row_counts,
-    int* bsr_columns,
-    int* bsr_nnz,
-    void* bsr_nnz_event
+    int* bsr_columns
 );
 
 WP_API void wp_bsr_transpose_host(
@@ -455,6 +638,7 @@ WP_API void wp_bsr_transpose_device(
 
 WP_API void wp_bsr_compress_inplace_host(
     int row_count,
+    int col_count,
     int block_size,
     int scalar_size_in_bytes,
     int scalar_type,
@@ -466,12 +650,11 @@ WP_API void wp_bsr_compress_inplace_host(
     int* bsr_row_counts,
     int* bsr_columns,
     void* bsr_values,
-    bool compress_values,
-    int* bsr_nnz,
-    void* bsr_nnz_event
+    bool compress_values
 );
 WP_API void wp_bsr_compress_inplace_device(
     int row_count,
+    int col_count,
     int block_size,
     int scalar_size_in_bytes,
     int scalar_type,
@@ -483,9 +666,7 @@ WP_API void wp_bsr_compress_inplace_device(
     int* bsr_row_counts,
     int* bsr_columns,
     void* bsr_values,
-    bool compress_values,
-    int* bsr_nnz,
-    void* bsr_nnz_event
+    bool compress_values
 );
 
 
@@ -518,6 +699,9 @@ WP_API int wp_cuda_device_is_uva(int ordinal);
 WP_API int wp_cuda_device_get_pageable_memory_access(int ordinal);
 WP_API int wp_cuda_device_get_direct_managed_mem_access_from_host(int ordinal);
 WP_API int wp_cuda_device_get_host_native_atomic_supported(int ordinal);
+WP_API int wp_cuda_device_get_managed_memory_supported(int ordinal);
+WP_API int wp_cuda_device_get_concurrent_managed_access_supported(int ordinal);
+WP_API int wp_cuda_pointer_get_memory_kind(void* context, void* ptr);
 WP_API int wp_cuda_device_is_mempool_supported(int ordinal);
 WP_API int wp_cuda_device_is_ipc_supported(int ordinal);
 WP_API int wp_cuda_device_set_mempool_release_threshold(int ordinal, uint64_t threshold);
@@ -540,7 +724,11 @@ WP_API void* wp_cuda_context_get_stream(void* context);
 WP_API void wp_cuda_context_set_stream(void* context, void* stream, int sync);
 
 // ensures all device side operations have completed in the current context
-WP_API void wp_cuda_context_synchronize(void* context);
+WP_API bool wp_cuda_context_synchronize(void* context);
+
+// profiler control for the current CUDA context (equivalent to cuProfilerStart/cuProfilerStop)
+WP_API bool wp_cuda_profiler_start(void* context);
+WP_API bool wp_cuda_profiler_stop(void* context);
 
 // return cudaError_t code
 WP_API uint64_t wp_cuda_context_check(void* context);
@@ -565,10 +753,12 @@ WP_API int wp_cuda_stream_query(void* stream);
 WP_API void wp_cuda_stream_register(void* context, void* stream);
 WP_API void wp_cuda_stream_unregister(void* context, void* stream);
 WP_API void* wp_cuda_stream_get_current();
-WP_API void wp_cuda_stream_synchronize(void* stream);
+WP_API bool wp_cuda_stream_synchronize(void* stream);
 WP_API void wp_cuda_stream_wait_event(void* stream, void* event, bool external = false);
 WP_API void wp_cuda_stream_wait_stream(void* stream, void* other_stream, void* event, bool external = false);
 WP_API int wp_cuda_stream_is_capturing(void* stream);
+WP_API int wp_cuda_stream_is_blocking(void* stream);
+WP_API int wp_cuda_thread_exchange_capture_mode(int mode);
 WP_API uint64_t wp_cuda_stream_get_capture_id(void* stream);
 WP_API int wp_cuda_stream_get_priority(void* stream);
 
@@ -576,7 +766,7 @@ WP_API void* wp_cuda_event_create(void* context, unsigned flags);
 WP_API void wp_cuda_event_destroy(void* event);
 WP_API int wp_cuda_event_query(void* event);
 WP_API void wp_cuda_event_record(void* event, void* stream, bool external = false);
-WP_API void wp_cuda_event_synchronize(void* event);
+WP_API bool wp_cuda_event_synchronize(void* event);
 WP_API float wp_cuda_event_elapsed_time(void* start_event, void* end_event);
 
 WP_API bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int mode);
@@ -659,6 +849,10 @@ WP_API bool wp_cuda_compile_fft(
     int precision,
     int* shared_memory_size
 );
+// alignment_A/B/C: per-operand byte alignment for the cuBLASDx Alignment operator; any value <= 0 leaves
+// every operand at its default. enable_static_block_dim: non-zero enables cublasdx::experimental::StaticBlockDim.
+// suppress_errors: non-zero suppresses the error print when cuBLASDx rejects the configuration (the caller
+// retries without the alignment operator).
 WP_API bool wp_cuda_compile_dot(
     const char* ltoir_output_path,
     const char* symbol_name,
@@ -676,7 +870,15 @@ WP_API bool wp_cuda_compile_dot(
     int arrangement_A,
     int arrangement_B,
     int arrangement_C,
-    int num_threads
+    int num_threads,
+    int lda,
+    int ldb,
+    int ldc,
+    int alignment_A,
+    int alignment_B,
+    int alignment_C,
+    int enable_static_block_dim,
+    int suppress_errors
 );
 WP_API bool wp_cuda_compile_solver(
     const char* fatbin_output_path,
@@ -711,6 +913,8 @@ WP_API size_t wp_cuda_launch_kernel(
     size_t dim,
     int max_blocks,
     int block_dim,
+    int grid_stride,
+    int cluster_dim,
     int shared_memory_bytes,
     void** args,
     void* stream,
@@ -718,6 +922,24 @@ WP_API size_t wp_cuda_launch_kernel(
 );
 WP_API int wp_cuda_get_max_shared_memory(void* context);
 WP_API bool wp_cuda_configure_kernel_shared_memory(void* kernel, int size);
+// Static (compile-time) shared memory the loaded kernel reserves per block, in bytes.
+// Returns -1 if the kernel handle is null or the driver query fails. The dynamic shared
+// memory a kernel can be configured for is wp_cuda_get_max_shared_memory() minus this value.
+WP_API int wp_cuda_get_kernel_static_shared_memory(void* context, void* kernel);
+// Query all public properties for a loaded CUDA function in one batch.
+// Returns false if arguments are invalid or any driver query fails. The properties
+// buffer is updated only after every query succeeds.
+WP_API bool wp_cuda_get_kernel_properties(void* context, void* kernel, int* properties, int property_count);
+// Set CUDA Thread Block Cluster attributes on a loaded kernel function.
+// For total cluster size > 8 (non-portable range), enables
+// CU_FUNC_NON_PORTABLE_CLUSTER_SIZE_ALLOWED. Sizes <= 8 are no-ops at this
+// layer (the cluster dimension itself is set via __cluster_dims__ in codegen).
+// Returns true on success or no-op; false on driver error.
+WP_API bool wp_cuda_set_kernel_cluster_attrs(void* kernel, int cx, int cy, int cz);
+// Query the maximum cluster_dim (CTA count, 1D product) usable for *kernel*
+// at the given block_dim and dynamic shared memory configuration. Returns
+// 1 if the device does not support clusters or on driver error.
+WP_API int wp_cuda_get_max_cluster_dim(void* context, void* kernel, int block_dim, int dynamic_smem_bytes);
 WP_API bool wp_cuda_get_suggested_block_size(
     void* context, void* kernel, int shared_memory_bytes, int* block_size_out, int* min_grid_size_out
 );
@@ -743,7 +965,13 @@ WP_API void wp_cuda_timing_end(timing_result_t* results, int size);
 // graph coloring
 WP_API int wp_graph_coloring(int num_nodes, wp::array_t<int> edges, int algorithm, wp::array_t<int> node_colors);
 WP_API float wp_balance_coloring(
-    int num_nodes, wp::array_t<int> edges, int num_colors, float target_max_min_ratio, wp::array_t<int> node_colors
+    int num_nodes,
+    wp::array_t<int> edges,
+    int num_colors,
+    float target_max_min_ratio,
+    int max_iterations,
+    wp::array_t<int> node_colors,
+    int* iteration_limit_reached
 );
 
 // allocation tracking

@@ -19,14 +19,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+
+CANONICAL_WHEEL_PLATFORMS = {
+    "manylinux_2_28_x86_64",
+    "manylinux_2_34_aarch64",
+    "win_amd64",
+    "macosx_11_0_arm64",
+}
+# Windows on Arm wheels are built by GitHub Actions and uploaded to Artifactory
+# by hand, so publishing treats them as optional for now, with no set end date.
+# After this workflow has worked for a few releases, consider moving win_arm64
+# into CANONICAL_WHEEL_PLATFORMS so publishing refuses to proceed without it.
+OPTIONAL_WHEEL_PLATFORMS = {"win_arm64"}
+OPTIONAL_WHEEL_LOOKUP_TIMEOUT = 30
+WARP_WHEEL_FILENAME_PATTERN = re.compile(r"^warp_lang-(?P<version>[^-]+)-py3-none-(?P<platform>[^.]+)\.whl$")
 
 
 class KitmakerClient:
@@ -47,7 +64,16 @@ class KitmakerClient:
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
 
-    def create_release(self, project_id, project_name, pic_email, wheels, upload=True, devzone_subdir=None):
+    def create_release(
+        self,
+        project_id,
+        project_name,
+        pic_email,
+        wheels,
+        upload=True,
+        devzone_subdir=None,
+        mirroring_strategy=None,
+    ):
         """Create a release and return the release UUID."""
         url = f"{self.base_url}/projects/{project_id}/releases"
         payload = {
@@ -58,6 +84,7 @@ class KitmakerClient:
                     "job_type": "wheel-release-job",
                     "url": wheel_url,
                     "upload": upload,
+                    **({"mirroring_strategy": mirroring_strategy} if mirroring_strategy else {}),
                     **({"devzone_subdir": devzone_subdir} if devzone_subdir else {}),
                 }
                 for wheel_url in wheels
@@ -130,6 +157,123 @@ class KitmakerClient:
             time.sleep(poll_interval)
 
 
+def validate_canonical_wheel_urls(wheel_urls):
+    """Validate the canonical Warp wheel URL set, plus at most one optional wheel."""
+    required_count = len(CANONICAL_WHEEL_PLATFORMS)
+    if not required_count <= len(wheel_urls) <= required_count + 1:
+        raise ValueError(
+            f"expected {required_count} canonical wheel URLs plus at most 1 optional wheel URL, found {len(wheel_urls)}"
+        )
+
+    platforms = []
+    versions = set()
+    errors = []
+    for wheel_url in wheel_urls:
+        filename = wheel_url.rsplit("/", 1)[-1]
+        match = WARP_WHEEL_FILENAME_PATTERN.fullmatch(filename)
+        if match is None:
+            errors.append(f"invalid Warp wheel filename: {filename}")
+            continue
+        versions.add(match.group("version"))
+        platforms.append(match.group("platform"))
+
+    actual_platforms = set(platforms)
+    missing_platforms = CANONICAL_WHEEL_PLATFORMS - actual_platforms
+    unsupported_platforms = actual_platforms - CANONICAL_WHEEL_PLATFORMS - OPTIONAL_WHEEL_PLATFORMS
+    duplicate_platforms = {platform for platform in actual_platforms if platforms.count(platform) > 1}
+    if missing_platforms:
+        errors.append(f"missing platforms: {', '.join(sorted(missing_platforms))}")
+    if unsupported_platforms:
+        errors.append(f"unsupported platforms: {', '.join(sorted(unsupported_platforms))}")
+    if duplicate_platforms:
+        errors.append(f"duplicate platforms: {', '.join(sorted(duplicate_platforms))}")
+    if len(versions) > 1:
+        errors.append(f"mixed versions: {', '.join(sorted(versions))}")
+    if any("+" in version for version in versions):
+        errors.append("canonical wheels must not use a local version suffix")
+    if errors:
+        raise ValueError("invalid canonical Warp wheel URL set:\n- " + "\n- ".join(errors))
+
+
+def get_wheel_filename_match(wheel_url):
+    """Return the filename match for a Warp wheel URL, or None if the filename is not a Warp wheel."""
+    return WARP_WHEEL_FILENAME_PATTERN.fullmatch(wheel_url.rsplit("/", 1)[-1])
+
+
+def get_https_origin(url):
+    """Return a normalized HTTPS origin, or None for invalid URLs or URLs with credentials."""
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            return parsed.scheme, parsed.hostname, parsed.port if parsed.port is not None else 443
+    except ValueError:
+        pass
+    return None
+
+
+def select_optional_woa_wheel(wheel_urls, *, artifact_token, artifact_base_url=None, verify_ssl=True):
+    """Return a new wheel list that includes the optional Windows on Arm wheel if Artifactory has it.
+
+    The wheel URLs must already pass ``validate_canonical_wheel_urls``. The input list is not
+    modified. No lookup outcome raises: unless the wheel is found, the reason is logged and the
+    returned list holds the same wheels as the input. Discovery requires a valid
+    ``artifact_base_url`` with the same HTTPS origin as the candidate wheel URL.
+    """
+    if any(get_wheel_filename_match(url).group("platform") in OPTIONAL_WHEEL_PLATFORMS for url in wheel_urls):
+        print("Windows on Arm wheel supplied explicitly; skipping lookup")
+        return list(wheel_urls)
+
+    parents = {url.rsplit("/", 1)[0] for url in wheel_urls}
+    version = get_wheel_filename_match(wheel_urls[0]).group("version")
+    candidate = f"{wheel_urls[0].rsplit('/', 1)[0]}/warp_lang-{version}-py3-none-win_arm64.whl"
+    artifact_origin = get_https_origin(artifact_base_url or "")
+    could_not_check = (
+        "Warning: could not check for optional Windows on Arm wheel ({}); publishing without it. "
+        "Publish it separately if it was uploaded."
+    )
+    if len(parents) != 1:
+        message = could_not_check.format("canonical wheels are not in one directory")
+    elif not artifact_token:
+        message = could_not_check.format("ARTIFACTORY_SVC_ACCESS_TOKEN is not set")
+    elif not artifact_base_url:
+        message = could_not_check.format("ARTIFACTORY_BASE_URL is not set")
+    elif artifact_origin is None:
+        message = could_not_check.format("ARTIFACTORY_BASE_URL is not a valid HTTPS URL without credentials")
+    elif get_https_origin(candidate) != artifact_origin:
+        message = could_not_check.format("wheel URL does not match the ARTIFACTORY_BASE_URL HTTPS origin")
+    else:
+        request_kwargs = {
+            "headers": {"Authorization": f"Bearer {artifact_token}"},
+            "timeout": OPTIONAL_WHEEL_LOOKUP_TIMEOUT,
+            "verify": verify_ssl,
+            "allow_redirects": True,
+        }
+        try:
+            status = requests.head(candidate, **request_kwargs).status_code
+            if status == 405:
+                # Some repositories reject HEAD. Stream the GET so the wheel body is never downloaded.
+                with requests.get(candidate, stream=True, **request_kwargs) as response:
+                    status = response.status_code
+        except requests.RequestException as error:
+            message = could_not_check.format(f"{type(error).__name__} for {candidate}")
+        else:
+            if status == 200:
+                return list(wheel_urls) + [candidate]
+            if status == 404:
+                message = f"Optional Windows on Arm wheel not found: {candidate}"
+            else:
+                message = could_not_check.format(f"HTTP {status} for {candidate}")
+
+    print(message)
+    # Skipping is allowed only while win_arm64 is optional; see OPTIONAL_WHEEL_PLATFORMS.
+    return list(wheel_urls)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Create and monitor releases on the Kitmaker portal",
@@ -147,13 +291,24 @@ Environment Variables:
   KITMAKER_PROJECT_ID     Required. Kitmaker project ID.
   KITMAKER_PROJECT_NAME   Required. Kitmaker project name.
   KITMAKER_PIC_EMAIL      Required. Person-in-charge email address.
+  ARTIFACTORY_BASE_URL    Optional. Trusted HTTPS base URL for optional wheel discovery.
+                          Discovery is skipped unless the wheel URL has the same origin.
+  ARTIFACTORY_SVC_ACCESS_TOKEN
+                          Optional. Artifactory token used only to look for the
+                          optional win_arm64 wheel with --require-canonical-wheel-set.
         """,
     )
 
     parser.add_argument("wheel_urls", nargs="+", metavar="WHEEL_URL",
-                        help="HTTPS URL(s) to .whl file(s) (1-4 URLs)")
+                        help="HTTPS URL(s) to .whl file(s) (1-5 URLs)")
     parser.add_argument("--devzone-subdir", default=None,
                         help="Optional Devzone subdirectory prefix for uploads")
+    parser.add_argument(
+        "--mirroring-strategy",
+        choices=("upload-both", "wheel-stub", "claim-project"),
+        default=None,
+        help="Optional Kitmaker publication strategy",
+    )
     parser.add_argument("--poll-interval", type=int, default=30,
                         help="Seconds between status checks (default: 30)")
     parser.add_argument("--timeout", type=int, default=3600,
@@ -170,6 +325,14 @@ Environment Variables:
                         help="Person-in-charge email (default: KITMAKER_PIC_EMAIL env var)")
     parser.add_argument("--no-verify-ssl", action="store_true",
                         help="Disable SSL certificate verification")
+    parser.add_argument(
+        "--require-canonical-wheel-set",
+        action="store_true",
+        help=(
+            "Require the complete canonical Warp wheel URL set. Also looks in Artifactory for an optional "
+            "win_arm64 wheel next to the canonical wheels and publishes it if found"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -193,8 +356,8 @@ Environment Variables:
     client = KitmakerClient(config["base_url"], api_token, verify_ssl=not args.no_verify_ssl)
 
     try:
-        if len(args.wheel_urls) > 4:
-            print(f"Error: Too many wheel URLs ({len(args.wheel_urls)}). Maximum is 4.")
+        if len(args.wheel_urls) > 5:
+            print(f"Error: Too many wheel URLs ({len(args.wheel_urls)}). Maximum is 5.")
             return 1
 
         wheels = []
@@ -203,14 +366,35 @@ Environment Variables:
                 print(f"Error: Invalid wheel URL (must be https:// and end with .whl): {wheel_url}")
                 return 1
             wheels.append(wheel_url)
+        if args.require_canonical_wheel_set:
+            try:
+                validate_canonical_wheel_urls(wheels)
+                wheels = select_optional_woa_wheel(
+                    wheels,
+                    artifact_token=os.environ.get("ARTIFACTORY_SVC_ACCESS_TOKEN"),
+                    artifact_base_url=os.environ.get("ARTIFACTORY_BASE_URL"),
+                    verify_ssl=not args.no_verify_ssl,
+                )
+                validate_canonical_wheel_urls(wheels)
+            except ValueError as error:
+                print(f"Error: {error}")
+                return 1
 
         # Configuration summary
         print(f"\nProject: {config['project_name']} (ID: {config['project_id']})")
         print(f"PIC: {config['pic_email']}")
         print(f"Upload: {'No (dry-run)' if args.dry_run else 'Yes'}")
+        if args.mirroring_strategy:
+            print(f"Mirroring strategy: {args.mirroring_strategy}")
         if args.devzone_subdir:
             print(f"Devzone subdir: {args.devzone_subdir}")
         print(f"Timeout: {args.timeout}s | Poll interval: {args.poll_interval}s")
+        if args.require_canonical_wheel_set:
+            has_woa = any(
+                get_wheel_filename_match(url).group("platform") in OPTIONAL_WHEEL_PLATFORMS for url in wheels
+            )
+            print("Windows on Arm: included" if has_woa else "Windows on Arm: not included (optional)")
+        print(f"Selected wheels for Kitmaker ({len(wheels)}):")
         for url in wheels:
             print(f"  {url}")
 
@@ -221,6 +405,7 @@ Environment Variables:
             wheels=wheels,
             upload=not args.dry_run,
             devzone_subdir=args.devzone_subdir,
+            mirroring_strategy=args.mirroring_strategy,
         )
 
         success = client.monitor_release(

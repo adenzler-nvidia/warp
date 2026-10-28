@@ -12,12 +12,12 @@ from warp.tests.unittest_utils import *
 @wp.kernel
 def test_kernel(
     kernel_seed: int,
-    int_a: wp.array(dtype=int),
-    int_ab: wp.array(dtype=int),
-    uint_a: wp.array(dtype=wp.uint32),
-    uint_ab: wp.array(dtype=wp.uint32),
-    float_01: wp.array(dtype=float),
-    float_ab: wp.array(dtype=float),
+    int_a: wp.array[int],
+    int_ab: wp.array[int],
+    uint_a: wp.array[wp.uint32],
+    uint_ab: wp.array[wp.uint32],
+    float_01: wp.array[float],
+    float_ab: wp.array[float],
 ):
     tid = wp.tid()
 
@@ -113,7 +113,7 @@ def test_rand(test, device):
 
 @wp.kernel
 def randn_kernel(
-    x: wp.array(dtype=float),
+    x: wp.array[float],
 ):
     tid = wp.tid()
     r = wp.rand_init(tid)
@@ -152,7 +152,7 @@ def test_randn(test, device):
 
 
 @wp.kernel
-def sample_cdf_kernel(kernel_seed: int, cdf: wp.array(dtype=float), samples: wp.array(dtype=int)):
+def sample_cdf_kernel(kernel_seed: int, cdf: wp.array[float], samples: wp.array[int]):
     tid = wp.tid()
     state = wp.rand_init(kernel_seed, tid)
 
@@ -177,15 +177,15 @@ def test_sample_cdf(test, device):
 @wp.kernel
 def sampling_kernel(
     kernel_seed: int,
-    triangle_samples: wp.array(dtype=wp.vec2),
-    square_samples: wp.array(dtype=wp.vec2),
-    ring_samples: wp.array(dtype=wp.vec2),
-    disk_samples: wp.array(dtype=wp.vec2),
-    sphere_surface_samples: wp.array(dtype=wp.vec3),
-    sphere_samples: wp.array(dtype=wp.vec3),
-    hemisphere_surface_samples: wp.array(dtype=wp.vec3),
-    hemisphere_samples: wp.array(dtype=wp.vec3),
-    cube_samples: wp.array(dtype=wp.vec3),
+    triangle_samples: wp.array[wp.vec2],
+    square_samples: wp.array[wp.vec2],
+    ring_samples: wp.array[wp.vec2],
+    disk_samples: wp.array[wp.vec2],
+    sphere_surface_samples: wp.array[wp.vec3],
+    sphere_samples: wp.array[wp.vec3],
+    hemisphere_surface_samples: wp.array[wp.vec3],
+    hemisphere_samples: wp.array[wp.vec3],
+    cube_samples: wp.array[wp.vec3],
 ):
     tid = wp.tid()
     state = wp.rand_init(kernel_seed, tid)
@@ -260,7 +260,7 @@ def test_sampling_methods(test, device):
 
 @wp.kernel
 def sample_poisson_kernel(
-    kernel_seed: int, poisson_samples_low: wp.array(dtype=wp.uint32), poisson_samples_high: wp.array(dtype=wp.uint32)
+    kernel_seed: int, poisson_samples_low: wp.array[wp.uint32], poisson_samples_high: wp.array[wp.uint32]
 ):
     tid = wp.tid()
     state = wp.rand_init(kernel_seed, tid)
@@ -308,6 +308,46 @@ def test_poisson(test, device):
     test.assertTrue(np.abs(poisson_high_std - np_poisson_high_std) <= 2e-1)
 
 
+@wp.kernel
+def sample_poisson_rate_kernel(seed: int, lam: float, out: wp.array[wp.uint32]):
+    """Draw one sample from ``Poisson(lam)`` per thread, seeding each thread with its index."""
+    tid = wp.tid()
+    state = wp.rand_init(seed, tid)
+    out[tid] = wp.poisson(state, lam)
+
+
+@wp.kernel
+def sample_poisson_state_kernel(states: wp.array[wp.uint32], lam: float, out: wp.array[wp.uint32]):
+    """Draw one sample from ``Poisson(lam)`` per thread, starting from an explicit RNG state."""
+    tid = wp.tid()
+    out[tid] = wp.poisson(states[tid], lam)
+
+
+def test_poisson_rejection_zero_bias(test, device):
+    """Check that ``wp.poisson()`` does not return excess zeros for rates just above 10.
+
+    From ``lam = 10``, ``wp.poisson()`` switches to transformed rejection sampling, which can propose negative
+    candidates at rates just above the switch. The sampler must reject them before converting to ``uint32``.
+    CUDA and ARM CPUs convert a negative float to 0, so every accepted negative candidate adds a spurious zero.
+    """
+    n = 1_000_000
+    out = wp.empty(n, dtype=wp.uint32, device=device)
+    for lam in (10.0, 12.0):
+        wp.launch(sample_poisson_rate_kernel, dim=n, inputs=[42, lam, out], device=device)
+        zeros = np.count_nonzero(out.numpy() == 0)
+        expected = n * np.exp(-lam)
+        # Bound the count of zeros at 6 standard deviations above its expectation.
+        test.assertLessEqual(zeros, expected + 6.0 * np.sqrt(expected), f"lam={lam}")
+
+    # From each of these states, the first proposal at lam = 10 is a negative candidate with a uniform draw of
+    # exactly 0. If the sampler does not reject it as negative, it returns 0 on CUDA and ARM and a value near
+    # 2**32 on x86.
+    states = wp.array([962669792, 1029222154, 1536123189], dtype=wp.uint32, device=device)
+    samples = wp.empty(3, dtype=wp.uint32, device=device)
+    wp.launch(sample_poisson_state_kernel, dim=3, inputs=[states, 10.0, samples], device=device)
+    test.assertTrue(np.all((samples.numpy() > 0) & (samples.numpy() < 100)), samples.numpy())
+
+
 devices = get_test_devices()
 
 
@@ -320,6 +360,7 @@ add_function_test(TestRand, "test_randn", test_randn, devices=devices)
 add_function_test(TestRand, "test_sample_cdf", test_sample_cdf, devices=devices)
 add_function_test(TestRand, "test_sampling_methods", test_sampling_methods, devices=devices)
 add_function_test(TestRand, "test_poisson", test_poisson, devices=devices)
+add_function_test(TestRand, "test_poisson_rejection_zero_bias", test_poisson_rejection_zero_bias, devices=devices)
 
 
 if __name__ == "__main__":

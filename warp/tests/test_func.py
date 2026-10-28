@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import inspect
 import math
 import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, get_overloads
 
 import numpy as np
 
@@ -85,7 +87,7 @@ def test_override_func():
 
 def test_func_closure_capture(test, device):
     def make_closure_kernel(func):
-        def closure_kernel_fn(data: wp.array(dtype=float), expected: float):
+        def closure_kernel_fn(data: wp.array[float], expected: float):
             f = func(data[wp.tid()])
             wp.expect_eq(f, expected)
 
@@ -108,7 +110,7 @@ def test_func(param1: wp.int32, param2: wp.int32, param3: wp.int32) -> wp.float3
 
 
 @wp.kernel
-def test_return_kernel(test_data: wp.array(dtype=wp.float32)):
+def test_return_kernel(test_data: wp.array[wp.float32]):
     tid = wp.tid()
     test_data[tid] = wp.lerp(test_func(0, 1, 2), test_func(0, 1, 2), 0.5)
 
@@ -125,7 +127,7 @@ def multi_valued_func(a: wp.float32, b: wp.float32):
 
 def test_multi_valued_func(test, device):
     @wp.kernel(module="unique")
-    def test_multi_valued_kernel(test_data1: wp.array(dtype=wp.float32), test_data2: wp.array(dtype=wp.float32)):
+    def test_multi_valued_kernel(test_data1: wp.array[wp.float32], test_data2: wp.array[wp.float32]):
         tid = wp.tid()
         d1, d2 = test_data1[tid], test_data2[tid]
         a, b, c, d = multi_valued_func(d1, d2)
@@ -214,7 +216,7 @@ def test_user_func_return_multiple_values():
 
 @wp.func
 def user_func_overload(
-    b: wp.array(dtype=Any),
+    b: wp.array[Any],
     i: int,
 ):
     return b[i] * 2.0
@@ -222,8 +224,8 @@ def user_func_overload(
 
 @wp.kernel
 def user_func_overload_resolution_kernel(
-    a: wp.array(dtype=Any),
-    b: wp.array(dtype=Any),
+    a: wp.array[Any],
+    b: wp.array[Any],
 ):
     i = wp.tid()
     a[i] = user_func_overload(b, i)
@@ -269,7 +271,7 @@ def divide_float64(x: wp.float64):
 
 
 @wp.func
-def get_array_len(arr: wp.array(dtype=wp.float32)):
+def get_array_len(arr: wp.array[wp.float32]):
     return len(arr)
 
 
@@ -286,12 +288,12 @@ def grad_func(x: float):
 
 @wp.kernel(enable_backward=False)
 def grad_kernel(
-    x: wp.array(dtype=float),
-    y: wp.array(dtype=float),
-    grad_x: wp.array(dtype=float),
-    grad_atan2_y: wp.array(dtype=float),
-    grad_atan2_x: wp.array(dtype=float),
-    z: wp.array(dtype=float),
+    x: wp.array[float],
+    y: wp.array[float],
+    grad_x: wp.array[float],
+    grad_atan2_y: wp.array[float],
+    grad_atan2_x: wp.array[float],
+    z: wp.array[float],
 ):
     tid = wp.tid()
 
@@ -351,7 +353,7 @@ def adj_safe_sqrt(x: float, adj_ret: float):
 
 
 @wp.kernel
-def safe_sqrt_kernel(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+def safe_sqrt_kernel(x: wp.array[float], y: wp.array[float]):
     tid = wp.tid()
     y[tid] = safe_sqrt(x[tid])
 
@@ -374,8 +376,44 @@ def test_grad_in_func_grad(test, device):
 
 
 class TestFunc(unittest.TestCase):
+    def test_func_decorator_does_not_retain_caller(self):
+        """Release unrelated caller objects without relying on cyclic collection."""
+
+        class CallerState:
+            pass
+
+        def register_function(parameterized):
+            if parameterized:
+
+                @wp.func()
+                def identity(x: float) -> float:
+                    return x
+            else:
+
+                @wp.func
+                def identity(x: float) -> float:
+                    return x
+
+            return identity
+
+        def discard_caller_state(parameterized):
+            caller_state = CallerState()
+            register_function(parameterized)
+            return weakref.ref(caller_state)
+
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for parameterized in (False, True):
+                with self.subTest(parameterized=parameterized):
+                    caller_state_ref = discard_caller_state(parameterized)
+                    self.assertIsNone(caller_state_ref())
+        finally:
+            if gc_enabled:
+                gc.enable()
+
     def test_user_func_export(self):
-        # tests calling overloaded user-defined functions from Python
+        """Call overloaded user-defined functions from Python."""
         i = custom(1)
         f = custom(1.0)
         v = custom(wp.vec3(1.0, 0.0, 0.0))
@@ -385,7 +423,7 @@ class TestFunc(unittest.TestCase):
         assert_np_equal(np.array([*v]), np.array([2.0, 0.0, 0.0]))
 
     def test_native_func_export(self):
-        # tests calling native functions from Python
+        """Call native functions from Python."""
 
         q = wp.quat(0.0, 0.0, 0.0, 1.0)
         assert_np_equal(np.array([*q]), np.array([0.0, 0.0, 0.0, 1.0]))
@@ -564,7 +602,6 @@ class TestFunc(unittest.TestCase):
         length = get_array_len(arr)
         assert length == 8
 
-    @unittest.skipUnless(sys.version_info >= (3, 11), "get_overloads() is only available in Python 3.11 and later")
     def test_func_decorator_has_overloads(self):
         """Verify @wp.func has @overload signatures for static type checkers.
 
@@ -572,8 +609,6 @@ class TestFunc(unittest.TestCase):
         Pyright/Pylance show generic _Wrapped types instead of the actual function
         signature when hovering over @wp.func decorated functions.
         """
-        from typing import get_overloads  # noqa: PLC0415
-
         overloads = get_overloads(wp.func)
         # Should have at least 2 overloads:
         # 1. @wp.func (bare decorator)
@@ -585,11 +620,8 @@ class TestFunc(unittest.TestCase):
             "Without these, static type checkers cannot infer decorated function signatures.",
         )
 
-    @unittest.skipUnless(sys.version_info >= (3, 11), "get_overloads() is only available in Python 3.11 and later")
     def test_func_decorator_overloads_preserve_signature(self):
         """Verify @wp.func overloads return Callable types to preserve signatures."""
-        from typing import get_overloads  # noqa: PLC0415
-
         overloads = get_overloads(wp.func)
         if len(overloads) < 2:
             self.skipTest("Overloads not yet implemented")

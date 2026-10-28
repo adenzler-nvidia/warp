@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import warp as wp
-
-_wp_module_name_ = "warp.optim.adam"
+from warp._src.types import type_repr
 
 
 @wp.kernel
@@ -81,7 +80,7 @@ class Adam:
     account for their initialization at zero.
 
     The interface is similar to `PyTorch's torch.optim.Adam
-    <https://pytorch.org/docs/stable/generated/torch.optim.Adam.html>`_.
+    <https://docs.pytorch.org/docs/stable/generated/torch.optim.Adam.html>`_.
 
     Args:
         params: List of :class:`warp.array` objects to optimize. Can be ``None``
@@ -129,10 +128,16 @@ class Adam:
                 else:
                     raise RuntimeError(f"Unsupported dtype for Warp Adam optimizer: {param.dtype}")
 
-                if self.m[i] is None or self.m[i].shape != param.shape or self.m[i].dtype != param.dtype:
+                # Moments are always fp32 even for fp16 params, so compare against ``dtype`` (the moment
+                # buffer dtype), not ``param.dtype``, otherwise the buffers are re-zeroed on every call.
+                if self.m[i] is None or self.m[i].shape != param.shape or self.m[i].dtype != dtype:
                     self.m[i] = wp.zeros(shape=param.shape, dtype=dtype, device=param.device)
-                if self.v[i] is None or self.v[i].shape != param.shape or self.v[i].dtype != param.dtype:
+                elif self.m[i].device != param.device:
+                    self.m[i] = self.m[i].to(param.device)
+                if self.v[i] is None or self.v[i].shape != param.shape or self.v[i].dtype != dtype:
                     self.v[i] = wp.zeros(shape=param.shape, dtype=dtype, device=param.device)
+                elif self.v[i].device != param.device:
+                    self.v[i] = self.v[i].to(param.device)
 
     def reset_internal_state(self):
         """Reset moment buffers and timestep to zero."""
@@ -148,7 +153,8 @@ class Adam:
         Args:
             grad: List of gradient arrays matching ``params``.
         """
-        assert self.params is not None
+        if self.params is None:
+            raise RuntimeError("Adam parameters must be set before calling step(), got None")
         for i in range(len(self.params)):
             Adam.step_detail(
                 grad[i], self.m[i], self.v[i], self.lr, self.beta1, self.beta2, self.t, self.eps, self.params[i]
@@ -170,8 +176,12 @@ class Adam:
             eps: Numerical stability term.
             params: Parameter array to update in-place.
         """
-        assert params.dtype == g.dtype
-        assert params.shape == g.shape
+        if params.dtype != g.dtype:
+            raise TypeError(
+                f"Adam gradient dtype must match parameter dtype {type_repr(params.dtype)}, got {type_repr(g.dtype)}"
+            )
+        if params.shape != g.shape:
+            raise ValueError(f"Adam gradient shape must match parameter shape {params.shape}, got {g.shape}")
         kernel_inputs = [g, m, v, lr, beta1, beta2, t, eps, params]
         if params.dtype == wp._src.types.float32:
             wp.launch(

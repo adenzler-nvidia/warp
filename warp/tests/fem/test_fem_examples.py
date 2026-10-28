@@ -19,9 +19,11 @@ import warp as wp
 import warp.tests.unittest_utils
 from warp._src.utils import check_p2p
 from warp.tests.unittest_utils import (
+    USD_AVAILABLE,
     add_function_test,
     get_selected_cuda_test_devices,
     get_selected_cuda_test_devices_with_mempool,
+    sanitize_identifier,
 )
 
 
@@ -57,6 +59,42 @@ def add_fem_example_test(
             options = test_options | test_options_cuda
         else:
             options = test_options | test_options_cpu
+
+        # Mark the test as skipped if NLopt is not installed but required
+        nlopt_required = options.pop("nlopt_required", False)
+        if nlopt_required:
+            try:
+                import nlopt  # noqa: PLC0415,F401
+            except ImportError:
+                test.skipTest("Requires NLopt")
+
+        # Default any USD output into the gitignored warp/tests/outputs/ directory
+        # (mirroring the core example harness) and remove it after a passing run,
+        # so examples run via the suite never litter the working directory (e.g.
+        # the repo root). A test can still pass stage_path=None to disable output.
+        outputs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs")
+        short_name = name.rsplit(".", maxsplit=1)[-1]
+        if USD_AVAILABLE:
+            stage_path = options.pop(
+                "stage_path",
+                os.path.join(outputs_dir, f"{short_name}_{sanitize_identifier(device)}.usd"),
+            )
+        else:
+            options.pop("stage_path", None)
+            stage_path = "None"
+
+        if stage_path is None:
+            # Forward stage_path=None so the example disables USD output entirely
+            # (the example maps the literal "None" back to None).
+            options["stage_path"] = None
+        else:
+            options["stage_path"] = stage_path
+            if stage_path != "None":
+                os.makedirs(outputs_dir, exist_ok=True)
+                try:
+                    os.remove(stage_path)
+                except OSError:
+                    pass
 
         env_vars = os.environ.copy()
 
@@ -98,6 +136,13 @@ def add_fem_example_test(
             msg=f"Failed with return code {result.returncode}, command: {' '.join(command)}\n\nOutput:\n{result.stdout}\n{result.stderr}",
         )
 
+        # Clean up the output stage on success (mirrors the core example harness).
+        if stage_path not in (None, "None") and result.returncode == 0:
+            try:
+                os.remove(stage_path)
+            except OSError:
+                pass
+
     add_function_test(cls, f"test_{name}", run, devices=devices, check_output=False)
 
 
@@ -125,8 +170,8 @@ if check_p2p():
 add_fem_example_test(
     TestFemExamples,
     name="fem.example_apic_fluid",
-    devices=cuda_devices,
-    test_options={"num_frames": 5, "voxel_size": 2.0},
+    devices=cuda_devices_with_mempool,
+    test_options={"num_frames": 5, "voxel_size": 2.0, "stage_path": None},
 )
 add_fem_example_test(
     TestFemExamples,
@@ -235,6 +280,19 @@ add_fem_example_test(
     name="fem.example_darcy_ls_optimization",
     devices=cuda_devices,
     test_options={"num_iters": 5, "resolution": 25, "headless": True},
+)
+add_fem_example_test(
+    TestFemExamples,
+    name="fem.example_cantilever_topology_optimization",
+    devices=cuda_devices,
+    test_options={
+        "nx": 16,
+        "ny": 6,
+        "nz": 1,
+        "max_evals": 3,
+        "headless": True,
+        "nlopt_required": True,
+    },
 )
 add_fem_example_test(
     TestFemExamples,

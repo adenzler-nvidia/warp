@@ -43,6 +43,24 @@ function(warp_get_packman_platform out_var)
     set(${out_var} "${_platform}" PARENT_SCOPE)
 endfunction()
 
+# The LLVM SDK manifest uses packman's own platform tokens, which spell macOS as
+# "macos" rather than the "darwin" that deps/libmathdx-deps.packman.xml expects.
+# macOS is always aarch64 here, matching build_llvm.py, which builds warp-clang
+# for arm64 even when cross-compiling from an Intel Mac.
+function(warp_get_llvm_packman_platform out_var)
+    warp_get_host_arch(_arch)
+    if(WIN32)
+        set(_platform "windows-${_arch}")
+    elseif(APPLE)
+        set(_platform "macos-aarch64")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_platform "linux-${_arch}")
+    else()
+        message(FATAL_ERROR "Unsupported Packman platform: ${CMAKE_SYSTEM_NAME}")
+    endif()
+    set(${out_var} "${_platform}" PARENT_SCOPE)
+endfunction()
+
 function(warp_get_packman_python out_var)
     if(NOT WARP_PYTHON_EXECUTABLE)
         message(FATAL_ERROR "warp_find_python() must be called before fetching Packman dependencies")
@@ -94,29 +112,8 @@ function(warp_set_default_cuda_architectures)
 endfunction()
 
 function(warp_find_python)
-    find_package(Python3 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+    find_package(Python3 3.11 COMPONENTS Interpreter REQUIRED)
     set(WARP_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}" PARENT_SCOPE)
-    set(WARP_PYTHON_INCLUDE_DIRS "${Python3_INCLUDE_DIRS}" PARENT_SCOPE)
-
-    if(WIN32)
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c "import sysconfig; print(sysconfig.get_config_var('base') or sysconfig.get_config_var('installed_base') or '')"
-            OUTPUT_VARIABLE _python_base
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-        unset(_warp_python3_library CACHE)
-        find_library(
-            _warp_python3_library
-            NAMES python3
-            PATHS "${_python_base}/libs" "${Python3_LIBRARY_DIRS}"
-            NO_DEFAULT_PATH
-        )
-        if(NOT _warp_python3_library OR NOT EXISTS "${_warp_python3_library}")
-            message(FATAL_ERROR "Could not find python3.lib for Python stable ABI linking")
-        endif()
-        set(WARP_PYTHON3_LIBRARY "${_warp_python3_library}" PARENT_SCOPE)
-    endif()
 endfunction()
 
 function(warp_get_python_script_command out_var script_path)
@@ -185,6 +182,20 @@ function(warp_find_libmathdx)
         set(_mathdx_root "${PROJECT_SOURCE_DIR}/_build/target-deps/libmathdx")
     endif()
 
+    # libmathdx 0.4.0 and newer ship archives that wrap the payload in a single top-level
+    # directory (e.g. libmathdx-linux-x86_64), one level above the layout Warp builds
+    # against. Descend into that wrapper when the root does not already hold the layout.
+    if(NOT EXISTS "${_mathdx_root}/include")
+        file(GLOB _mathdx_nested LIST_DIRECTORIES true "${_mathdx_root}/libmathdx-*")
+        foreach(_candidate IN LISTS _mathdx_nested)
+            if(EXISTS "${_candidate}/include")
+                message(STATUS "Using nested libmathdx directory ${_candidate}")
+                set(_mathdx_root "${_candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
     if(WIN32)
         set(_mathdx_lib_dir "${_mathdx_root}/lib/x64")
     else()
@@ -246,26 +257,17 @@ function(warp_find_llvm)
         return()
     endif()
 
-    warp_get_host_arch(_arch)
-
     if(WARP_LLVM_PATH)
         set(_llvm_root "${WARP_LLVM_PATH}")
     else()
         warp_get_packman_python(_packman_python)
         warp_get_packman_command(_packman)
-        if(WIN32)
-            set(_llvm_package "15.0.7-windows-x86_64-ptx-vs142")
-        elseif(APPLE)
-            set(_llvm_package "15.0.7-darwin-aarch64-macos11")
-        elseif(_arch STREQUAL "aarch64")
-            set(_llvm_package "15.0.7-linux-aarch64-gcc7.5")
-        else()
-            set(_llvm_package "18.1.3-linux-x86_64-gcc9.4")
-        endif()
-        set(_llvm_root "${PROJECT_SOURCE_DIR}/_build/host-deps/llvm-project/release-${_arch}")
+        warp_get_llvm_packman_platform(_llvm_platform)
+        set(_llvm_root "${PROJECT_SOURCE_DIR}/_build/host-deps/llvm-project/release-${_llvm_platform}")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E env "PM_PYTHON_EXT=${_packman_python}"
-                    "${_packman}" install -l "${_llvm_root}" clang+llvm-warp "${_llvm_package}"
+                    "${_packman}" pull --verbose --platform "${_llvm_platform}"
+                    "${PROJECT_SOURCE_DIR}/deps/llvm-deps.packman.xml"
             WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
             COMMAND_ERROR_IS_FATAL ANY
         )

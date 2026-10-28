@@ -38,11 +38,39 @@ def randvals(rng, shape, dtype):
 
 kernel_cache = {}
 
+# Compilation hygiene
+#
+# This file's shared module is large, and backward code accounts for roughly two thirds of it. The negation and
+# subtraction checks only differentiate their float instantiations, and the mutation, length, and indexing-type
+# kernels are forward-only, so all of those skip backward codegen.
 
-def getkernel(func, suffix=""):
+
+def getkernel(func, suffix="", enable_backward=None):
+    """Get or create a cached kernel.
+
+    Args:
+        func: Kernel function to wrap.
+        suffix: Optional suffix for the kernel key.
+        enable_backward: Whether to generate a backward kernel. Uses the
+            module default when not specified.
+
+    Returns:
+        Cached or newly created wp.Kernel.
+    """
     key = func.__name__ + "_" + suffix
     if key not in kernel_cache:
-        kernel_cache[key] = wp.Kernel(func=func, key=key)
+        options = {} if enable_backward is None else {"enable_backward": enable_backward}
+        kernel_cache[key] = wp.Kernel(func=func, key=key, options=options)
+    elif enable_backward is not None:
+        cached_kernel = kernel_cache[key]
+        cached_enable_backward = cached_kernel.options.get(
+            "enable_backward", cached_kernel.module.options["enable_backward"]
+        )
+        if cached_enable_backward != enable_backward:
+            raise ValueError(
+                f"Kernel {key!r} is already cached with enable_backward={cached_enable_backward!r}, "
+                f"but enable_backward={enable_backward!r} was requested."
+            )
     return kernel_cache[key]
 
 
@@ -63,8 +91,6 @@ def test_length_mismatch(test, device):
 
 
 def test_negation(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -130,10 +156,12 @@ def test_negation(test, device, dtype, register_kernels=False):
         v53[0] = wptype(2) * v5result[3]
         v54[0] = wptype(2) * v5result[4]
 
-    kernel = getkernel(check_negation, suffix=dtype.__name__)
+    kernel = getkernel(check_negation, suffix=dtype.__name__, enable_backward=dtype in np_float_types)
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     v2 = wp.array(randvals(rng, (1, 2), dtype), dtype=vec2, requires_grad=True, device=device)
     v3 = wp.array(randvals(rng, (1, 3), dtype), dtype=vec3, requires_grad=True, device=device)
@@ -208,7 +236,7 @@ def test_subtraction_unsigned(test, device, dtype, register_kernels=False):
             vec5(wptype(2), wptype(2), wptype(1), wptype(1), wptype(0)),
         )
 
-    kernel = getkernel(check_subtraction_unsigned, suffix=dtype.__name__)
+    kernel = getkernel(check_subtraction_unsigned, suffix=dtype.__name__, enable_backward=dtype in np_float_types)
 
     if register_kernels:
         return
@@ -217,8 +245,6 @@ def test_subtraction_unsigned(test, device, dtype, register_kernels=False):
 
 
 def test_subtraction(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -279,10 +305,12 @@ def test_subtraction(test, device, dtype, register_kernels=False):
         v53[0] = wptype(2) * v5result[3]
         v54[0] = wptype(2) * v5result[4]
 
-    kernel = getkernel(check_subtraction, suffix=dtype.__name__)
+    kernel = getkernel(check_subtraction, suffix=dtype.__name__, enable_backward=dtype in np_float_types)
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     s2 = wp.array(randvals(rng, (1, 2), dtype), dtype=vec2, requires_grad=True, device=device)
     s3 = wp.array(randvals(rng, (1, 3), dtype), dtype=vec3, requires_grad=True, device=device)
@@ -354,8 +382,6 @@ def test_subtraction(test, device, dtype, register_kernels=False):
 
 
 def test_length(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -396,6 +422,8 @@ def test_length(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     v2 = wp.array(randvals(rng, (1, 2), dtype), dtype=vec2, requires_grad=True, device=device)
     v3 = wp.array(randvals(rng, (1, 3), dtype), dtype=vec3, requires_grad=True, device=device)
@@ -476,8 +504,6 @@ def test_length(test, device, dtype, register_kernels=False):
 
 
 def test_normalize(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -582,6 +608,8 @@ def test_normalize(test, device, dtype, register_kernels=False):
     if register_kernels:
         return
 
+    rng = np.random.default_rng(123)
+
     # I've already tested the things I'm using in check_normalize_alt, so I'll just
     # make sure the two are giving the same results/gradients
     v2 = wp.array(randvals(rng, (1, 2), dtype), dtype=vec2, requires_grad=True, device=device)
@@ -683,8 +711,6 @@ def test_normalize(test, device, dtype, register_kernels=False):
 
 
 def test_crossproduct(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -712,6 +738,8 @@ def test_crossproduct(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     s3 = wp.array(randvals(rng, (1, 3), dtype), dtype=vec3, requires_grad=True, device=device)
     v3 = wp.array(randvals(rng, (1, 3), dtype), dtype=vec3, requires_grad=True, device=device)
@@ -777,7 +805,7 @@ def test_crossproduct(test, device, dtype, register_kernels=False):
         tape.zero()
 
 
-@wp.kernel(module="unique")
+@wp.kernel(enable_backward=False, module="unique")
 def test_vector_mutation(expected: wp.types.vector(length=10, dtype=float)):
     v = wp.types.vector(length=10, dtype=float)
 
@@ -793,7 +821,7 @@ def test_vector_mutation(expected: wp.types.vector(length=10, dtype=float)):
 Vec123 = wp.types.vector(123, dtype=wp.float16)
 
 
-@wp.kernel(module="unique")
+@wp.kernel(enable_backward=False, module="unique")
 def vector_len_kernel(
     v1: wp.vec2, v2: wp.types.vector(3, float), v3: wp.types.vector(Any, float), v4: Vec123, out: wp.array[int]
 ):
@@ -1248,7 +1276,7 @@ def test_vec_slicing_assign(test, device):
 
 
 def test_vec_assign_inplace_errors(test, device):
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel_1():
         v = wp.vec4(1.0, 2.0, 3.0, 4.0)
         v[1:] = wp.vec3d(5.0, 6.0, 7.0)
@@ -1259,7 +1287,7 @@ def test_vec_assign_inplace_errors(test, device):
     ):
         wp.launch(kernel_1, dim=1, device=device)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel_2():
         v = wp.vec4(1.0, 2.0, 3.0, 4.0)
         v[1:] = wp.float64(5.0)
@@ -1270,7 +1298,7 @@ def test_vec_assign_inplace_errors(test, device):
     ):
         wp.launch(kernel_2, dim=1, device=device)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel_3():
         v = wp.vec4(1.0, 2.0, 3.0, 4.0)
         v[1:] = wp.mat22(5.0, 6.0, 7.0, 8.0)
@@ -1281,7 +1309,7 @@ def test_vec_assign_inplace_errors(test, device):
     ):
         wp.launch(kernel_3, dim=1, device=device)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel_4():
         v = wp.vec4(1.0, 2.0, 3.0, 4.0)
         v[1:] = wp.vec2(5.0, 6.0)
@@ -1376,7 +1404,7 @@ for dtype in np_float_types:
     )
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def test_vector_indexing_types():
     # Test vector indexing with various integer types
     v2 = wp.vec2i(1, 2)

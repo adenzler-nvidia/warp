@@ -39,7 +39,7 @@ Workflow:
 This example runs from within the Warp repository.
 
 **Requirements:**
-- **Python 3.10+**
+- **Python 3.11+**
 - **CUDA Toolkit 12.8+** (includes `nvcc` compiler; 12.8+ required for `sm_120` support)
 - **NVIDIA GPU** (supports multiple architectures via multi-arch compilation)
 - **Build System**: GNU Make (Unix/Linux) or CMake 3.20+ (cross-platform)
@@ -117,10 +117,12 @@ def compute_loss(
     error = y_pred - y_true[tid]
     wp.atomic_add(loss, 0, error * error)
 
+
 @wp.kernel
 def update_params(learning_rate: wp.float32, grads: wp.array(dtype=wp.float32), params: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     params[tid] -= learning_rate * grads[tid]
+
 
 # Generate .cu source
 wp.compile_aot_module("__main__", module_dir="generated/", strip_hash=True)

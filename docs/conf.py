@@ -9,19 +9,22 @@
 import ast
 import importlib
 import inspect
+import json
 import operator
 import os
 import pkgutil
 import re
 import sys
+import types
+from typing import TypeVar
 
 import docutils
 import sphinx
+import sphinx.util.logging
 from sphinx import addnodes
 from sphinx.environment.adapters.toctree import note_toctree
 from sphinx.ext.autosummary import autosummary_toc
 from sphinx.ext.autosummary.generate import AutosummaryRenderer
-from sphinx.ext.napoleon.docstring import GoogleDocstring
 
 _RE_WP_DOT = re.compile(r"\bwp\.")
 
@@ -29,8 +32,8 @@ _RE_WP_DOT = re.compile(r"\bwp\.")
 
 HERE = os.path.dirname(__file__)
 WARP_PATH = os.path.realpath(os.path.join(HERE, ".."))
-
 sys.path.insert(0, WARP_PATH)
+sys.path.insert(0, os.path.join(HERE, "_ext"))
 
 try:
     import warp as wp
@@ -72,7 +75,14 @@ extensions = [
     # Third-party extensions.
     "myst_parser",  # Parses markdown files.
     "sphinx_copybutton",  # Adds a copy button to code blocks.
+    # Local extensions, from `docs/_ext`.
+    "wp_function_tags",  # Renders the property tags and source links of Warp functions.
+    "wp_doctest_shard",  # Runs selected doctest documents in isolated subprocess shards.
 ]
+
+# Generate targets for Markdown headings through level 2 so standard fragment
+# links in included GitHub-flavored Markdown resolve as Sphinx references.
+myst_heading_anchors = 2
 
 # Enable nitpicky mode to warn about unresolved references.
 nitpicky = True
@@ -83,11 +93,16 @@ nitpicky = True
 nitpick_ignore_regex = [
     # Public type aliases indexed as py:data but referenced as py:class (Sphinx limitation)
     (r"py:class", r"(warp\.|wp\.)?(Scalar|Int|Float|DeviceLike)"),
+    # numpy.typing aliases used in annotations but imported only under TYPE_CHECKING
+    (r"py:class", r"npt\.ArrayLike"),
     # Internal meta-types used in builtin function signatures (not exported)
     (
         r"py:class",
         r"(Vector|Quaternion|Matrix|Array|Transformation|Tile|TileStack|IndexedArray|IndexedFabricArray|FabricArray|Shape|DType|Any)",
     ),
+    # Private codegen query subtypes — visible in Sphinx RST (generated from Python source)
+    # but not in __init__.pyi (rewritten by export_stubs) or the public API.
+    (r"py:class", r"(_BvhQueryAabb|_BvhQueryRay|_BvhQueryCapsule|_BvhQuerySphere|_MeshQuerySphere)"),
     # Array type parameters from warp.array() annotations (e.g., "dtype=warp.float32", "ndim=3")
     # Sphinx splits "warp.array(dtype=float, ndim=3)" and tries to resolve each part as a class.
     (r"py:class", r"(ndim|dtype)=.*"),
@@ -116,18 +131,27 @@ nitpick_ignore_regex = [
     (r"py:class", r"<(property|functools\.cached_property) object at .*>"),
     # Autosummary-generated member stubs for Warp classes (Texture*, fem.*, etc.)
     (r"py:obj", r"warp\.(Texture\w+|fixedarray|indexedarray|indexedfabricarray|fabricarray|fem\.).*"),
+    # Members inherited from IsoSurfaceBase, listed in member tables but documented on the base class
+    (r"py:obj", r"warp\.geometry\.IsoSurface(MarchingCubes|Nets)\.(resize|surface|extract)"),
+    # FSAI inherits these attributes; their documentation is on LinearOperator.
+    (
+        r"py:obj",
+        r"warp\.optim\.linear\.FSAI\.(batch_count|batch_offsets|device|dtype|matvec|max_batch_length|scalar_type|shape)",
+    ),
+    # Everything on the deprecated `wp.MarchingCubes` alias is inherited from, and
+    # documented on, `warp.geometry.IsoSurfaceMarchingCubes`
+    (r"py:(obj|attr)", r"warp\.MarchingCubes\..*"),
+    (
+        r"py:attr",
+        r"(CUBE_CORNER_OFFSETS|EDGE_TO_CORNERS|CASE_TO_TRI_RANGE|TRI_LOCAL_INDICES)",
+    ),
     # Internal C++/Python interop methods on geometric types
     (
         r"py:obj",
         r"warp\.(vec|mat|quat|transform|spatial_vector|spatial_matrix)\w*\.(from_ptr|scalar_export|scalar_import)",
     ),
     # Matrix accessor methods
-    (r"py:obj", r"warp\.(mat|spatial_matrix)\w+\.(get_col|get_row|set_col|set_row)"),
-    # Built-in numeric methods/properties inherited by enums/int/float subclasses
-    (
-        r"py:obj",
-        r".*\.(conjugate|bit_length|bit_count|to_bytes|from_bytes|as_integer_ratio|is_integer|real|imag|numerator|denominator)",
-    ),
+    (r"py:obj", r"warp\.(mat|spatial_matrix)\w*\.(get_col|get_row|set_col|set_row)"),
 ]
 
 
@@ -212,7 +236,9 @@ html_context = {
     "doc_path": "docs",
 }
 html_css_files = ["custom.css"]
+html_js_files = ["copy-page-source.js"]
 html_static_path = ["_static"]
+html_copy_source = True
 html_show_sphinx = False
 
 
@@ -229,6 +255,14 @@ autodoc_default_options = {
 # Mock external dependencies that might not be installed.
 autodoc_mock_imports = ["jax", "paddle", "pxr", "torch"]
 
+# Merge the ``__init__`` docstring into the class description. Many Warp classes
+# (e.g. ``warp.array``, ``warp.Mesh``, ``warp.fem`` geometries) document their
+# constructor arguments on ``__init__`` rather than the class docstring. The
+# autosummary class template intentionally omits ``.. automethod:: __init__``
+# (it fails to resolve for the dynamically generated ctypes vec/mat/quat types),
+# so this setting is what keeps those constructor arguments in the rendered docs.
+autoclass_content = "both"
+
 # Show typehints as content of the function or method instead of in the signature.
 autodoc_typehints = "description"
 
@@ -237,6 +271,36 @@ autodoc_preserve_defaults = True
 
 # Prevent docstrings from being inherited from parent classes or methods.
 autodoc_inherit_docstrings = False
+
+
+# Work around a Sphinx 9 formatting bug: when a class is documented as an
+# attribute alias (``doc_as_attr``), ``sphinx.ext.autodoc._generate`` appends
+# the "alias of ..." note directly after the directive's content without a
+# separating blank line. Our public vec/mat/quat/transform and ``warp.fem``
+# index-type aliases carry autosummary "Methods"/"Attributes" tables, so the
+# unindented "alias of" line runs into the preceding ``.. autosummary::``
+# block and docutils reports "Explicit markup ends without a blank line".
+# Prepend a blank line so the generated reST stays well-formed. The private
+# ``_generate`` module was added in Sphinx 9. Keep the guard for environments
+# using an older Sphinx release.
+try:
+    import sphinx.ext.autodoc._generate as _autodoc_generate
+except ModuleNotFoundError as e:
+    if e.name != "sphinx.ext.autodoc._generate":
+        raise
+else:
+    if hasattr(_autodoc_generate, "_body_alias_lines"):
+        _orig_body_alias_lines = _autodoc_generate._body_alias_lines
+
+        def _body_alias_lines_with_blank(**kwargs):
+            emitted = False
+            for line in _orig_body_alias_lines(**kwargs):
+                if not emitted:
+                    yield ""  # separate the alias note from any preceding directive content
+                    emitted = True
+                yield line
+
+        _autodoc_generate._body_alias_lines = _body_alias_lines_with_blank
 
 
 # -- sphinx.ext.autosummary --------------------------------------------------
@@ -274,10 +338,13 @@ autosummary_filename_map = {
 }
 
 AUTOSUMMARY_ANNOTATION_OVERRIDES = {
+    "warp.config.enable_mempools_at_init": ": bool = True",
     "warp.config.launch_array_access_mode": (
         ": warp.config.LaunchArrayAccessMode = warp.config.LaunchArrayAccessMode.RELAXED"
     ),
     "warp.config.log_level": ": int = warp.LOG_INFO",
+    # Hide the internal module path that ``repr()`` exposes.
+    "warp.DeviceLike": "= warp.Device | str | None",
 }
 
 # Map internal builtin function paths to public names for output filenames.
@@ -290,80 +357,91 @@ for _builtin_name in wp._src.context.builtin_functions:
     autosummary_filename_map.setdefault(_internal, _public)
 
 
-def normalize_docstring(doc: str) -> str:
-    """Normalize docstrings for consistent RST indentation and formatting."""
-    if not doc:
-        return ""
-    cleaned = inspect.cleandoc(doc)
-    if not cleaned:
-        return ""
-    rst = str(GoogleDocstring(cleaned))
-    # Rewrite ``wp.`` aliases in :type:/:rtype: fields so Sphinx cross-references
-    # resolve correctly.  Only target field-list lines to avoid mangling code
-    # examples that legitimately use ``import warp as wp``.
-    return re.sub(r"^(:(rtype|type\s+\w+):.*)\bwp\.", r"\1warp.", rst, flags=re.MULTILINE) if "wp." in rst else rst
+from docs._ext.warp_function_reference import describe_function, source_url  # noqa: E402
 
 
-def _get_builtin_overloads_info(symbol: str) -> list[dict[str, object]]:
-    head = wp._src.context.builtin_functions[symbol]
+def _is_inherited_builtin_member(cls, member):
+    for owner in inspect.getmro(cls):
+        if member in vars(owner):
+            return owner is not cls and owner.__module__ == "builtins"
 
-    # Collect all overloads, filtering out hidden ones.
-    # Note: head.overloads already includes the head itself (see Function.__init__)
-    all_funcs = head.overloads if hasattr(head, "overloads") else [head]
-    visible_overloads = [f for f in all_funcs if not f.hidden]
+    return False
 
-    overloads_info = []
-    seen_overloads = set()
-    for func in visible_overloads:
-        args = {k: wp._src.context.type_str(v) for k, v in func.input_types.items()}
-        args_str = ", ".join(f"{k}: {v}" for k, v in args.items())
 
-        try:
-            return_type = wp._src.context.type_str(func.value_func(None, None))
-        except Exception:
-            return_type = "None"
+def _hide_inherited_builtin_members(context):
+    module_name = context.get("module")
+    object_name = context.get("objname")
+    if not module_name or not object_name:
+        return
 
-        if hasattr(func, "overloads"):
-            sig = wp._src.context.resolve_exported_function_sig(func)
-            is_exported = sig is not None
-        else:
-            is_exported = False
+    try:
+        module = importlib.import_module(module_name)
+        cls = operator.attrgetter(object_name)(module)
+    except (AttributeError, ImportError):
+        return
 
-        doc = normalize_docstring(func.doc)
-        overload_key = (args_str, return_type, is_exported, func.is_differentiable, doc)
-        if overload_key in seen_overloads:
-            continue
+    if not inspect.isclass(cls):
+        return
 
-        seen_overloads.add(overload_key)
-        overloads_info.append(
-            {
-                "args": args_str,
-                "return_type": return_type,
-                "is_exported": is_exported,
-                "is_differentiable": func.is_differentiable,
-                "doc": doc,
-            }
-        )
+    for member_group in ("methods", "attributes"):
+        context[member_group] = [
+            member for member in context.get(member_group, ()) if not _is_inherited_builtin_member(cls, member)
+        ]
 
-    return overloads_info
+
+def _is_type_var(fullname):
+    """Return whether ``fullname`` resolves to a :class:`typing.TypeVar`."""
+    module_name, _, attr_name = fullname.rpartition(".")
+    try:
+        obj = getattr(importlib.import_module(module_name), attr_name)
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+    return isinstance(obj, TypeVar)
 
 
 class AutosummaryRenderer(AutosummaryRenderer):
-    # Module containing Warp's built-ins functions and requiring special handling.
-    BUILTINS_TEMPLATE_FILE = "builtins.rst"
+    # Template documenting built-ins and other Warp functions, requiring special handling.
+    WARP_FUNCTION_TEMPLATE_FILE = "warp_function.rst"
 
     def render(self, template_name, context):
         context["wp_annotation_override"] = AUTOSUMMARY_ANNOTATION_OVERRIDES.get(context.get("fullname"))
+        context["wp_no_value"] = _is_type_var(context.get("fullname", ""))
 
-        if template_name == self.BUILTINS_TEMPLATE_FILE:
+        if context.get("objtype") == "class":
+            _hide_inherited_builtin_members(context)
+
+        # Autosummary classifies a `warp._src.context.Function` as data, which renders
+        # its `repr()` in place of a signature.  Route the registered ones through the
+        # function template instead so they document like the built-ins, without
+        # having to split the module pages into per-template blocks.
+        if context.get("fullname") in wp._src.context.api_functions:
+            template_name = self.WARP_FUNCTION_TEMPLATE_FILE
+
+        if template_name == self.WARP_FUNCTION_TEMPLATE_FILE:
             fullname = context["fullname"]
             symbol = fullname.split(".")[-1]
+            module = context["module"]
+
+            # Module-scoped API functions keep their own namespace; built-ins are
+            # documented from the `warp._src.lang` placeholder module and published
+            # under the flat `warp.` namespace instead.
+            publication = wp._src.context.api_functions.get(f"{module}.{symbol}")
+            if publication is None and module == "warp._src.lang":
+                publication = wp._src.context.api_functions.get(f"warp.{symbol}")
+            if publication is None:
+                func = wp._src.context.builtin_functions[symbol]
+                display_name = f"warp.{symbol}"
+            else:
+                func = publication.function
+                display_name = publication.public_name
 
             # Insert metadata that can be accessed from the template.
             context.update(
                 {
-                    "wp_display_name": f"warp.{symbol}",
-                    "wp_overloads": _get_builtin_overloads_info(symbol),
+                    "wp_display_name": display_name,
+                    "wp_module": module,
+                    "wp_overloads": describe_function(func, publication, GITHUB_VERSION),
                 }
             )
 
@@ -396,13 +474,34 @@ extlinks = {
 
 # -- sphinx.ext.intersphinx --------------------------------------------------
 
-# Mapping to external documentation to enable cross-linking (e.g., :class:`numpy.ndarray`)
-intersphinx_mapping = {
+# Intersphinx resolves external cross-references (e.g. :class:`numpy.ndarray`)
+# by fetching each project's objects.inv over the network. Builds are lenient by
+# default so an unreachable inventory doesn't hard-fail a local build; CI passes
+# --warnings-as-errors to promote stale/unreachable URLs to errors.
+_intersphinx_mapping = {
     "jax": ("https://docs.jax.dev/en/latest", None),
     "numpy": ("https://numpy.org/doc/stable", None),
     "python": ("https://docs.python.org/3", None),
     "pytorch": ("https://docs.pytorch.org/docs/stable", None),
 }
+
+# Fail fast on unreachable inventories instead of hanging on the default socket
+# timeout (seconds).
+intersphinx_timeout = 2
+
+# PyTorch's ``stable`` documentation URLs are client-side redirect stubs that
+# preserve fragments in browsers. The linkcheck builder cannot follow those
+# redirects before validating anchors, so only skip anchor checks for them;
+# URL availability is still checked.
+linkcheck_anchors_ignore_for_url = [r"https://docs\.pytorch\.org/docs/stable/.*"]
+
+_sphinx_logger = sphinx.util.logging.getLogger(__name__)
+# WARP_DOCS_OFFLINE=1 skips external resolution entirely for known-offline builds.
+if os.environ.get("WARP_DOCS_OFFLINE") == "1":
+    _sphinx_logger.info("intersphinx: WARP_DOCS_OFFLINE=1 set; skipping external cross-reference resolution.")
+    intersphinx_mapping = {}
+else:
+    intersphinx_mapping = _intersphinx_mapping
 
 
 # -- sphinx.ext.linkcode -----------------------------------------------------
@@ -414,7 +513,7 @@ def linkcode_resolve(domain, info):
     This is used for the sphinx.ext.linkcode extension.
 
     References:
-        https://github.com/google/jax/blob/main/docs/conf.py
+        https://github.com/jax-ml/jax/blob/main/docs/conf.py
         https://www.sphinx-doc.org/en/master/usage/extensions/linkcode.html
     """
     if domain != "py":
@@ -424,20 +523,18 @@ def linkcode_resolve(domain, info):
     if not info["fullname"]:
         return None
 
+    if info["module"] == "warp._src.lang" or f"{info['module']}.{info['fullname']}" in wp._src.context.api_functions:
+        return None  # The Warp function template links each overload to its own source.
+
     try:
         mod = sys.modules.get(info["module"])
         obj = operator.attrgetter(info["fullname"])(mod)
-        if isinstance(obj, property):
-            obj = obj.fget
-        filename = inspect.getsourcefile(obj)
-        source, linenum = inspect.getsourcelines(obj)
     except Exception:
         return None
+    if isinstance(obj, property):
+        obj = obj.fget
 
-    filename = os.path.relpath(filename, start=os.path.dirname(wp.__file__))
-    lines = f"#L{linenum}-L{linenum + len(source)}" if linenum else ""
-
-    return f"https://github.com/NVIDIA/warp/blob/{GITHUB_VERSION}/warp/{filename}{lines}"
+    return source_url(obj, GITHUB_VERSION)
 
 
 # -- sphinx_copybutton -------------------------------------------------------
@@ -567,18 +664,23 @@ def populate_reexported_docstrings(app, what, name, obj, options, lines):
     from the source module using string literals that follow constant
     assignments.
     """
-    if lines:
-        # Already has a docstring, nothing to do
+    if what != "data":
         return
 
-    if what != "data":
+    if isinstance(obj, (TypeVar, types.UnionType)) and obj.__doc__ == type(obj).__doc__:
+        # Type annotation objects inherit their class docstring, such as the
+        # ``typing.TypeVar`` one, which says nothing about this annotation.
+        lines.clear()
+
+    if lines:
+        # Already has a docstring, nothing to do
         return
 
     # Extract the simple name from the full qualified name
     simple_name = name.split(".")[-1]
 
     if simple_name in CONSTANT_DOCS_CACHE:
-        lines.append(CONSTANT_DOCS_CACHE[simple_name])
+        lines.extend(CONSTANT_DOCS_CACHE[simple_name].splitlines())
 
 
 def rewrite_internal_module_paths(app, doctree, docname):
@@ -714,7 +816,16 @@ def resolve_public_builtin_aliases(app, env, node, contnode):
 
 def generate_reference_docs(app):
     """Generate API and language reference .rst files before Sphinx reads sources."""
+    # The coordinator prepares the shared source tree before starting workers.
+    if app.builder.name == "doctest-shard":
+        return
     docs.generate_reference.run()
+
+
+def hide_generated_api_edit_link(_app, pagename, _templatename, context, _doctree):
+    """Hide edit links for generated API stubs that are not tracked in Git."""
+    if pagename.startswith("api_reference/_generated/"):
+        context["theme_use_edit_page_button"] = False
 
 
 def drop_autosummary_toctrees(app, doctree):
@@ -737,11 +848,120 @@ def drop_autosummary_toctrees(app, doctree):
         asum.parent.remove(asum)
 
 
+# Redirects for documentation pages that moved or were removed during the
+# navigation reorganization, so old URLs (bookmarks, external links, search
+# results) keep resolving. Maps an old page path without the ``.html`` suffix
+# to its new target, both relative to the docs root and without a leading
+# slash. Targets include ``.html`` and may include an optional ``#anchor``,
+# used when the old URL has no fragment of its own. GitHub Pages has no
+# server-side redirects and the site is served with ``.nojekyll`` (so
+# ``jekyll-redirect-from`` cannot run), hence
+# we emit redirect stubs at build time. Targets are rewritten relative to each
+# old page so the stubs work unchanged under any version prefix (``/stable/``,
+# ``/latest/``, ``/vX.Y/``).
+DOC_REDIRECTS = {
+    "user_guide/tiles": "user_guide/programming_model/tiles.html",
+    "user_guide/generics": "user_guide/programming_model/generics.html",
+    "user_guide/cpp_cuda_workflows": "user_guide/programming_model/cpp_cuda_workflows.html",
+    "deep_dive/codegen": "user_guide/programming_model/code_generation.html",
+    "deep_dive/concurrency": "user_guide/execution_and_performance/concurrency.html",
+    "deep_dive/allocators": "user_guide/execution_and_performance/memory_management.html",
+    "deep_dive/profiling": "user_guide/execution_and_performance/profiling.html",
+    "user_guide/deterministic_execution": "user_guide/execution_and_performance/deterministic_execution.html",
+    "user_guide/interoperability_jax": "user_guide/interoperability/jax.html",
+    "user_guide/interoperability_pytorch": "user_guide/interoperability/pytorch.html",
+    "user_guide/changelog": "project/changelog.html",
+    "user_guide/contribution_guide": "project/contribution_guide.html",
+    "user_guide/publications": "project/publications.html",
+    "deep_dive/memory_access": "user_guide/execution_and_performance/memory_management.html",
+    "user_guide/devices": "user_guide/runtime.html#devices",
+}
+
+# Legacy fragments whose content moved to a different page or whose generated
+# heading ID changed. All other incoming fragments are preserved as-is.
+DOC_FRAGMENT_REDIRECTS = {
+    "deep_dive/allocators": {
+        "allocators": "user_guide/execution_and_performance/memory_management.html#memory-allocation-and-access",
+        "introduction": "user_guide/execution_and_performance/memory_management.html#stream-ordered-memory-pool-allocators",
+    },
+    "deep_dive/memory_access": {
+        "cpu-gpu-cross-device-memory-access": (
+            "user_guide/execution_and_performance/memory_management.html#cross-device-memory-access"
+        ),
+        "launching-with-arrays-on-the-same-device": (
+            "user_guide/execution_and_performance/memory_management.html#launch-device-versus-allocation-device"
+        ),
+        "launching-gpu-kernels-with-cpu-arrays": (
+            "user_guide/execution_and_performance/memory_management.html#gpu-kernels-using-cpu-arrays"
+        ),
+        "accessing-gpu-data-from-cpu-code": (
+            "user_guide/execution_and_performance/memory_management.html#cpu-code-using-gpu-resident-data"
+        ),
+        "checking-access-for-a-specific-array-with-wp-can-access": (
+            "user_guide/execution_and_performance/memory_management.html#checking-a-concrete-array-with-wp-can-access"
+        ),
+        "checking-array-access-before-launch": (
+            "user_guide/execution_and_performance/memory_management.html#checked-launch-validation"
+        ),
+    },
+    "user_guide/devices": {
+        "cuda-peer-access": "user_guide/execution_and_performance/memory_management.html#cuda-peer-access",
+        "peer-access": "user_guide/execution_and_performance/memory_management.html#peer-access",
+    },
+}
+
+
+def write_redirect_stubs(app, exception):
+    """Emit meta-refresh stubs at moved/removed pages' old URLs (see ``DOC_REDIRECTS``)."""
+    if exception is not None or app.builder.name != "html":
+        return
+    logger = sphinx.util.logging.getLogger(__name__)
+    written = 0
+    for old, new in DOC_REDIRECTS.items():
+        dest = os.path.join(app.outdir, old + ".html")
+        if os.path.exists(dest):
+            logger.warning("skipping redirect for %s: a real page exists there", old)
+            continue
+        target, sep, frag = new.partition("#")
+        if not os.path.exists(os.path.join(app.outdir, target)):
+            logger.warning("redirect for %s targets missing page %s", old, target)
+        url = os.path.relpath(target, os.path.dirname(old)).replace(os.sep, "/") + sep + frag
+        script_url = json.dumps(url).replace("<", r"\u003c")
+        fragment_urls = {}
+        for old_fragment, fragment_target in DOC_FRAGMENT_REDIRECTS.get(old, {}).items():
+            fragment_page, fragment_sep, fragment_anchor = fragment_target.partition("#")
+            if not os.path.exists(os.path.join(app.outdir, fragment_page)):
+                logger.warning("fragment redirect for %s#%s targets missing page %s", old, old_fragment, fragment_page)
+            fragment_urls[f"#{old_fragment}"] = (
+                os.path.relpath(fragment_page, os.path.dirname(old)).replace(os.sep, "/")
+                + fragment_sep
+                + fragment_anchor
+            )
+        script_fragment_urls = json.dumps(fragment_urls, sort_keys=True).replace("<", r"\u003c")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(
+                '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                f'<link rel="canonical" href="{url}">'
+                f"<script>const target = new URL({script_url}, window.location.href);"
+                f"const fragmentTargets = {script_fragment_urls};"
+                "const fragmentTarget = fragmentTargets[window.location.hash];"
+                "if (fragmentTarget) target.href = new URL(fragmentTarget, window.location.href).href;"
+                "else if (window.location.hash) target.hash = window.location.hash;"
+                "window.location.replace(target.href);</script>"
+                f'<noscript><meta http-equiv="refresh" content="0; url={url}"></noscript></head>'
+                f'<body>Redirecting to <a href="{url}">{url}</a>&hellip;</body></html>\n'
+            )
+        written += 1
+    logger.info("wrote %d documentation redirect stub(s)", written)
+
+
 def setup(app):
     """Sphinx extension setup."""
     # Priority must be lower than autosummary's default (500) so that the
     # reference .rst files exist before autosummary scans for stub directives.
     app.connect("builder-inited", generate_reference_docs, priority=400)
+    app.connect("html-page-context", hide_generated_api_edit_link)
     app.connect("autodoc-process-docstring", filter_builtin_docstrings)
     app.connect("autodoc-process-docstring", rewrite_wp_in_docstrings)
     app.connect("autodoc-process-docstring", populate_reexported_docstrings)
@@ -754,3 +974,4 @@ def setup(app):
     app.connect("doctree-read", drop_autosummary_toctrees, priority=400)
     app.connect("doctree-resolved", rewrite_internal_module_paths)
     app.connect("doctree-resolved", strip_repr_addresses)
+    app.connect("build-finished", write_redirect_stubs)

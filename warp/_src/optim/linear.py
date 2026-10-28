@@ -3,14 +3,13 @@
 
 import functools
 import math
+import operator
 from collections.abc import Callable
 from typing import Any
 
 import warp as wp
 import warp.sparse as sparse
-from warp._src.types import type_is_matrix, type_is_vector, type_length, type_scalar_type
-
-_wp_module_name_ = "warp.optim.linear"
+from warp._src.types import type_is_matrix, type_is_vector, type_length, type_scalar_type, type_size_in_bytes
 
 __all__ = [
     "CG",
@@ -42,7 +41,13 @@ class LinearOperator:
         batch_offsets: Optional array of shape ``(B+1,)`` partitioning scalar degrees of freedom into
             ``B`` independent subproblems. ``batch_offsets[i]`` is the first scalar degree of freedom of
             subproblem ``i``. For vector-valued arrays, offsets must be aligned to the vector length.
+            Scalar degrees of freedom at or beyond ``batch_offsets[-1]`` are inactive and ignored by batched
+            iterative solvers.
             When ``None`` (default) the operator represents a single subproblem.
+        max_batch_length: Optional upper bound on the number of scalar degrees of freedom in any subproblem.
+            Providing this value with ``batch_offsets`` allows CUDA reductions to avoid redundant tree levels
+            without accessing the offsets on the host. It must not be smaller than the largest difference between
+            consecutive offsets. Stateful solvers require this value to remain fixed between calls.
 
     The matrix-vector multiplication routine should have the following signature:
 
@@ -69,12 +74,20 @@ class LinearOperator:
         device: wp._src.context.Device,
         matvec: Callable,
         batch_offsets: wp.array | None = None,
+        max_batch_length: int | None = None,
     ):
+        if max_batch_length is not None:
+            if batch_offsets is None:
+                raise ValueError("max_batch_length requires batch_offsets")
+            if max_batch_length < 0:
+                raise ValueError("max_batch_length must be non-negative")
+
         self._shape = shape
         self._dtype = dtype
         self._device = device
         self._matvec = matvec
         self._batch_offsets = batch_offsets
+        self._max_batch_length = max_batch_length
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -98,7 +111,11 @@ class LinearOperator:
 
     @property
     def batch_offsets(self) -> wp.array | None:
-        """Array of length ``batch_count + 1`` partitioning scalar degrees of freedom, or ``None``."""
+        """Array partitioning the active scalar degrees of freedom, or ``None``.
+
+        Scalar degrees of freedom at or beyond the final offset are inactive and ignored by batched iterative
+        solvers.
+        """
         return self._batch_offsets
 
     @property
@@ -106,11 +123,20 @@ class LinearOperator:
         """Number of independent subproblems. ``1`` when :attr:`batch_offsets` is ``None``."""
         return 1 if self._batch_offsets is None else self._batch_offsets.shape[0] - 1
 
+    @property
+    def max_batch_length(self) -> int | None:
+        """Upper bound on the number of scalar degrees of freedom in any subproblem, or ``None``."""
+        return self._max_batch_length
+
 
 _Matrix = wp.array | sparse.BsrMatrix | LinearOperator
 
 
-def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> LinearOperator:
+def aslinearoperator(
+    A: _Matrix,
+    batch_offsets: wp.array | None = None,
+    max_batch_length: int | None = None,
+) -> LinearOperator:
     """Cast the dense or sparse matrix ``A`` as a :class:`LinearOperator`.
 
     ``A`` must be of one of the following types:
@@ -118,12 +144,15 @@ def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> Linea
         - :class:`warp.sparse.BsrMatrix`
         - two-dimensional ``warp.array``; then ``A`` is assumed to be a dense matrix
         - one-dimensional ``warp.array``; then ``A`` is assumed to be a diagonal matrix
-        - :class:`warp.optim.linear.LinearOperator`; no casting necessary, ``batch_offsets`` is ignored
+        - :class:`warp.optim.linear.LinearOperator`; no casting necessary, ``batch_offsets`` and
+          ``max_batch_length`` are ignored
 
     Args:
         A: The matrix to wrap.
         batch_offsets: Optional array of shape ``(B+1,)`` partitioning scalar degrees of freedom into
             ``B`` independent subproblems (see :class:`LinearOperator`).
+        max_batch_length: Optional upper bound on the number of scalar degrees of freedom in any subproblem.
+            Specifying ``max_batch_length`` requires ``batch_offsets`` (see :class:`LinearOperator`).
     """
 
     if A is None or isinstance(A, LinearOperator):
@@ -165,13 +194,41 @@ def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> Linea
 
     if isinstance(A, wp.array):
         if A.ndim == 2:
-            return LinearOperator(A.shape, A.dtype, A.device, matvec=dense_mv, batch_offsets=batch_offsets)
+            return LinearOperator(
+                A.shape,
+                A.dtype,
+                A.device,
+                matvec=dense_mv,
+                batch_offsets=batch_offsets,
+                max_batch_length=max_batch_length,
+            )
         if A.ndim == 1:
             if type_is_vector(A.dtype):
-                return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv_vec, batch_offsets=batch_offsets)
-            return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv, batch_offsets=batch_offsets)
+                return LinearOperator(
+                    A.shape,
+                    A.dtype,
+                    A.device,
+                    matvec=diag_mv_vec,
+                    batch_offsets=batch_offsets,
+                    max_batch_length=max_batch_length,
+                )
+            return LinearOperator(
+                A.shape,
+                A.dtype,
+                A.device,
+                matvec=diag_mv,
+                batch_offsets=batch_offsets,
+                max_batch_length=max_batch_length,
+            )
     if isinstance(A, sparse.BsrMatrix):
-        return LinearOperator(A.shape, A.dtype, A.device, matvec=bsr_mv, batch_offsets=batch_offsets)
+        return LinearOperator(
+            A.shape,
+            A.dtype,
+            A.device,
+            matvec=bsr_mv,
+            batch_offsets=batch_offsets,
+            max_batch_length=max_batch_length,
+        )
 
     raise ValueError(f"Unable to create LinearOperator from {A}")
 
@@ -185,15 +242,548 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
 
          - ``"diag"``: Diagonal (a.k.a. Jacobi) preconditioner
          - ``"diag_abs"``: Similar to Jacobi, but using the absolute value of diagonal coefficients
+         - ``"block_jacobi_direct"``: Block-Jacobi preconditioner that inverts each diagonal block
+           via a dense Householder-QR-based inverse. Zero-safe: a numerically singular block
+           falls back to the identity for that block instead of producing NaNs, mirroring the
+           zero-safe convention of ``"diag"``.
+         - ``"block_jacobi_sequential"``: Block-Jacobi preconditioner that factorizes each
+           diagonal block via a scalar LDL^T factorization. Requires the block to be symmetric
+           positive-definite, but is zero-safe (a non-SPD block becomes identity). Supports any Warp floating
+           scalar type.
+         - ``"block_jacobi_tile"``: Block-Jacobi preconditioner that factorizes each diagonal
+           block via tile-parallel Cholesky (runs on both CPU and GPU). Blocks must be symmetric
+           positive-definite, and ``A``'s scalar type must be ``float32`` or ``float64``. A
+           non-symmetric block is zero-safe (becomes identity); a symmetric but non-positive-definite
+           block is not (undefined, per :func:`wp.tile_cholesky`).
+         - ``"fsai"``: Adaptive factorized sparse approximate inverse for an SPD BSR matrix.
+           Use :class:`warp.optim.linear.FSAI` directly to configure its sparsity and reuse.
          - ``"id"``: Identity (null) preconditioner
+
+         All ``"block_jacobi*"`` variants require ``A`` to be a square :class:`warp.sparse.BsrMatrix`
+         with square blocks, and fall back to ``"diag"`` for 1x1-block (CSR) matrices.
+
+    Returns:
+        A :class:`LinearOperator` applying the requested preconditioner, or ``None`` for
+        ``ptype="id"``.
+
+    Raises:
+        ValueError: ``ptype`` is not one of the supported values, a ``"block_jacobi*"``
+            ``ptype`` is requested with a non-\\ :class:`warp.sparse.BsrMatrix` ``A``, one that
+            isn't square, or one whose blocks aren't square; or ``ptype="block_jacobi_tile"``
+            is requested with an ``A`` whose scalar type isn't ``float32``/``float64``;
+            or ``ptype="fsai"`` is requested with an input that fails
+            :class:`warp.optim.linear.FSAI` validation.
+        TypeError: ``ptype="fsai"`` is requested with an unsupported scalar type.
     """
 
+    if ptype == "fsai":
+        from warp._src.optim.fsai import FSAI  # noqa: PLC0415
+
+        return FSAI(A)
     if ptype == "id":
         return None
     if ptype in ("diag", "diag_abs"):
         return _make_jacobi_preconditioner(A, use_abs=ptype == "diag_abs")
+    if ptype in _BLOCK_JACOBI_STRATEGIES:
+        return _make_block_jacobi_preconditioner(A, _BLOCK_JACOBI_STRATEGIES[ptype])
 
     raise ValueError(f"Unsupported preconditioner type '{ptype}'")
+
+
+_BLOCK_JACOBI_STRATEGIES = {
+    "block_jacobi_direct": "direct",
+    "block_jacobi_sequential": "sequential",
+    "block_jacobi_tile": "tile",
+}
+
+# Relative pivot tolerance below which a diagonal block is treated as singular, per dtype
+# (~eps**0.75). float16's is already ~1 ulp (eps 9.8e-4) and cannot go lower without missing
+# genuinely rank-deficient blocks, so a float16 block scaled below ~1e-3 falls back to the
+# identity -- see test_block_jacobi_preconditioner_well_conditioned_scaled_block.
+_BLOCK_JACOBI_PIVOT_REL_TOL = {wp.float16: 1.0e-3, wp.float32: 1.0e-6, wp.float64: 1.0e-12}
+
+
+def _make_block_jacobi_preconditioner(A: _Matrix, strategy: str) -> LinearOperator:
+    """Build a block-Jacobi preconditioner from the diagonal blocks of a BsrMatrix.
+
+    Validates ``A`` once, then dispatches to the ``"direct"``, ``"sequential"``, or ``"tile"``
+    builder for ``strategy``. Falls back to scalar Jacobi for 1x1-block (CSR) matrices; see
+    :func:`preconditioner` for the full contract.
+    """
+    if not isinstance(A, sparse.BsrMatrix):
+        raise ValueError("Block-Jacobi preconditioner requires a warp.sparse.BsrMatrix input")
+
+    block_shape = A.block_shape
+    if block_shape[0] != block_shape[1]:
+        raise ValueError(f"Block-Jacobi preconditioner requires square matrix blocks, got shape {block_shape}")
+
+    # The block grid must be square too, not just the blocks: bsr_get_diag() returns
+    # min(nrow, ncol) blocks, which every builder below uses as both its launch dimension and
+    # the operator's shape. Unequal block-row/block-column counts would therefore yield an
+    # operator smaller than the system it preconditions, silently leaving trailing outputs
+    # unwritten -- even when square blocks happen to make the overall scalar shape square too.
+    if A.nrow != A.ncol:
+        raise ValueError(
+            f"Block-Jacobi preconditioner requires the same number of block rows and block "
+            f"columns, got {A.nrow} block rows and {A.ncol} block columns (overall shape {A.shape})"
+        )
+
+    block_size = block_shape[0]
+    if block_size == 1:
+        # A CSR matrix; block-Jacobi degenerates to standard (scalar) Jacobi.
+        return _make_jacobi_preconditioner(A, use_abs=False)
+
+    if strategy == "direct":
+        return _make_block_jacobi_direct(A, block_size)
+    if strategy == "sequential":
+        return _make_block_jacobi_sequential(A, block_size)
+    return _make_block_jacobi_tile(A, block_size)
+
+
+def _make_block_jacobi_direct(A: _Matrix, block_size: int) -> LinearOperator:
+    """Build a block-Jacobi preconditioner via a dense Householder-QR block inverse."""
+    device = A.device
+    scalar_type = A.scalar_type
+
+    A_diag = sparse.bsr_get_diag(A)
+    dim = A_diag.shape[0]
+    inv_diag = wp.empty_like(A_diag)
+    rel_tol = scalar_type(_BLOCK_JACOBI_PIVOT_REL_TOL.get(scalar_type, 1.0e-6))
+    wp.launch(_invert_diagonal_blocks_qr, dim=dim, device=device, inputs=[A_diag, rel_tol, inv_diag])
+
+    def block_jacobi_direct_mv(x, y, z, alpha, beta):
+        """Compute ``z = alpha * (blockdiag(A)^-1 @ x) + beta * y`` via the QR block inverse."""
+        wp.launch(
+            _block_diag_mv_inverse,
+            dim=dim,
+            device=device,
+            inputs=[
+                inv_diag,
+                _as_vector_array(_as_scalar_array(x), block_size),
+                _as_vector_array(_as_scalar_array(y), block_size),
+                _as_vector_array(_as_scalar_array(z), block_size),
+                scalar_type(alpha),
+                scalar_type(beta),
+            ],
+        )
+
+    return LinearOperator((dim * block_size, dim * block_size), A.dtype, device, matvec=block_jacobi_direct_mv)
+
+
+def _make_block_jacobi_sequential(A: _Matrix, block_size: int) -> LinearOperator:
+    """Build a block-Jacobi preconditioner via a scalar LDL^T block factorization.
+
+    Applies the block factorization via plain scalar arithmetic rather than tile hardware, which
+    is what gives it ``float16`` support and zero-safe behavior on non-SPD input (see
+    :func:`_block_ldlt`). Requires blocks to be symmetric positive-definite (falls back to
+    identity on failure, see :func:`_block_ldlt`).
+    """
+    device = A.device
+    scalar_type = A.scalar_type
+
+    A_diag = sparse.bsr_get_diag(A)
+    dim = A_diag.shape[0]
+    ldlt_diag = wp.empty_like(A_diag)
+    rel_tol = scalar_type(_BLOCK_JACOBI_PIVOT_REL_TOL.get(scalar_type, 1.0e-6))
+    wp.launch(_ldlt_diagonal_blocks, dim=dim, device=device, inputs=[A_diag, rel_tol, ldlt_diag])
+
+    def block_jacobi_sequential_mv(x, y, z, alpha, beta):
+        """Compute ``z = alpha * (blockdiag(A)^-1 @ x) + beta * y`` via the packed LDL^T solve."""
+        wp.launch(
+            _block_diag_mv_ldlt,
+            dim=dim,
+            device=device,
+            inputs=[
+                ldlt_diag,
+                _as_vector_array(_as_scalar_array(x), block_size),
+                _as_vector_array(_as_scalar_array(y), block_size),
+                _as_vector_array(_as_scalar_array(z), block_size),
+                scalar_type(alpha),
+                scalar_type(beta),
+            ],
+        )
+
+    return LinearOperator((dim * block_size, dim * block_size), A.dtype, device, matvec=block_jacobi_sequential_mv)
+
+
+def _make_block_jacobi_tile(A: _Matrix, block_size: int) -> LinearOperator:
+    """Build a block-Jacobi preconditioner via tile-parallel Cholesky factorization (runs on
+    both CPU and GPU).
+
+    Best suited to large blocks. Requires blocks to be symmetric positive-definite, and ``A``'s
+    scalar type to be ``float32`` or ``float64`` (the types supported by :func:`warp.tile_cholesky`).
+    :func:`wp.tile_cholesky` only reads one triangle, so a non-symmetric block is flagged up front
+    (see :func:`_check_block_symmetry`) and swapped for the identity before factorization instead
+    of being silently misfactorized -- unlike ``"sequential"``, positive-definiteness itself is
+    still unchecked.
+    """
+    scalar_type = A.scalar_type
+    if scalar_type not in (wp.float32, wp.float64):
+        raise ValueError(
+            f"'block_jacobi_tile' preconditioner requires a float32 or float64 scalar type, got {scalar_type.__name__}"
+        )
+    device = A.device
+
+    A_diag = sparse.bsr_get_diag(A)
+    dim = A_diag.shape[0]
+    rel_tol = scalar_type(_BLOCK_JACOBI_PIVOT_REL_TOL.get(scalar_type, 1.0e-6))
+    symmetric = wp.empty(shape=dim, dtype=wp.bool, device=device)
+    wp.launch(_check_block_symmetry, dim=dim, device=device, inputs=[A_diag, rel_tol, symmetric])
+
+    # One matrix block per row, laid out contiguously; reinterpret as a flat
+    # (dim * block_size, block_size) scalar array so the Cholesky kernels below
+    # can address each block with a simple tile_load/tile_store offset.
+    A_flat = A_diag.view(scalar_type).reshape((dim * block_size, block_size))
+    L_flat = wp.empty(shape=A_flat.shape, dtype=scalar_type, device=device)
+
+    factorize_kernel, solve_kernel = _create_block_jacobi_tile_kernels(block_size)
+    wp.launch_tiled(factorize_kernel, dim=[dim], inputs=[A_flat, symmetric, L_flat], block_dim=32, device=device)
+
+    def block_jacobi_tile_mv(x, y, z, alpha, beta):
+        """Compute ``z = alpha * (blockdiag(A)^-1 @ x) + beta * y``, the block-Jacobi matvec."""
+        wp.launch_tiled(
+            solve_kernel,
+            dim=[dim],
+            inputs=[
+                L_flat,
+                _as_scalar_array(x),
+                _as_scalar_array(y),
+                _as_scalar_array(z),
+                scalar_type(alpha),
+                scalar_type(beta),
+            ],
+            block_dim=32,
+            device=device,
+        )
+
+    return LinearOperator(
+        (dim * block_size, dim * block_size),
+        A.dtype,
+        device,
+        matvec=block_jacobi_tile_mv,
+    )
+
+
+@functools.cache
+def _create_block_jacobi_tile_kernels(block_size: int):
+    """Build and cache the tile-Cholesky factorize/solve kernel pair for one block size.
+
+    Used by the ``block_jacobi_tile`` preconditioner strategy.
+    """
+
+    @wp.kernel(module="unique")
+    def factorize_kernel(
+        A_flat: wp.array2d[Any],
+        symmetric: wp.array[wp.bool],
+        L_flat: wp.array2d[Any],
+    ):
+        """Cholesky-factorize one ``block_size x block_size`` diagonal block per tile.
+
+        Computes ``L L^T = A_flat``'s block, or ``L L^T = I`` for a block flagged non-symmetric
+        by ``symmetric`` (see :func:`_check_block_symmetry`), so the subsequent solve is a
+        pass-through on that block instead of silently factorizing only its lower triangle.
+        """
+        i = wp.tid()
+        off = i * block_size
+        if symmetric[i]:
+            A_tile = wp.tile_load(A_flat, shape=(block_size, block_size), offset=(off, 0))
+        else:
+            A_tile = wp.tile_diag_add(
+                wp.tile_zeros(shape=(block_size, block_size), dtype=A_flat.dtype),
+                wp.tile_ones(shape=(block_size,), dtype=A_flat.dtype),
+            )
+        L_tile = wp.tile_cholesky(A_tile)
+        wp.tile_store(L_flat, L_tile, offset=(off, 0))
+
+    @wp.kernel(module="unique")
+    def solve_kernel(
+        L_flat: wp.array2d[Any],
+        x: wp.array[Any],
+        y: wp.array[Any],
+        z: wp.array[Any],
+        alpha: Any,
+        beta: Any,
+    ):
+        """Apply one block-diagonal inverse per tile and write the result directly into ``z``.
+
+        Computes ``z = alpha * (A_diag^-1 x) + beta * y`` via forward/backward substitution on
+        ``L_flat``, writing straight into the caller-provided ``z`` tile with no shared scratch
+        buffer, so concurrent calls on different streams cannot race on intermediate state.
+        """
+        i = wp.tid()
+        off = i * block_size
+        L_tile = wp.tile_load(L_flat, shape=(block_size, block_size), offset=(off, 0))
+        zero = type(alpha)(0.0)
+        if alpha == zero:
+            out = wp.tile_zeros(shape=(block_size,), dtype=x.dtype)
+        else:
+            rhs = wp.tile_load(x, shape=(block_size,), offset=(off,))
+            wp.tile_cholesky_solve_inplace(L_tile, rhs)
+            out = rhs * alpha
+
+        if beta != zero:
+            out += wp.tile_load(y, shape=(block_size,), offset=(off,)) * beta
+        wp.tile_store(z, out, offset=(off,))
+
+    return factorize_kernel, solve_kernel
+
+
+# --- Direct (QR) and sequential (LDL^T) block-Jacobi helpers -----------------
+#
+# Local re-implementations of QR-based dense inversion and LDL^T factorization for small,
+# fixed-size blocks. Kept as plain wp.funcs operating on fixed-size wp.matrix/wp.vector types
+# (no wp.tile_* involved), so they work for any Warp floating scalar type and don't require
+# tile hardware.
+
+
+@wp.func
+def _qr_decomposition(A: Any):
+    """Compute a Householder QR factorization of a square fixed-size matrix.
+
+    Returns ``(Q, R)`` such that ``A = Q R``, with ``Q`` orthonormal and ``R`` upper triangular.
+    """
+    x = type(A[0])()
+    Q = wp.identity(n=x.length, dtype=A.dtype)
+
+    zero = x.dtype(0.0)
+    two = x.dtype(2.0)
+
+    for i in range(x.length):
+        for k in range(x.length):
+            x[k] = wp.where(k < i, zero, A[k, i])
+
+        alpha = wp.length(x) * wp.sign(x[i])
+        x[i] += alpha
+        two_over_x_sq = wp.where(alpha == zero, zero, two / wp.length_sq(x))
+
+        A -= wp.outer(two_over_x_sq * x, x * A)
+        Q -= wp.outer(Q * x, two_over_x_sq * x)
+
+    return Q, A
+
+
+@wp.func
+def _solve_upper(R: Any, b: Any):
+    """Solve ``R x = b`` for an upper-triangular ``R``, zero-safe on a zero diagonal entry."""
+    zero = b.dtype(0)
+    x = type(b)(zero)
+    for i in range(b.length, 0, -1):
+        j = i - 1
+        r = b[j] - wp.dot(R[j], x)
+        x[j] = wp.where(R[j, j] == zero, zero, r / R[j, j])
+    return x
+
+
+@wp.func
+def _block_inverse_qr(A: Any, rel_tol: Any):
+    """Invert a square fixed-size matrix via Householder QR.
+
+    Falls back to the identity when the block is numerically singular, mirroring the zero-safe
+    convention of the scalar Jacobi preconditioner, so the result stays well-defined for
+    non-invertible blocks. A pivot is treated as singular when it is non-finite or small
+    relative to the largest pivot magnitude in the block, rather than only when it is exactly
+    zero: for a genuinely rank-deficient block, roundoff during the QR factorization typically
+    leaves a tiny but nonzero diagonal entry on ``R`` rather than an exact zero, which an
+    exact-zero check misses and then divides by in the triangular solve below.
+
+    ``rel_tol`` is the dtype's relative pivot tolerance (``_BLOCK_JACOBI_PIVOT_REL_TOL``); a
+    single constant across dtypes would reject well-conditioned, merely differently-scaled
+    blocks such as ``diag(1, 1e-4)``.
+    """
+    Q, R = _qr_decomposition(A)
+    row = type(A[0])()
+    zero = A.dtype(0)
+    one = A.dtype(1)
+
+    max_pivot = zero
+    for j in range(row.length):
+        max_pivot = wp.max(max_pivot, wp.abs(R[j, j]))
+
+    singular = wp.bool(False)
+    for j in range(row.length):
+        pivot = R[j, j]
+        singular = singular or (not wp.isfinite(pivot)) or (wp.abs(pivot) <= rel_tol * max_pivot)
+
+    A_inv = type(A)()
+    for i in range(row.length):
+        A_inv[i] = _solve_upper(R, Q[i])  # i-th column of Q^T
+    inv = wp.transpose(A_inv)
+
+    for i in range(row.length):
+        for j in range(row.length):
+            inv[i, j] = wp.where(singular, wp.where(i == j, one, zero), inv[i, j])
+    return inv
+
+
+@wp.func
+def _block_is_symmetric(A: Any, rel_tol: Any):
+    """Check whether a fixed-size matrix is symmetric, within ``rel_tol`` of its diagonal scale.
+
+    Shared by :func:`_block_ldlt` (``"block_jacobi_sequential"``) and
+    :func:`_check_block_symmetry` (``"block_jacobi_tile"``): both factorize only the lower
+    triangle of their input (LDL^T and Cholesky, respectively), so neither would otherwise notice
+    a non-symmetric block and would silently factorize it as if its lower triangle were the whole
+    matrix.
+    """
+    row = type(A[0])()
+
+    max_diag = A.dtype(0.0)
+    for j in range(row.length):
+        max_diag = wp.max(max_diag, wp.abs(A[j, j]))
+
+    for j in range(row.length):
+        for i in range(j + 1, row.length):
+            if wp.abs(A[i, j] - A[j, i]) > rel_tol * max_diag:
+                return wp.bool(False)
+    return wp.bool(True)
+
+
+@wp.func
+def _block_ldlt(A: Any, rel_tol: Any):
+    """Factorize a symmetric fixed-size matrix as ``A = L D L^T``.
+
+    ``L`` is unit lower triangular and ``D`` is diagonal; both are packed into a single returned
+    matrix ``M`` with ``M[i, i] = D[i]`` and ``M[i, j] = L[i, j]`` for ``i > j`` (``L``'s implicit
+    unit diagonal is not stored). Falls back to the identity on non-SPD input, so
+    :func:`_apply_ldlt` becomes a pass-through on that block and the preconditioner stays
+    well-defined. A pivot is treated as non-SPD when it is non-finite or small relative to the
+    block's diagonal scale, rather than only when it is ``<= 0``: for a genuinely rank-deficient
+    block, LDL^T roundoff can leave a tiny positive residual pivot instead of an exact
+    non-positive value, which a ``<= 0`` check misses and then divides by. Also falls back to the
+    identity for a non-symmetric block -- see :func:`_block_is_symmetric`.
+
+    ``rel_tol`` is the dtype's relative pivot tolerance -- see :func:`_block_inverse_qr`.
+    """
+    row = type(A[0])()
+    zero = A.dtype(0.0)
+
+    if not _block_is_symmetric(A, rel_tol):
+        return wp.identity(n=row.length, dtype=A.dtype)
+
+    max_diag = zero
+    for j in range(row.length):
+        max_diag = wp.max(max_diag, wp.abs(A[j, j]))
+
+    M = type(A)(zero)
+    spd = wp.bool(True)
+    for j in range(row.length):
+        d = A[j, j]
+        for k in range(j):
+            d -= M[j, k] * M[j, k] * M[k, k]
+
+        if (not wp.isfinite(d)) or (d <= rel_tol * max_diag):
+            spd = False
+            break
+
+        M[j, j] = d
+        for i in range(j + 1, row.length):
+            t = A[i, j]
+            for k in range(j):
+                t -= M[i, k] * M[j, k] * M[k, k]
+            M[i, j] = t / d
+
+    if spd:
+        return M
+    return wp.identity(n=row.length, dtype=A.dtype)
+
+
+@wp.func
+def _apply_ldlt(M: Any, x: Any):
+    """Solve ``(L D L^T) z = x`` given the packed LDL^T form returned by :func:`_block_ldlt`."""
+    zero = x.dtype(0)
+
+    # Forward: L y = x (unit lower).
+    y = type(x)(zero)
+    for i in range(x.length):
+        r = x[i]
+        for j in range(i):
+            r -= M[i, j] * y[j]
+        y[i] = r
+
+    # Backward with D^{-1} folded in: solve L^T z = D^{-1} y (unit upper).
+    z = type(x)(zero)
+    for i in range(x.length, 0, -1):
+        idx = i - 1
+        r = y[idx] / M[idx, idx]
+        for j in range(idx + 1, x.length):
+            r -= M[j, idx] * z[j]
+        z[idx] = r
+    return z
+
+
+@wp.kernel(module_options={"max_unroll": 4}, module="unique")
+def _invert_diagonal_blocks_qr(
+    diag: wp.array[Any],
+    rel_tol: Any,
+    inv_diag: wp.array[Any],
+):
+    """Invert one diagonal block per thread via Householder QR."""
+    i = wp.tid()
+    inv_diag[i] = _block_inverse_qr(diag[i], rel_tol)
+
+
+@wp.kernel(module="unique")
+def _ldlt_diagonal_blocks(
+    diag: wp.array[Any],
+    rel_tol: Any,
+    ldlt_diag: wp.array[Any],
+):
+    """Factorize one diagonal block per thread into packed LDL^T form."""
+    i = wp.tid()
+    ldlt_diag[i] = _block_ldlt(diag[i], rel_tol)
+
+
+@wp.kernel(module="unique")
+def _check_block_symmetry(
+    diag: wp.array[Any],
+    rel_tol: Any,
+    symmetric: wp.array[wp.bool],
+):
+    """Flag one diagonal block per thread as symmetric -- used by ``"block_jacobi_tile"``, whose
+    Cholesky factorization otherwise only reads one triangle. See :func:`_block_is_symmetric`.
+    """
+    i = wp.tid()
+    symmetric[i] = _block_is_symmetric(diag[i], rel_tol)
+
+
+@wp.kernel(module="unique")
+def _block_diag_mv_inverse(
+    inv: wp.array[Any],
+    x: wp.array[Any],
+    y: wp.array[Any],
+    z: wp.array[Any],
+    alpha: Any,
+    beta: Any,
+):
+    """Apply one precomputed block inverse per thread and write ``z = alpha * (inv x) + beta * y``."""
+    i = wp.tid()
+    zero = type(alpha)(0)
+    s = z.dtype(zero)
+    if alpha != zero:
+        s = alpha * (inv[i] * x[i])
+    if beta != zero:
+        s += beta * y[i]
+    z[i] = s
+
+
+@wp.kernel(module="unique")
+def _block_diag_mv_ldlt(
+    ldlt: wp.array[Any],
+    x: wp.array[Any],
+    y: wp.array[Any],
+    z: wp.array[Any],
+    alpha: Any,
+    beta: Any,
+):
+    """Apply one packed LDL^T solve per thread and write ``z = alpha * (M^-1 x) + beta * y``."""
+    i = wp.tid()
+    zero = type(alpha)(0)
+    s = z.dtype(zero)
+    if alpha != zero:
+        s = alpha * _apply_ldlt(ldlt[i], x[i])
+    if beta != zero:
+        s += beta * y[i]
+    z[i] = s
 
 
 def _make_jacobi_preconditioner(A: _Matrix, use_abs: bool) -> LinearOperator:
@@ -241,6 +831,32 @@ def _as_scalar_array(x: wp.array):
     return arr
 
 
+def _as_vector_array(x: wp.array, length: int):
+    """View a 1-D scalar array as a 1-D array of fixed-length vectors.
+
+    The underlying storage is shared (no copy); ``x`` must be contiguous along its last
+    dimension, and that dimension's length must be divisible by ``length``.
+    """
+    if length == 1:
+        return x
+    if x.strides[-1] != type_size_in_bytes(x.dtype):
+        raise ValueError("Array is not contiguous along its last dimension")
+    if x.shape[-1] % length != 0:
+        raise ValueError(f"Array length {x.shape[-1]} is not divisible by block size {length}")
+
+    vec_type = wp.types.vector(length=length, dtype=x.dtype)
+    arr = wp.array(
+        ptr=x.ptr,
+        shape=(*x.shape[:-1], x.shape[-1] // length),
+        strides=(*x.strides[:-1], x.strides[-1] * length),
+        dtype=vec_type,
+        device=x.device,
+        grad=None if x.grad is None else _as_vector_array(x.grad, length),
+    )
+    arr._ref = x
+    return arr
+
+
 def _dofs_per_entry(dtype: type):
     return type_length(dtype) if type_scalar_type(dtype) != dtype else 1
 
@@ -261,6 +877,9 @@ class TiledDot:
         batch_offsets: Optional array of shape ``(B+1,)`` partitioning scalar degrees of freedom into
             ``B`` independent subproblems. When provided, :meth:`compute` returns ``B`` independent
             dot products rather than a single global one.
+        max_batch_length: Optional upper bound on the length of any subproblem. Providing it avoids
+            redundant CUDA tree-reduction levels. It must not be smaller than the largest difference
+            between consecutive ``batch_offsets``.
     """
 
     def __init__(
@@ -271,26 +890,38 @@ class TiledDot:
         device=None,
         max_column_count: int = 1,
         batch_offsets: wp.array | None = None,
+        max_batch_length: int | None = None,
     ):
+        if max_batch_length is not None:
+            if batch_offsets is None:
+                raise ValueError("max_batch_length requires batch_offsets")
+            if max_batch_length < 0:
+                raise ValueError("max_batch_length must be non-negative")
+
         self.tile_size = tile_size
         self.device = device
         self.max_column_count = max_column_count
         self.batch_offsets = batch_offsets
+        self.max_batch_length = max_batch_length
         self.batch_count = 1 if batch_offsets is None else batch_offsets.shape[0] - 1
 
-        if self.batch_count == 1:
+        use_segmented_tree = (
+            batch_offsets is not None
+            and self.device.is_cuda
+            and self.tile_size > 1
+            and (max_batch_length is None or max_batch_length > self.tile_size)
+        )
+
+        if batch_offsets is None:
             num_blocks = (max_length + self.tile_size - 1) // self.tile_size
-            # Scratch must hold at least batch_count result slots per column (one per subproblem)
-            scratch_size = max(num_blocks, self.batch_count)
             scratch = wp.zeros(
-                shape=(2, max_column_count, scratch_size),
+                shape=(2, max_column_count, num_blocks),
                 dtype=scalar_type,
                 device=self.device,
             )
             self.partial_sums_a = scratch[0]
             self.partial_sums_b = scratch[1]
 
-            # Non-batched: tiled tree reduction
             self.dot_kernel, self.sum_kernel = _create_tiled_dot_kernels(self.tile_size)
 
             rounds = 0
@@ -308,6 +939,7 @@ class TiledDot:
                 inputs=(self.partial_sums_a, self.partial_sums_b),
                 outputs=(self.partial_sums_a,),
                 block_dim=self.tile_size,
+                device=self.device,
                 record_cmd=True,
             )
             self.sum_launch: wp.Launch = wp.launch(
@@ -316,14 +948,95 @@ class TiledDot:
                 inputs=(self.partial_sums_a,),
                 outputs=(self.partial_sums_b,),
                 block_dim=self.tile_size,
+                device=self.device,
                 record_cmd=True,
             )
             self.batch_dot_launch = None
-        else:
-            # Batched: direct per-subproblem reduction in one kernel
-            # Each subproblem's threads loop over their DOF range and reduce cooperatively.
-            # (Assumes all subproblems are small compared to total length)
+            self.segmented_dot_launch = None
+        elif use_segmented_tree:
+            (
+                plan_offsets_kernel,
+                segmented_dot_kernel,
+                segmented_sum_kernel,
+            ) = _create_segmented_tiled_dot_kernels(self.tile_size)
 
+            # Plan compact, batch-aligned chunks entirely on the device. Each level stores
+            # prefix offsets into that level's flattened partial-sum array.
+            self.segmented_offsets = [batch_offsets]
+            self.segmented_block_counts = []
+            batch_length_bound = max_length if max_batch_length is None else min(max_length, max_batch_length)
+            level_scale = 1
+            while True:
+                level_scale *= self.tile_size
+                batch_length_bound = max(1, (batch_length_bound + self.tile_size - 1) // self.tile_size)
+                total_length_bound = max(
+                    self.batch_count,
+                    (max_length + level_scale - 1) // level_scale + self.batch_count - 1,
+                )
+                max_block_count = min(total_length_bound, self.batch_count * batch_length_bound)
+
+                input_offsets = self.segmented_offsets[-1]
+                output_offsets = wp.empty(self.batch_count + 1, dtype=int, device=self.device)
+                # The batch layout is fixed for the lifetime of this TiledDot, so plan
+                # each level once on the current stream and keep the offsets device-side.
+                wp.launch(
+                    plan_offsets_kernel,
+                    dim=self.tile_size,
+                    inputs=[input_offsets],
+                    outputs=[output_offsets],
+                    block_dim=self.tile_size,
+                    device=self.device,
+                )
+                self.segmented_offsets.append(output_offsets)
+                self.segmented_block_counts.append(max_block_count)
+
+                if batch_length_bound == 1:
+                    break
+
+            scratch = wp.zeros(
+                shape=(2, max_column_count, self.segmented_block_counts[0]),
+                dtype=scalar_type,
+                device=self.device,
+            )
+            self.partial_sums_a = scratch[0]
+            self.partial_sums_b = scratch[1]
+
+            self.rounds = len(self.segmented_block_counts) - 1
+            self._output = self.partial_sums_a if self.rounds % 2 == 0 else self.partial_sums_b
+
+            self.segmented_dot_launch: wp.Launch = wp.launch(
+                segmented_dot_kernel,
+                dim=(max_column_count, self.segmented_block_counts[0], self.tile_size),
+                inputs=(
+                    self.partial_sums_a,
+                    self.partial_sums_b,
+                    self.partial_sums_a,
+                    self.segmented_offsets[0],
+                    self.segmented_offsets[1],
+                ),
+                block_dim=self.tile_size,
+                device=self.device,
+                record_cmd=True,
+            )
+            self.sum_launch: wp.Launch = wp.launch(
+                segmented_sum_kernel,
+                dim=(max_column_count, self.segmented_block_counts[-1], self.tile_size),
+                inputs=(
+                    self.partial_sums_a,
+                    self.partial_sums_b,
+                    self.segmented_offsets[-2],
+                    self.segmented_offsets[-1],
+                ),
+                block_dim=self.tile_size,
+                device=self.device,
+                record_cmd=True,
+            )
+            self.dot_launch = None
+            self.batch_dot_launch = None
+        else:
+            # CPU reductions remain direct because CPU tiles contain one thread. CUDA
+            # reductions use this path when every batch fits in one tile, avoiding the
+            # segmented offset plan and per-block binary search.
             if not self.device.is_cuda:
                 self.tile_size = 1
 
@@ -338,6 +1051,7 @@ class TiledDot:
             self._output = self.partial_sums_a  # rounds=0 -> always written to partial_sums_a
             self.dot_launch = None
             self.sum_launch = None
+            self.segmented_dot_launch = None
 
             self.batch_dot_launch: wp.Launch = wp.launch(
                 batch_dot_kernel,
@@ -374,6 +1088,22 @@ class TiledDot:
             self.batch_dot_launch.set_param_at_index(2, data_out)
             self.batch_dot_launch.set_dim((column_count, self.batch_count, self.tile_size))
             self.batch_dot_launch.launch()
+        elif self.segmented_dot_launch is not None:
+            self.segmented_dot_launch.set_param_at_index(0, a)
+            self.segmented_dot_launch.set_param_at_index(1, b)
+            self.segmented_dot_launch.set_param_at_index(2, data_out)
+            self.segmented_dot_launch.set_dim((column_count, self.segmented_block_counts[0], self.tile_size))
+            self.segmented_dot_launch.launch()
+
+            for round_index in range(self.rounds):
+                data_in, data_out = data_out, data_in
+
+                self.sum_launch.set_param_at_index(0, data_in)
+                self.sum_launch.set_param_at_index(1, data_out)
+                self.sum_launch.set_param_at_index(2, self.segmented_offsets[round_index + 1])
+                self.sum_launch.set_param_at_index(3, self.segmented_offsets[round_index + 2])
+                self.sum_launch.set_dim((column_count, self.segmented_block_counts[round_index + 1], self.tile_size))
+                self.sum_launch.launch()
         else:
             # Non-batched path: tiled tree reduction
             num_blocks = (a.shape[1] + self.tile_size - 1) // self.tile_size
@@ -440,6 +1170,91 @@ def _create_tiled_dot_kernels(tile_size):
     return block_dot_kernel, block_sum_kernel
 
 
+@functools.cache
+def _create_segmented_tiled_dot_kernels(tile_size):
+    @wp.kernel(module="unique")
+    def plan_offsets_kernel(
+        input_offsets: wp.array1d[int],
+        output_offsets: wp.array1d[int],
+    ):
+        lane = wp.tid()
+        batch_count = input_offsets.shape[0] - 1
+        batches_per_lane = (batch_count + wp.block_dim() - 1) // wp.block_dim()
+        batch_begin = lane * batches_per_lane
+        batch_end = wp.min(batch_begin + batches_per_lane, batch_count)
+
+        lane_total = int(0)
+        for batch in range(batch_begin, batch_end):
+            input_count = input_offsets[batch + 1] - input_offsets[batch]
+            output_count = input_count // tile_size
+            if input_count % tile_size != 0:
+                output_count += 1
+            output_count = wp.max(1, output_count)
+            lane_total += output_count
+
+        lane_offsets = wp.tile_scan_exclusive(wp.tile(lane_total))
+        output_offset = wp.tile_extract(lane_offsets, lane)
+        for batch in range(batch_begin, batch_end):
+            output_offsets[batch] = output_offset
+            input_count = input_offsets[batch + 1] - input_offsets[batch]
+            output_count = input_count // tile_size
+            if input_count % tile_size != 0:
+                output_count += 1
+            output_offset += wp.max(1, output_count)
+
+        if batch_begin < batch_count and batch_end == batch_count:
+            output_offsets[batch_count] = output_offset
+
+    @wp.kernel(module="unique")
+    def segmented_block_dot_kernel(
+        a: wp.array2d[Any],
+        b: wp.array2d[Any],
+        partial_sums: wp.array2d[Any],
+        input_offsets: wp.array1d[int],
+        output_offsets: wp.array1d[int],
+    ):
+        column, block_id, lane = wp.tid()
+        batch_count = output_offsets.shape[0] - 1
+        if block_id >= output_offsets[batch_count]:
+            return
+
+        batch = wp.lower_bound(output_offsets, 0, batch_count + 1, block_id + 1) - 1
+        local_block = block_id - output_offsets[batch]
+        i = input_offsets[batch] + local_block * tile_size + lane
+        input_end = input_offsets[batch + 1]
+        acc = a.dtype(0.0)
+        if i < input_end:
+            acc = a[column, i] * b[column, i]
+
+        tile_sum = wp.tile_sum(wp.tile(acc))
+        wp.tile_store(partial_sums[column], tile_sum, offset=block_id)
+
+    @wp.kernel(module="unique")
+    def segmented_block_sum_kernel(
+        data: wp.array2d[Any],
+        partial_sums: wp.array2d[Any],
+        input_offsets: wp.array1d[int],
+        output_offsets: wp.array1d[int],
+    ):
+        column, block_id, lane = wp.tid()
+        batch_count = output_offsets.shape[0] - 1
+        if block_id >= output_offsets[batch_count]:
+            return
+
+        batch = wp.lower_bound(output_offsets, 0, batch_count + 1, block_id + 1) - 1
+        local_block = block_id - output_offsets[batch]
+        i = input_offsets[batch] + local_block * tile_size + lane
+        input_end = input_offsets[batch + 1]
+        acc = data.dtype(0.0)
+        if i < input_end:
+            acc = data[column, i]
+
+        tile_sum = wp.tile_sum(wp.tile(acc))
+        wp.tile_store(partial_sums[column], tile_sum, offset=block_id)
+
+    return plan_offsets_kernel, segmented_block_dot_kernel, segmented_block_sum_kernel
+
+
 @wp.kernel(module="unique")
 def batch_dot_kernel(
     a: wp.array2d(dtype=Any),
@@ -470,8 +1285,9 @@ class LinearSolverState:
     optionally substituting a new matrix, right-hand side, solution vector, or
     preconditioner. Replacement operands must match the construction-time shape, dtype,
     device, and batch layout. For batched :class:`LinearOperator` inputs, the
-    ``batch_offsets`` array is part of that layout. This avoids repeated buffer
-    allocation when the same solver is applied many times.
+    ``batch_offsets`` array and ``max_batch_length`` value are part of that layout and
+    must remain fixed. This avoids repeated buffer allocation when the same solver is
+    applied many times.
 
     Args:
         A: the linear system's left-hand-side
@@ -523,6 +1339,7 @@ class LinearSolverState:
             maxiter = _scalar_dof_count(b) // self._batch_count
         self._maxiter = int(maxiter)
 
+        self._cur_iter_and_condition = wp.empty((2,), dtype=int, device=self._device)
         self._allocate()
 
     def _allocate(self):
@@ -544,8 +1361,10 @@ class LinearSolverState:
                 raise ValueError(f"Incompatible A.device: expected {self._A.device}, got {A.device}")
             if A.batch_count != self._A.batch_count:
                 raise ValueError(f"Incompatible A.batch_count: expected {self._A.batch_count}, got {A.batch_count}")
-            if self._A.batch_offsets is not None and A.batch_offsets is not self._A.batch_offsets:
-                raise ValueError("For batched systems, A.batch_offsets must be the same array as at construction")
+            if A.batch_offsets is not self._A.batch_offsets:
+                raise ValueError("A.batch_offsets must be the same array as at construction")
+            if A.max_batch_length != self._A.max_batch_length:
+                raise ValueError("For batched systems, A.max_batch_length must match the value used at construction")
         if b is not self._b:
             if b.shape != self._b.shape:
                 raise ValueError(f"Incompatible b.shape: expected {self._b.shape}, got {b.shape}")
@@ -581,13 +1400,68 @@ class LinearSolverState:
         return self._run(A_op, b_arr, x_arr, M_op)
 
 
-class CG(LinearSolverState):
+class _RestartableLinearSolverState(LinearSolverState):
+    """Shared optional restart configuration for CG and CR."""
+
+    def __init__(
+        self,
+        A: _Matrix,
+        b: wp.array,
+        x: wp.array,
+        tol: float | None = None,
+        atol: float | None = None,
+        maxiter: float | None = 0,
+        M: _Matrix | None = None,
+        callback: Callable | None = None,
+        check_every: int = 10,
+        use_cuda_graph: bool = True,
+        *,
+        restart: int | None = None,
+    ):
+        if restart is not None:
+            if isinstance(restart, bool):
+                raise TypeError("restart must be an integer or None")
+            try:
+                restart = operator.index(restart)
+            except TypeError as error:
+                raise TypeError("restart must be an integer or None") from error
+            if restart < 1:
+                raise ValueError("restart must be positive")
+
+        self._restart = restart
+        super().__init__(
+            A,
+            b,
+            x,
+            tol=tol,
+            atol=atol,
+            maxiter=maxiter,
+            M=M,
+            callback=callback,
+            check_every=check_every,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _configure_restart(self):
+        if self._restart is not None:
+            self._restart = max(1, min(self._restart, self._maxiter))
+            if self._check_every > 0:
+                self._check_every = max(self._check_every, self._restart)
+
+
+class CG(_RestartableLinearSolverState):
     """Pre-allocated state for the Conjugate Gradient solver.
 
-    See :class:`LinearSolverState` for the constructor parameters. The preconditioner
-    ``M`` may be freely changed (or toggled between ``None`` and a valid operator)
-    between calls as long as the replacement operands match the construction-time
-    shape, dtype, device, and batch layout.
+    See :class:`LinearSolverState` for the shared constructor parameters, plus:
+
+    Args:
+        restart: Optional positive number of iterations between restarts. Each restart
+            recomputes ``b - A x`` and resets the search direction to limit
+            finite-precision drift.
+
+    The preconditioner ``M`` may be freely changed (or toggled between ``None`` and
+    a valid operator) between calls as long as the replacement operands match the
+    construction-time shape, dtype, device, and batch layout.
     """
 
     def _allocate(self):
@@ -597,7 +1471,9 @@ class CG(LinearSolverState):
         scalar_type = self._scalar_type
         batch_count = self._batch_count
 
-        # Temp storage — residuals are per-subproblem
+        self._configure_restart()
+
+        # Temp storage, with residuals stored per subproblem
         self._r_and_z_buf = wp.empty((2, b.shape[0]), dtype=b.dtype, device=device)
         self._p_and_Ap = wp.empty_like(self._r_and_z_buf)
         self._residuals = wp.empty((2, batch_count), dtype=scalar_type, device=device)
@@ -608,6 +1484,7 @@ class CG(LinearSolverState):
             scalar_type=scalar_type,
             max_column_count=2,
             batch_offsets=A.batch_offsets,
+            max_batch_length=A.max_batch_length,
         )
 
         # (r, r) view — so we can compute r.z and r.r at once
@@ -656,10 +1533,10 @@ class CG(LinearSolverState):
         update_rr_rz()
         p.assign(z)
 
-        def do_iteration():
+        def do_iteration(update_direction=True):
             rz_old.assign(rz_new)
 
-            # Ap = A * p;
+            # Ap = A * p
             A.matvec(p, Ap, Ap, alpha=1, beta=0)
             tiled_dot.compute(p, Ap, col_offset=1)
             p_Ap = tiled_dot.col(1)
@@ -671,23 +1548,46 @@ class CG(LinearSolverState):
                 inputs=[atol_sq, r_norm_sq, rz_old, p_Ap, x, r, p, Ap, batch_offsets, dofs_per_entry],
             )
 
-            update_rr_rz()
+            if update_direction:
+                update_rr_rz()
 
-            wp.launch(
-                kernel=_cg_kernel_2,
-                dim=z.shape[0],
-                device=device,
-                inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p, batch_offsets, dofs_per_entry],
-            )
+                wp.launch(
+                    kernel=_cg_kernel_2,
+                    dim=z.shape[0],
+                    device=device,
+                    inputs=[atol_sq, r_norm_sq, rz_old, rz_new, z, p, batch_offsets, dofs_per_entry],
+                )
+
+        restart = self._restart
+        if restart is None:
+            do_cycle = do_iteration
+            cycle_size = 1
+        else:
+
+            def do_restart_cycle():
+                for _ in range(restart - 1):
+                    do_iteration()
+
+                # The explicit residual replaces the recursive update from the final
+                # iteration, then the search direction restarts from the corrected value.
+                do_iteration(update_direction=False)
+                A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+                update_rr_rz()
+                p.assign(z)
+
+            do_cycle = do_restart_cycle
+            cycle_size = restart
 
         return _run_capturable_loop(
-            do_iteration,
-            r_norm_sq,
-            self._maxiter,
-            atol_sq,
-            self._callback,
-            self._check_every,
-            self._use_cuda_graph,
+            do_cycle,
+            cur_iter_and_condition=self._cur_iter_and_condition,
+            r_norm_sq=r_norm_sq,
+            maxiter=self._maxiter,
+            atol_sq=atol_sq,
+            callback=self._callback,
+            check_every=self._check_every,
+            use_cuda_graph=self._use_cuda_graph,
+            cycle_size=cycle_size,
         )
 
 
@@ -703,6 +1603,8 @@ def cg(
     check_every=10,
     use_cuda_graph=True,
     run: bool = True,
+    *,
+    restart: int | None = None,
 ) -> tuple[int, float, float] | tuple[wp.array, wp.array, wp.array] | CG:
     """Compute an approximate solution to a symmetric, positive-definite linear system
     using the Conjugate Gradient algorithm.
@@ -717,6 +1619,8 @@ def cg(
         tol: relative tolerance for the residual, as a ratio of the right-hand-side norm
         atol: absolute tolerance for the residual
         maxiter: maximum number of iterations to perform before aborting. Defaults to the system size.
+            When ``restart`` is enabled, CG performs complete restart cycles and may exceed
+            ``maxiter`` by up to ``restart - 1`` iterations.
         M: optional left-preconditioner, ideally chosen such that ``M A`` is close to identity.
         callback: function to be called every `check_every` iteration with the current iteration number, residual and tolerance.
             If `check_every` is 0, the callback should be a Warp kernel.
@@ -730,20 +1634,31 @@ def cg(
             residual norm, and absolute tolerance. If ``False``, return a pre-allocated :class:`~warp.optim.linear.CG` functor.
             The functor can be called repeatedly without reallocating temporary buffers when replacement operands match the
             construction-time shape, dtype, device, and batch layout. For batched :class:`LinearOperator` inputs, replacement
-            operators must use the same ``batch_offsets`` array.
+            operators must use the same ``batch_offsets`` array and ``max_batch_length`` value.
+        restart: Optional positive number of iterations between restarts. Each restart recomputes
+            ``b - A x`` and resets the search direction, limiting drift between the recursively updated
+            residual and the true residual. Convergence checks and callbacks occur only at restart-cycle
+            boundaries. The default ``None`` preserves standard recursive CG.
 
     Returns:
         If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
-            - residual_norm: The final residual norm ||b - Ax||
+            - residual_norm: The recursively updated residual norm. When ``restart`` is enabled,
+              this is the true residual norm ||b - Ax|| at the final restart-cycle boundary.
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
         If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
-            - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
+            - residual_norm_squared_array: Device array containing the squared recursively updated residual norm.
+              When ``restart`` is enabled, this is the squared true residual norm ||b - Ax||² at the
+              final restart-cycle boundary.
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
         If ``run`` is ``False``: a :class:`~warp.optim.linear.CG` functor with all temporary buffers pre-allocated.
+
+    Raises:
+        TypeError: If ``restart`` is not an integer or ``None``.
+        ValueError: If a specified ``restart`` is not positive.
 
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
@@ -758,19 +1673,26 @@ def cg(
         callback=callback,
         check_every=check_every,
         use_cuda_graph=use_cuda_graph,
+        restart=restart,
     )
     if run:
         return state()
     return state
 
 
-class CR(LinearSolverState):
+class CR(_RestartableLinearSolverState):
     """Pre-allocated state for the Conjugate Residual solver.
 
-    See :class:`LinearSolverState` for the constructor parameters. The preconditioner
-    ``M`` may be freely changed (or toggled between ``None`` and a valid operator)
-    between calls as long as the replacement operands match the construction-time
-    shape, dtype, device, and batch layout.
+    See :class:`LinearSolverState` for the shared constructor parameters, plus:
+
+    Args:
+        restart: Optional positive number of iterations between restarts. Each restart
+            recomputes ``b - A x`` and resets the search direction to limit
+            finite-precision drift.
+
+    The preconditioner ``M`` may be freely changed (or toggled between ``None`` and
+    a valid operator) between calls as long as the replacement operands match the
+    construction-time shape, dtype, device, and batch layout.
     """
 
     def _allocate(self):
@@ -779,6 +1701,8 @@ class CR(LinearSolverState):
         device = self._device
         scalar_type = self._scalar_type
         batch_count = self._batch_count
+
+        self._configure_restart()
 
         # Notations follow pseudo-code from https://en.wikipedia.org/wiki/Conjugate_residual_method
         # with z := M^-1 r and y := M^-1 Ap
@@ -794,6 +1718,7 @@ class CR(LinearSolverState):
             scalar_type=scalar_type,
             max_column_count=2,
             batch_offsets=A.batch_offsets,
+            max_batch_length=A.max_batch_length,
         )
 
         self._r_and_z_repeated = _repeat_first(self._r_and_z_buf)
@@ -832,22 +1757,25 @@ class CR(LinearSolverState):
         # Not strictly necessary, but makes it more robust to user-provided LinearOperators
         y_and_Ap_buf.zero_()
 
-        # z = M r
-        if M is not None:
-            z.zero_()
-            M.matvec(r, z, z, alpha=1.0, beta=0.0)
+        def update_z():
+            # z = M r
+            if M is not None:
+                M.matvec(r, z, z, alpha=1.0, beta=0.0)
 
         def update_rr_zAz():
             A.matvec(z, Az, Az, alpha=1, beta=0)
             r_copy.assign(r)
             tiled_dot.compute(r_and_z, r_and_Az)
 
+        if M is not None:
+            z.zero_()
+        update_z()
         update_rr_zAz()
 
         p.assign(z)
         Ap.assign(Az)
 
-        def do_iteration():
+        def do_iteration(update_direction=True):
             zAz_old.assign(zAz_new)
 
             if M is not None:
@@ -872,17 +1800,41 @@ class CR(LinearSolverState):
                     inputs=[atol_sq, r_norm_sq, zAz_old, y_Ap, x, r, z, p, Ap, y, batch_offsets, dofs_per_entry],
                 )
 
-            update_rr_zAz()
-            wp.launch(
-                kernel=_cr_kernel_2,
-                dim=z.shape[0],
-                device=device,
-                inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap, batch_offsets, dofs_per_entry],
-            )
+            if update_direction:
+                update_rr_zAz()
+                wp.launch(
+                    kernel=_cr_kernel_2,
+                    dim=z.shape[0],
+                    device=device,
+                    inputs=[atol_sq, r_norm_sq, zAz_old, zAz_new, z, p, Az, Ap, batch_offsets, dofs_per_entry],
+                )
+
+        restart = self._restart
+        if restart is None:
+            do_cycle = do_iteration
+            cycle_size = 1
+        else:
+
+            def do_restart_cycle():
+                for _ in range(restart - 1):
+                    do_iteration()
+
+                # Replace the final recursive residual with the true residual, then
+                # rebuild the preconditioned residual and restart both p and A p.
+                do_iteration(update_direction=False)
+                A.matvec(x, b, r, alpha=-1.0, beta=1.0)
+                update_z()
+                update_rr_zAz()
+                p.assign(z)
+                Ap.assign(Az)
+
+            do_cycle = do_restart_cycle
+            cycle_size = restart
 
         return _run_capturable_loop(
-            do_iteration,
-            cycle_size=1,
+            do_cycle,
+            cur_iter_and_condition=self._cur_iter_and_condition,
+            cycle_size=cycle_size,
             r_norm_sq=r_norm_sq,
             maxiter=self._maxiter,
             atol_sq=atol_sq,
@@ -904,6 +1856,8 @@ def cr(
     check_every=10,
     use_cuda_graph=True,
     run: bool = True,
+    *,
+    restart: int | None = None,
 ) -> tuple[int, float, float] | tuple[wp.array, wp.array, wp.array] | CR:
     """Compute an approximate solution to a symmetric, positive-definite linear system
     using the Conjugate Residual algorithm.
@@ -918,7 +1872,8 @@ def cr(
         tol: relative tolerance for the residual, as a ratio of the right-hand-side norm
         atol: absolute tolerance for the residual
         maxiter: maximum number of iterations to perform before aborting. Defaults to the system size.
-            Note that the current implementation always performs iterations in pairs, and as a result may exceed the specified maximum number of iterations by one.
+            When ``restart`` is enabled, CR performs complete restart cycles and may exceed
+            ``maxiter`` by up to ``restart - 1`` iterations.
         M: optional left-preconditioner, ideally chosen such that ``M A`` is close to identity.
         callback: function to be called every `check_every` iteration with the current iteration number, residual and tolerance.
             If `check_every` is 0, the callback should be a Warp kernel.
@@ -932,20 +1887,31 @@ def cr(
             pre-allocated :class:`~warp.optim.linear.CR` functor. The functor can be called repeatedly without
             reallocating temporary buffers when replacement operands match the construction-time shape, dtype, device,
             and batch layout. For batched :class:`LinearOperator` inputs, replacement operators must use the same
-            ``batch_offsets`` array.
+            ``batch_offsets`` array and ``max_batch_length`` value.
+        restart: Optional positive number of iterations between restarts. Each restart recomputes
+            ``b - A x`` and resets the search direction, limiting drift between the recursively updated
+            residual and the true residual. Convergence checks and callbacks occur only at restart-cycle
+            boundaries. The default ``None`` preserves standard recursive CR.
 
     Returns:
         If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
             - final_iteration: The number of iterations performed before convergence or reaching maxiter
-            - residual_norm: The final residual norm ||b - Ax||
+            - residual_norm: The recursively updated residual norm. When ``restart`` is enabled,
+              this is the true residual norm ||b - Ax|| at the final restart-cycle boundary.
             - absolute_tolerance: The absolute tolerance used for convergence checking
 
         If ``run`` is ``True`` and ``check_every`` is 0: Tuple (final_iteration_array, residual_norm_squared_array, absolute_tolerance_squared_array)
             - final_iteration_array: Device array containing the number of iterations performed
-            - residual_norm_squared_array: Device array containing the squared residual norm ||b - Ax||²
+            - residual_norm_squared_array: Device array containing the squared recursively updated residual norm.
+              When ``restart`` is enabled, this is the squared true residual norm ||b - Ax||² at the
+              final restart-cycle boundary.
             - absolute_tolerance_squared_array: Device array containing the squared absolute tolerance
 
         If ``run`` is ``False``: a :class:`~warp.optim.linear.CR` functor with all temporary buffers pre-allocated.
+
+    Raises:
+        TypeError: If ``restart`` is not an integer or ``None``.
+        ValueError: If a specified ``restart`` is not positive.
 
     If both `tol` and `atol` are provided, the absolute tolerance used as the termination criterion for the residual norm is ``max(atol, tol * norm(b))``.
     """
@@ -960,6 +1926,7 @@ def cr(
         callback=callback,
         check_every=check_every,
         use_cuda_graph=use_cuda_graph,
+        restart=restart,
     )
     if run:
         return state()
@@ -1041,6 +2008,7 @@ class BiCGSTAB(LinearSolverState):
             scalar_type=scalar_type,
             max_column_count=5,
             batch_offsets=A.batch_offsets,
+            max_batch_length=A.max_batch_length,
         )
 
         self._atol_sq = wp.empty(batch_count, dtype=scalar_type, device=device)
@@ -1155,6 +2123,7 @@ class BiCGSTAB(LinearSolverState):
 
         return _run_capturable_loop(
             do_iteration,
+            cur_iter_and_condition=self._cur_iter_and_condition,
             r_norm_sq=r_norm_sq,
             maxiter=self._maxiter,
             atol_sq=atol_sq,
@@ -1204,7 +2173,8 @@ def bicgstab(
             pre-allocated :class:`~warp.optim.linear.BiCGSTAB` functor. The functor can be called repeatedly without
             reallocating temporary buffers when replacement operands match the construction-time shape, dtype, device,
             and batch layout. For batched :class:`LinearOperator` inputs, replacement operators must use the same
-            ``batch_offsets`` array. Whether ``M`` was provided at construction must match subsequent calls.
+            ``batch_offsets`` array and ``max_batch_length`` value. Whether ``M`` was provided at construction
+            must match subsequent calls.
 
     Returns:
         If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
@@ -1319,6 +2289,7 @@ class GMRES(LinearSolverState):
             scalar_type=scalar_dtype,
             max_column_count=restart + 1,
             batch_offsets=A.batch_offsets,
+            max_batch_length=A.max_batch_length,
         )
 
         w = self._w
@@ -1342,7 +2313,7 @@ class GMRES(LinearSolverState):
         self._least_squares_solve = wp.launch(
             least_squares_kernel,
             dim=(batch_count, tile_size),
-            block_dim=tile_size if tile_size > 1 else 256,
+            block_dim=tile_size if tile_size > 1 else None,
             device=device,
             inputs=[restart, self._pivot_tolerance, self._beta, self._H, self._y],
             record_cmd=True,
@@ -1477,7 +2448,13 @@ class GMRES(LinearSolverState):
                     device=device,
                     inputs=[restart, scalar_dtype(0.0), y, V, w, batch_offsets, dofs_per_entry],
                 )
-                M.matvec(w, x, x, alpha=1, beta=1)
+                M.matvec(w, r, r, alpha=1, beta=0)
+                wp.launch(
+                    _gmres_add_active_entries_kernel,
+                    dim=x.shape,
+                    device=device,
+                    inputs=[r, x, batch_offsets, dofs_per_entry],
+                )
 
             # update r and residual
             wp.copy(src=b, dest=r)
@@ -1486,6 +2463,7 @@ class GMRES(LinearSolverState):
 
         return _run_capturable_loop(
             do_restart_cycle,
+            cur_iter_and_condition=self._cur_iter_and_condition,
             cycle_size=restart,
             r_norm_sq=r_norm_sq,
             maxiter=self._maxiter,
@@ -1539,7 +2517,7 @@ def gmres(
             pre-allocated :class:`~warp.optim.linear.GMRES` functor. The functor can be called repeatedly without
             reallocating temporary buffers when replacement operands match the construction-time shape, dtype, device,
             and batch layout. For batched :class:`LinearOperator` inputs, replacement operators must use the same
-            ``batch_offsets`` array.
+            ``batch_offsets`` array and ``max_batch_length`` value.
 
     Returns:
         If ``run`` is ``True`` and ``check_every`` > 0: Tuple (final_iteration, residual_norm, absolute_tolerance)
@@ -1698,6 +2676,7 @@ def _create_update_condition_kernel(batch_count: int):
 
 def _run_capturable_loop(
     do_cycle: Callable,
+    cur_iter_and_condition: wp.array,
     r_norm_sq: wp.array,
     maxiter: int,
     atol_sq: wp.array,
@@ -1714,7 +2693,7 @@ def _run_capturable_loop(
             do_cycle, cycle_size, r_norm_sq, maxiter, atol_sq, callback, check_every, use_cuda_graph, device
         )
 
-    cur_iter_and_condition = wp.full((2,), value=-1, dtype=int, device=device)
+    cur_iter_and_condition.fill_(-cycle_size)
     cur_iter = cur_iter_and_condition[0:1]
     condition = cur_iter_and_condition[1:2]
 
@@ -1925,10 +2904,11 @@ def _cg_kernel_1(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    alpha = wp.where(resid[bid] > tol[bid], rz_old[bid] / p_Ap[bid], rz_old.dtype(0.0))
+    if bid >= 0:
+        alpha = wp.where(resid[bid] > tol[bid], rz_old[bid] / p_Ap[bid], rz_old.dtype(0.0))
 
-    x[i] = x[i] + alpha * p[i]
-    r[i] = r[i] - alpha * Ap[i]
+        x[i] = x[i] + alpha * p[i]
+        r[i] = r[i] - alpha * Ap[i]
 
 
 @wp.kernel
@@ -1946,9 +2926,10 @@ def _cg_kernel_2(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    beta = wp.where(resid_new[bid] > tol[bid], rz_new[bid] / rz_old[bid], rz_old.dtype(0.0))
+    if bid >= 0:
+        beta = wp.where(resid_new[bid] > tol[bid], rz_new[bid] / rz_old[bid], rz_old.dtype(0.0))
 
-    p[i] = z[i] + beta * p[i]
+        p[i] = z[i] + beta * p[i]
 
 
 @wp.kernel
@@ -1969,11 +2950,14 @@ def _cr_kernel_1(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    alpha = wp.where(resid[bid] > tol[bid] and y_Ap[bid] > 0.0, zAz_old[bid] / y_Ap[bid], zAz_old.dtype(0.0))
+    if bid >= 0:
+        alpha = wp.where(
+            resid[bid] > tol[bid] and y_Ap[bid] > y_Ap.dtype(0.0), zAz_old[bid] / y_Ap[bid], zAz_old.dtype(0.0)
+        )
 
-    x[i] = x[i] + alpha * p[i]
-    r[i] = r[i] - alpha * Ap[i]
-    z[i] = z[i] - alpha * y[i]
+        x[i] = x[i] + alpha * p[i]
+        r[i] = r[i] - alpha * Ap[i]
+        z[i] = z[i] - alpha * y[i]
 
 
 @wp.kernel
@@ -1993,10 +2977,13 @@ def _cr_kernel_2(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    beta = wp.where(resid[bid] > tol[bid] and zAz_old[bid] > 0.0, zAz_new[bid] / zAz_old[bid], zAz_old.dtype(0.0))
+    if bid >= 0:
+        beta = wp.where(
+            resid[bid] > tol[bid] and zAz_old[bid] > zAz_old.dtype(0.0), zAz_new[bid] / zAz_old[bid], zAz_old.dtype(0.0)
+        )
 
-    p[i] = z[i] + beta * p[i]
-    Ap[i] = Az[i] + beta * Ap[i]
+        p[i] = z[i] + beta * p[i]
+        Ap[i] = Az[i] + beta * Ap[i]
 
 
 @wp.kernel
@@ -2015,10 +3002,11 @@ def _bicgstab_kernel_1(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    alpha = wp.where(resid[bid] > tol[bid], rho_old[bid] / r0v[bid], rho_old.dtype(0.0))
+    if bid >= 0:
+        alpha = wp.where(resid[bid] > tol[bid], rho_old[bid] / r0v[bid], rho_old.dtype(0.0))
 
-    x[i] += alpha * y[i]
-    r[i] -= alpha * v[i]
+        x[i] += alpha * y[i]
+        r[i] -= alpha * v[i]
 
 
 @wp.kernel
@@ -2037,10 +3025,11 @@ def _bicgstab_kernel_2(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    omega = wp.where(resid[bid] > tol[bid], st[bid] / tt[bid], st.dtype(0.0))
+    if bid >= 0:
+        omega = wp.where(resid[bid] > tol[bid], st[bid] / tt[bid], st.dtype(0.0))
 
-    x[i] += omega * z[i]
-    r[i] -= omega * t[i]
+        x[i] += omega * z[i]
+        r[i] -= omega * t[i]
 
 
 @wp.kernel
@@ -2060,10 +3049,11 @@ def _bicgstab_kernel_3(
     i = wp.tid()
     bid = _find_entry_batch(i, batch_offsets, dofs_per_entry)
 
-    beta = wp.where(resid[bid] > tol[bid], rho_new[bid] * tt[bid] / (r0v[bid] * st[bid]), st.dtype(0.0))
-    beta_omega = wp.where(resid[bid] > tol[bid], rho_new[bid] / r0v[bid], st.dtype(0.0))
+    if bid >= 0:
+        beta = wp.where(resid[bid] > tol[bid], rho_new[bid] * tt[bid] / (r0v[bid] * st[bid]), st.dtype(0.0))
+        beta_omega = wp.where(resid[bid] > tol[bid], rho_new[bid] / r0v[bid], st.dtype(0.0))
 
-    p[i] = r[i] + beta * p[i] - beta_omega * v[i]
+        p[i] = r[i] + beta * p[i] - beta_omega * v[i]
 
 
 @wp.kernel(enable_backward=False)
@@ -2223,16 +3213,17 @@ def _gmres_arnoldi_axpy_kernel(
     tid, lane = wp.tid()
     bid = _find_entry_batch(tid, batch_offsets, dofs_per_entry)
 
-    s = w.dtype(H.dtype(0))
+    if bid >= 0:
+        s = w.dtype(H.dtype(0))
 
-    tile_size = wp.block_dim()
-    for k in range(lane, j + 1, tile_size):
-        s += H[bid, k, j] * V[k, tid]
+        tile_size = wp.block_dim()
+        for k in range(lane, j + 1, tile_size):
+            s += H[bid, k, j] * V[k, tid]
 
-    wi = wp.tile_load(w, shape=1, offset=tid)
-    wi -= wp.tile_sum(wp.tile(s, preserve_type=True))
+        wi = wp.tile_load(w, shape=1, offset=tid)
+        wi -= wp.tile_sum(wp.tile(s, preserve_type=True))
 
-    wp.tile_store(w, wi, offset=tid)
+        wp.tile_store(w, wi, offset=tid)
 
 
 @wp.kernel(enable_backward=False)
@@ -2247,15 +3238,17 @@ def _gmres_arnoldi_normalize_kernel(
     tid = wp.tid()
     scalar_dof = tid * dofs_per_entry
     bid = _find_batch(scalar_dof, batch_offsets)
-    a = alpha[bid]
-    norm = wp.sqrt(a)
-    y[tid] = wp.where(a == alpha.dtype(0.0), x[tid], x[tid] / norm)
 
-    if not batch_offsets:
-        if tid == 0:
-            alpha_copy[0] = norm
-    elif scalar_dof == batch_offsets[bid]:
-        alpha_copy[bid] = norm
+    if bid >= 0:
+        a = alpha[bid]
+        norm = wp.sqrt(a)
+        y[tid] = wp.where(a == alpha.dtype(0.0), x[tid], x[tid] / norm)
+
+        if not batch_offsets:
+            if tid == 0:
+                alpha_copy[0] = norm
+        elif scalar_dof == batch_offsets[bid]:
+            alpha_copy[bid] = norm
 
 
 @wp.kernel(enable_backward=False)
@@ -2282,11 +3275,26 @@ def _gmres_update_x_kernel(
     tid = wp.tid()
     bid = _find_entry_batch(tid, batch_offsets, dofs_per_entry)
 
-    xi = scale * x[tid]
-    for j in range(k):
-        xi += V[j, tid] * y[bid, j]
+    if bid >= 0:
+        xi = scale * x[tid]
+        for j in range(k):
+            xi += V[j, tid] * y[bid, j]
 
-    x[tid] = xi
+        x[tid] = xi
+
+
+@wp.kernel(enable_backward=False)
+def _gmres_add_active_entries_kernel(
+    update: wp.array(dtype=Any),
+    x: wp.array(dtype=Any),
+    batch_offsets: wp.array(dtype=int),
+    dofs_per_entry: int,
+):
+    tid = wp.tid()
+    bid = _find_entry_batch(tid, batch_offsets, dofs_per_entry)
+
+    if bid >= 0:
+        x[tid] += update[tid]
 
 
 def _register_overloads():
@@ -2315,6 +3323,7 @@ def _register_overloads():
         wp.overload(_gmres_arnoldi_normalize_kernel, {"x": a, "y": a, "alpha": a, "alpha_copy": a})
         wp.overload(_gmres_copy_hessenberg_column, {"src": a2, "H": a3})
         wp.overload(_gmres_update_x_kernel, {"scale": dtype, "y": a2, "V": a2, "x": a})
+        wp.overload(_gmres_add_active_entries_kernel, {"update": a, "x": a})
 
 
 _register_overloads()

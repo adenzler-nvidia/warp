@@ -52,7 +52,7 @@ def _test_environment_sides(
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_sparse_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: wp.array(dtype=int)):
+def _test_sparse_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
     wp.expect_eq(env_index, cell_env[s.element_index])
 
@@ -73,7 +73,7 @@ def _test_sparse_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: 
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_sparse_lookup_excludes_neighbor_env(s: fem.Sample, domain: fem.Domain, cell_env: wp.array(dtype=int)):
+def _test_sparse_lookup_excludes_neighbor_env(s: fem.Sample, domain: fem.Domain, cell_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
     if env_index == 0:
         pos = domain(s)
@@ -85,7 +85,7 @@ def _test_sparse_lookup_excludes_neighbor_env(s: fem.Sample, domain: fem.Domain,
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_sparse_environment_sides(s: fem.Sample, domain: fem.Domain, cell_env: wp.array(dtype=int)):
+def _test_sparse_environment_sides(s: fem.Sample, domain: fem.Domain, cell_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
 
     cells = fem.cells(domain)
@@ -99,7 +99,7 @@ def _test_sparse_environment_sides(s: fem.Sample, domain: fem.Domain, cell_env: 
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_mesh_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: wp.array(dtype=int)):
+def _test_mesh_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
     wp.expect_eq(env_index, cell_env[s.element_index])
 
@@ -114,7 +114,7 @@ def _test_mesh_environment_cells(s: fem.Sample, domain: fem.Domain, cell_env: wp
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_mesh_environment_sides(s: fem.Sample, domain: fem.Domain, cell_env: wp.array(dtype=int)):
+def _test_mesh_environment_sides(s: fem.Sample, domain: fem.Domain, cell_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
 
     inner_s = fem.to_inner_cell(domain, s)
@@ -139,7 +139,7 @@ def _test_no_env_lookup_rejected(s: fem.Sample, domain: fem.Domain):
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
-def _test_pic_environment_cells(s: fem.Sample, domain: fem.Domain, particle_env: wp.array(dtype=int)):
+def _test_pic_environment_cells(s: fem.Sample, domain: fem.Domain, particle_env: wp.array[int]):
     env_index = fem.environment_index(domain, s)
     wp.expect_eq(env_index, particle_env[s.qp_index])
 
@@ -230,14 +230,37 @@ def _make_env_offsets(offsets, device):
     return wp.array(np.array(offsets, dtype=np.int32), dtype=wp.vec3i, device=device)
 
 
-def _make_multi_env_nanogrid(device, env_offsets=None):
+def _pack_env_voxels(env_cells, device):
+    cell_np = np.concatenate([env_cell.numpy() for env_cell in env_cells], axis=0)
+    env_np = np.concatenate(
+        [np.full(env_cell.shape[0], env_index, dtype=np.int32) for env_index, env_cell in enumerate(env_cells)]
+    )
+    return (
+        wp.array(cell_np, dtype=env_cells[0].dtype, device=device),
+        wp.array(env_np, dtype=wp.int32, device=device),
+        len(env_cells),
+    )
+
+
+def _pack_env_voxels_with_levels(env_cells, env_levels, device):
+    points, point_envs, env_count = _pack_env_voxels(env_cells, device)
+    level_np = np.concatenate([env_level.numpy() for env_level in env_levels], axis=0)
+    return points, wp.array(level_np, dtype=wp.uint8, device=device), point_envs, env_count
+
+
+def _make_multi_env_nanogrid(device, env_offsets=None, point_dtype=wp.vec3i):
     env_cells = (
         wp.array([[i, j, k] for i in range(2) for j in range(2) for k in range(2)], dtype=wp.vec3i, device=device),
         wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.vec3i, device=device),
     )
+    points, point_envs, env_count = _pack_env_voxels(env_cells, device)
+    if point_dtype == wp.vec3f:
+        points = wp.array(points.numpy().astype(np.float32), dtype=wp.vec3f, device=device)
 
     geo = fem.Nanogrid.from_environment_voxels(
-        env_cells,
+        points,
+        point_envs,
+        env_count,
         env_offsets=env_offsets,
         voxel_size=1.0,
         device=device,
@@ -260,10 +283,13 @@ def _make_multi_env_adaptive_nanogrid(device, env_offsets=None):
         wp.array([1], dtype=wp.uint8, device=device),
         wp.array([0] * len(fine_cells), dtype=wp.uint8, device=device),
     )
+    points, cell_levels, point_envs, env_count = _pack_env_voxels_with_levels(env_cells, env_levels, device)
 
     geo = fem.AdaptiveNanogrid.from_environment_voxels(
-        env_cells,
-        env_levels,
+        points,
+        cell_levels,
+        point_envs,
+        env_count,
         level_count=2,
         env_offsets=env_offsets,
         voxel_size=0.5,
@@ -606,6 +632,29 @@ def _test_pic_partition_multi_env(test, device):
     np.testing.assert_array_equal(capped_pressure_partition.env_offsets.numpy(), np.array([0, 1, 1], dtype=np.int32))
     np.testing.assert_array_equal(capped_pressure_partition.space_node_indices().numpy(), np.array([0], dtype=np.int32))
 
+    capacity = 4
+    underfilled_pressure_partition = fem.make_space_partition(
+        space_topology=pressure_space.topology,
+        geometry_partition=partition,
+        environment_first=True,
+        with_halo=False,
+        max_node_count=capacity,
+        device=device,
+    )
+
+    test.assertEqual(underfilled_pressure_partition.node_count(), capacity)
+    np.testing.assert_array_equal(
+        underfilled_pressure_partition.space_node_indices().numpy()[:2], np.array([0, 4], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        underfilled_pressure_partition.env_offsets.numpy(), np.array([0, 1, 2], dtype=np.int32)
+    )
+    expected_space_to_partition = np.full(pressure_space.node_count(), fem.NULL_NODE_INDEX, dtype=np.int32)
+    expected_space_to_partition[[0, 4]] = [0, 1]
+    np.testing.assert_array_equal(
+        underfilled_pressure_partition._space_to_partition.numpy(), expected_space_to_partition
+    )
+
 
 def _test_pic_env_indices_api(test, device):
     geo = fem.Grid2D(res=wp.vec2i(2), env_count=2)
@@ -670,8 +719,11 @@ def _test_sparse_grid_lookup_with_adjacent_env_offsets(test, device):
             wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
             wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
         )
+        points, point_envs, env_count = _pack_env_voxels(env_cells, device)
         geo = fem.Nanogrid.from_environment_voxels(
-            env_cells,
+            points,
+            point_envs,
+            env_count,
             env_offsets=_make_env_offsets([[0, 0, 0], [1, 0, 0]], device),
             voxel_size=1.0,
             device=device,
@@ -848,6 +900,202 @@ def test_nanogrid_multi_env(test, device):
     bspline_space = fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.BSPLINE)
     _assert_sparse_multi_env_node_isolation(test, geo, bspline_space, cell_env, device)
 
+    world_geo, _ = _make_multi_env_nanogrid(device, point_dtype=wp.vec3f)
+    np.testing.assert_array_equal(world_geo.env_offsets.numpy(), np.array([[0, 0, 0], [5, 0, 0]], dtype=np.int32))
+    test.assertEqual(world_geo.cell_count(), 10)
+
+    masked_points = wp.array([[0, 0, 0], [9, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    masked_envs = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    point_mask = wp.array([1, 0, 1], dtype=wp.int32, device=device)
+    masked_geo = fem.Nanogrid.from_environment_voxels(
+        masked_points,
+        masked_envs,
+        2,
+        point_mask=point_mask,
+        voxel_size=1.0,
+        device=device,
+    )
+    np.testing.assert_array_equal(masked_geo.env_offsets.numpy(), np.array([[0, 0, 0], [4, 0, 0]], dtype=np.int32))
+    test.assertEqual(masked_geo.cell_count(), 2)
+    test.assertEqual(masked_geo.cell_grid.get_active_stats().voxel_count, 2)
+
+
+def test_nanogrid_multi_env_cell_boundary_lookup(test, device):
+    """Keep particles near cell boundaries in their allocated environment cells."""
+    with wp.ScopedDevice(device):
+        for rebuildable in (False, True):
+            for axis in range(3):
+                for coordinate in (-2.5, 2.5):
+                    for offset in (-1024, 1024):
+                        with test.subTest(rebuildable=rebuildable, axis=axis, coordinate=coordinate, offset=offset):
+                            positions = np.zeros((2, 3), dtype=np.float32)
+                            positions[1, axis] = np.nextafter(np.float32(coordinate), np.float32(-np.inf))
+                            offsets = np.zeros((2, 3), dtype=np.int32)
+                            offsets[1, axis] = offset
+                            points = wp.array(positions, dtype=wp.vec3, device=device)
+                            environments = wp.array([0, 1], dtype=wp.int32, device=device)
+                            grid = fem.Nanogrid.from_environment_voxels(
+                                points,
+                                environments,
+                                2,
+                                env_offsets=offsets,
+                                voxel_size=1.0,
+                                rebuildable=rebuildable,
+                                max_active_voxels=8 if rebuildable else None,
+                                device=device,
+                            )
+                            quadrature = fem.PicQuadrature(fem.Cells(grid), positions=points, env_indices=environments)
+                            cells = quadrature.cell_indices.numpy()
+                            test.assertTrue(np.all(cells >= 0), f"Particles missing from grid: {cells}")
+                            np.testing.assert_array_equal(grid.cell_env.numpy()[cells], [0, 1])
+
+
+def test_nanogrid_multi_env_rebuildable(test, device):
+    env_cells = (
+        wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
+        wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
+    )
+    points, point_envs, env_count = _pack_env_voxels(env_cells, device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+    geo = fem.Nanogrid.from_environment_voxels(
+        points,
+        point_envs,
+        env_count,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=4,
+        max_leaf_nodes=4,
+        max_lower_nodes=4,
+        max_upper_nodes=4,
+        status=status,
+    )
+    wp.synchronize_device(device)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertTrue(geo.cell_grid.is_rebuildable)
+    test.assertEqual(geo.cell_count(), 4)
+    test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 2)
+    test.assertEqual(geo.environment_count(), 2)
+
+    rebuilt_points = wp.array([[4, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    geo.rebuild(rebuilt_points, point_envs=point_envs, status=status)
+    wp.synchronize_device(device)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 2)
+    np.testing.assert_array_equal(geo.env_offsets.numpy(), np.array([[-4, 0, 0], [4, 0, 0]], dtype=np.int32))
+
+    rebuilt_voxels = wp.full((geo.cell_count(),), wp.vec3i(-999), dtype=wp.vec3i, device=device)
+    geo.cell_grid.get_voxels(out=rebuilt_voxels)
+    rebuilt_voxels_np = rebuilt_voxels.numpy()[:2]
+    rebuilt_voxels_np = rebuilt_voxels_np[np.argsort(rebuilt_voxels_np[:, 0])]
+    np.testing.assert_array_equal(rebuilt_voxels_np, np.array([[0, 0, 0], [4, 0, 0]], dtype=np.int32))
+
+
+def test_sparse_grid_multi_env_invalid_point_envs(test, device):
+    """Reject out-of-range point environment indices when constructing non-rebuildable sparse grids.
+
+    The indices address per-environment device arrays, so invalid values would otherwise read and
+    write out of bounds. Masked-out points are not used and may hold any value.
+    """
+    points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.vec3i, device=device)
+    levels = wp.array([0, 0], dtype=wp.uint8, device=device)
+
+    for invalid_env in (2, -1):
+        point_envs = wp.array([0, invalid_env], dtype=wp.int32, device=device)
+        with test.assertRaisesRegex(ValueError, f"Environment index {invalid_env} .* out of bounds"):
+            fem.Nanogrid.from_environment_voxels(points, point_envs, 2, device=device)
+        with test.assertRaisesRegex(ValueError, f"Environment index {invalid_env} .* out of bounds"):
+            fem.AdaptiveNanogrid.from_environment_voxels(points, levels, point_envs, 2, level_count=1, device=device)
+
+    point_envs = wp.array([0, -1], dtype=wp.int32, device=device)
+    point_mask = wp.array([1, 0], dtype=wp.int32, device=device)
+    geo = fem.Nanogrid.from_environment_voxels(points, point_envs, 2, point_mask=point_mask, device=device)
+    test.assertEqual(geo.cell_count(), 1)
+    np.testing.assert_array_equal(geo.cell_env.numpy(), np.array([0]))
+
+
+def test_nanogrid_multi_env_rebuildable_invalid_point_envs(test, device):
+    """Ignore out-of-range point environment indices when constructing a rebuildable Nanogrid.
+
+    Rebuildable construction must not wait on the device, so like ``rebuild()`` it drops points with an
+    out-of-range environment index and reports them through ``status`` instead of raising.
+    """
+    points = wp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=wp.vec3f, device=device)
+    point_envs = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    geo = fem.Nanogrid.from_environment_voxels(points, point_envs, 2, device=device, rebuildable=True, status=status)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_INVALID_INPUT)
+    test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 2)
+    np.testing.assert_array_equal(np.sort(geo.cell_env.numpy()[:2]), np.array([0, 1]))
+
+
+def test_nanogrid_multi_env_capture_invalid_point_envs(test, device):
+    """Ignore out-of-range point environment indices when building a Nanogrid under graph capture.
+
+    Validating indices on the host would synchronize, so rebuildable construction and all rebuilds drop
+    points with an out-of-range environment index and report them through the rebuild status flags.
+    """
+    capacity = {"max_active_voxels": 4, "max_leaf_nodes": 4, "max_lower_nodes": 4, "max_upper_nodes": 4}
+    points = wp.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=wp.vec3i, device=device)
+    valid_envs = wp.array([0, 1, 0, 1], dtype=wp.int32, device=device)
+    invalid_envs = wp.array([0, 1, -1, 2], dtype=wp.int32, device=device)
+    point_envs = wp.clone(invalid_envs)
+    point_mask = wp.ones(4, dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    geo = fem.Nanogrid.from_environment_voxels(points, valid_envs, 2, device=device, rebuildable=True, **capacity)
+
+    wp.load_module(device=device)
+    wp.load_module(module="warp.fem.geometry.nanogrid", device=device)
+
+    # Replaying a captured build that generates environment offsets fails independently of this check.
+    env_offsets = _make_env_offsets([[0, 0, 0], [8, 0, 0]], device)
+    with wp.ScopedCapture(device=device, force_module_load=False) as build_capture:
+        captured_geo = fem.Nanogrid.from_environment_voxels(
+            points,
+            point_envs,
+            2,
+            env_offsets,
+            point_mask=point_mask,
+            device=device,
+            rebuildable=True,
+            status=status,
+            **capacity,
+        )
+    with wp.ScopedCapture(device=device, force_module_load=False) as rebuild_capture:
+        geo.rebuild(points, point_envs=point_envs, status=status, point_mask=point_mask)
+
+    replay_cases = (
+        ("invalid", invalid_envs, [1, 1, 1, 1], wp.Volume.REBUILD_INVALID_INPUT, [0, 1]),
+        ("valid", valid_envs, [1, 1, 1, 1], wp.Volume.REBUILD_SUCCESS, [0, 0, 1, 1]),
+        ("masked_invalid", invalid_envs, [1, 1, 0, 0], wp.Volume.REBUILD_SUCCESS, [0, 1]),
+    )
+    for operation, graph, replay_geo in (
+        ("construction", build_capture.graph, captured_geo),
+        ("rebuild", rebuild_capture.graph, geo),
+    ):
+        for case, environments, mask, expected_status, expected_cell_env in replay_cases:
+            with test.subTest(operation=operation, case=case):
+                wp.copy(point_envs, environments)
+                point_mask.assign(np.array(mask, dtype=np.int32))
+                wp.capture_launch(graph)
+
+                test.assertEqual(int(status.numpy()[0]), expected_status)
+                voxel_count = len(expected_cell_env)
+                test.assertEqual(replay_geo.cell_grid.get_active_stats().voxel_count, voxel_count)
+                np.testing.assert_array_equal(
+                    np.sort(replay_geo.cell_env.numpy()[:voxel_count]), np.array(expected_cell_env)
+                )
+
+    # Without a status buffer or a user mask, invalid inputs must still be ignored safely.
+    test.assertIsNone(geo.rebuild(points, point_envs=invalid_envs))
+    test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 2)
+    np.testing.assert_array_equal(np.sort(geo.cell_env.numpy()[:2]), np.array([0, 1]))
+
 
 def test_adaptive_nanogrid_multi_env(test, device):
     if platform.system() == "Windows":
@@ -867,11 +1115,131 @@ def test_adaptive_nanogrid_multi_env(test, device):
     _test_sparse_grid_multi_env(test, device, geo, cell_env)
     _assert_environment_first_pressure_partition(test, geo, cell_env, device)
 
+    legacy_env_cells = (
+        wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
+        wp.array([[i, j, k] for i in range(2) for j in range(2) for k in range(2)], dtype=wp.vec3i, device=device),
+    )
+    legacy_env_levels = (
+        wp.array([1], dtype=wp.uint8, device=device),
+        wp.array([0] * legacy_env_cells[1].shape[0], dtype=wp.uint8, device=device),
+    )
+    legacy_geo = fem.AdaptiveNanogrid.from_environment_voxels(
+        legacy_env_cells,
+        legacy_env_levels,
+        level_count=2,
+        voxel_size=0.5,
+        device=device,
+    )
+    np.testing.assert_array_equal(legacy_geo.env_offsets.numpy(), np.array([[0, 0, 0], [4, 0, 0]], dtype=np.int32))
+    test.assertEqual(legacy_geo.cell_count(), 9)
+
+    aligned_points = wp.array([[-1, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    aligned_levels = wp.array([2, 0], dtype=wp.uint8, device=device)
+    aligned_envs = wp.array([0, 1], dtype=wp.int32, device=device)
+    aligned_geo = fem.AdaptiveNanogrid.from_environment_voxels(
+        aligned_points,
+        aligned_levels,
+        aligned_envs,
+        2,
+        level_count=3,
+        voxel_size=0.25,
+        device=device,
+    )
+    aligned_offsets = aligned_geo.env_offsets.numpy()
+    env0_packed_max = -1 + aligned_offsets[0, 0] + (1 << 2) - 1
+    env1_packed_min = aligned_offsets[1, 0]
+    test.assertGreaterEqual(env1_packed_min - env0_packed_max - 1, 4)
+
+    masked_points = wp.array([[0, 0, 0], [16, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    masked_levels = wp.array([1, 0, 0], dtype=wp.uint8, device=device)
+    masked_envs = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    point_mask = wp.array([1, 0, 1], dtype=wp.int32, device=device)
+    masked_geo = fem.AdaptiveNanogrid.from_environment_voxels(
+        masked_points,
+        masked_levels,
+        masked_envs,
+        2,
+        level_count=2,
+        point_mask=point_mask,
+        voxel_size=0.5,
+        device=device,
+    )
+    np.testing.assert_array_equal(masked_geo.env_offsets.numpy(), np.array([[0, 0, 0], [4, 0, 0]], dtype=np.int32))
+    test.assertEqual(masked_geo.cell_count(), 2)
+
+
+def test_environment_space_partition_capture(test, device):
+    with wp.ScopedDevice(device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=3)
+        cell_mask = wp.array([1, 0, 0, 1, 0, 0], dtype=int, device=device)
+        geo_partition = fem.ExplicitGeometryPartition(
+            geo,
+            cell_mask,
+            max_cell_count=4,
+            max_side_count=0,
+        )
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+
+        def make_partition():
+            return fem.make_space_partition(
+                space_topology=space.topology,
+                geometry_partition=geo_partition,
+                environment_first=True,
+                with_halo=False,
+                max_node_count=5,
+                device=device,
+            )
+
+        make_partition()
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            captured_partition = make_partition()
+        wp.capture_launch(capture.graph)
+
+        test.assertEqual(captured_partition.node_count(), 5)
+        np.testing.assert_array_equal(
+            captured_partition.space_node_indices().numpy()[:2], np.array([0, 3], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(captured_partition.env_offsets.numpy(), np.array([0, 1, 2, 2], dtype=np.int32))
+        expected_space_to_partition = np.full(space.node_count(), fem.NULL_NODE_INDEX, dtype=np.int32)
+        expected_space_to_partition[[0, 3]] = [0, 1]
+        np.testing.assert_array_equal(captured_partition._space_to_partition.numpy(), expected_space_to_partition)
+
+
+def test_single_environment_space_partition_environmentless_tail(test, device):
+    with wp.ScopedDevice(device):
+        positions = wp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [2.0, 2.0, 0.0],
+            ],
+            dtype=wp.vec3,
+            device=device,
+        )
+        geo = fem.Trimesh3D(
+            wp.array([[0, 1, 2]], dtype=int, device=device),
+            positions,
+            build_bvh=True,
+        )
+        space = fem.make_polynomial_space(geo, degree=1)
+        partition = fem.make_space_partition(
+            space_topology=space.topology,
+            environment_first=True,
+            max_node_count=space.node_count(),
+            device=device,
+        )
+
+        test.assertEqual(partition.node_count(), 4)
+        np.testing.assert_array_equal(partition.space_node_indices().numpy(), np.array([0, 1, 2, 3], dtype=np.int32))
+        np.testing.assert_array_equal(partition.env_offsets.numpy(), np.array([0, 3], dtype=np.int32))
+
 
 # -- Device setup and test registration --
 
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
+cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 
 class TestFemMultiEnv(unittest.TestCase):
@@ -882,9 +1250,48 @@ add_function_test(TestFemMultiEnv, "test_grid_2d_multi_env", test_grid_2d_multi_
 add_function_test(TestFemMultiEnv, "test_grid_3d_multi_env", test_grid_3d_multi_env, devices=devices)
 add_function_test(TestFemMultiEnv, "test_deformed_grid_3d_multi_env", test_deformed_grid_3d_multi_env, devices=devices)
 add_function_test(TestFemMultiEnv, "test_mesh_multi_env", test_mesh_multi_env, devices=devices)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_cell_boundary_lookup",
+    test_nanogrid_multi_env_cell_boundary_lookup,
+    devices=cuda_devices,
+)
 add_function_test(TestFemMultiEnv, "test_nanogrid_multi_env", test_nanogrid_multi_env, devices=cuda_devices)
 add_function_test(
+    TestFemMultiEnv, "test_nanogrid_multi_env_rebuildable", test_nanogrid_multi_env_rebuildable, devices=cuda_devices
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_sparse_grid_multi_env_invalid_point_envs",
+    test_sparse_grid_multi_env_invalid_point_envs,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuildable_invalid_point_envs",
+    test_nanogrid_multi_env_rebuildable_invalid_point_envs,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_capture_invalid_point_envs",
+    test_nanogrid_multi_env_capture_invalid_point_envs,
+    devices=cuda_devices_with_mempool,
+)
+add_function_test(
     TestFemMultiEnv, "test_adaptive_nanogrid_multi_env", test_adaptive_nanogrid_multi_env, devices=cuda_devices
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture",
+    test_environment_space_partition_capture,
+    devices=cuda_devices_with_mempool,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_single_environment_space_partition_environmentless_tail",
+    test_single_environment_space_partition_environmentless_tail,
+    devices=devices,
 )
 
 if __name__ == "__main__":

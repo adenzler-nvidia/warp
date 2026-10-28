@@ -28,7 +28,7 @@ def test_pow(e: float, expected: float):
 
 
 def test_fast_math_disabled(test, device):
-    # on all systems pow() should handle negative base correctly with fast math off
+    """Handle negative power bases with fast math disabled."""
     wp.set_module_options({"fast_math": False})
     wp.launch(test_pow, dim=1, inputs=[2.0, 4.0], device=device)
 
@@ -45,20 +45,18 @@ def test_fast_math_cuda(test, device):
 
 
 @wp.kernel
-def approx_div_kernel(a: wp.array(dtype=Any), b: wp.array(dtype=Any), out: wp.array(dtype=Any)):
+def approx_div_kernel(a: wp.array[Any], b: wp.array[Any], out: wp.array[Any]):
     i = wp.tid()
     out[i] = wp.div_approx(a[i], b[i])
 
 
 # Pre-instantiate overloads to avoid module recompilation during tests
 for scalar_type in (wp.float16, wp.float32, wp.float64):
-    wp.overload(
-        approx_div_kernel, [wp.array(dtype=scalar_type), wp.array(dtype=scalar_type), wp.array(dtype=scalar_type)]
-    )
+    wp.overload(approx_div_kernel, [wp.array[scalar_type], wp.array[scalar_type], wp.array[scalar_type]])
 
 
 @wp.kernel
-def approx_div_compound_kernel(a: wp.array(dtype=Any), b: wp.array(dtype=Any), out: wp.array(dtype=Any)):
+def approx_div_compound_kernel(a: wp.array[Any], b: wp.array[Any], out: wp.array[Any]):
     i = wp.tid()
     out[i] = wp.div_approx(a[i], b[i])
 
@@ -70,14 +68,14 @@ for _compound_type, _scalar_type in [
 ]:
     wp.overload(
         approx_div_compound_kernel,
-        [wp.array(dtype=_compound_type), wp.array(dtype=_scalar_type), wp.array(dtype=_compound_type)],
+        [wp.array[_compound_type], wp.array[_scalar_type], wp.array[_compound_type]],
     )
 
 
 @wp.kernel
 def approx_inverse_kernel(
-    m: wp.array(dtype=Any),
-    out: wp.array(dtype=Any),
+    m: wp.array[Any],
+    out: wp.array[Any],
 ):
     i = wp.tid()
     out[i] = wp.inverse_approx(m[i])
@@ -85,11 +83,11 @@ def approx_inverse_kernel(
 
 # Pre-instantiate overloads to avoid module recompilation during tests
 for mat_type in (wp.mat22, wp.mat33, wp.mat44, wp.mat22d, wp.mat33d, wp.mat44d):
-    wp.overload(approx_inverse_kernel, [wp.array(dtype=mat_type), wp.array(dtype=mat_type)])
+    wp.overload(approx_inverse_kernel, [wp.array[mat_type], wp.array[mat_type]])
 
 
 @wp.kernel
-def approx_inverse_backward_kernel_22(m: wp.array(dtype=wp.mat22), loss: wp.array(dtype=float)):
+def approx_inverse_backward_kernel_22(m: wp.array[wp.mat22], loss: wp.array[float]):
     i = wp.tid()
     inv = wp.inverse_approx(m[i])
     for r in range(2):
@@ -98,7 +96,7 @@ def approx_inverse_backward_kernel_22(m: wp.array(dtype=wp.mat22), loss: wp.arra
 
 
 @wp.kernel
-def approx_inverse_backward_kernel_33(m: wp.array(dtype=wp.mat33), loss: wp.array(dtype=float)):
+def approx_inverse_backward_kernel_33(m: wp.array[wp.mat33], loss: wp.array[float]):
     i = wp.tid()
     inv = wp.inverse_approx(m[i])
     for r in range(3):
@@ -107,7 +105,7 @@ def approx_inverse_backward_kernel_33(m: wp.array(dtype=wp.mat33), loss: wp.arra
 
 
 @wp.kernel
-def approx_inverse_backward_kernel_44(m: wp.array(dtype=wp.mat44), loss: wp.array(dtype=float)):
+def approx_inverse_backward_kernel_44(m: wp.array[wp.mat44], loss: wp.array[float]):
     i = wp.tid()
     inv = wp.inverse_approx(m[i])
     for r in range(4):
@@ -116,16 +114,14 @@ def approx_inverse_backward_kernel_44(m: wp.array(dtype=wp.mat44), loss: wp.arra
 
 
 @wp.kernel
-def approx_div_backward_kernel(
-    a: wp.array(dtype=Any), b: wp.array(dtype=Any), out: wp.array(dtype=Any), loss: wp.array(dtype=Any)
-):
+def approx_div_backward_kernel(a: wp.array[Any], b: wp.array[Any], out: wp.array[Any], loss: wp.array[Any]):
     i = wp.tid()
     out[i] = wp.div_approx(a[i], b[i])
     wp.atomic_add(loss, 0, out[i])
 
 
 for _backward_scalar_type in (wp.float16, wp.float32, wp.float64):
-    wp.overload(approx_div_backward_kernel, [wp.array(dtype=_backward_scalar_type)] * 4)
+    wp.overload(approx_div_backward_kernel, [wp.array[_backward_scalar_type]] * 4)
 
 
 def test_approx_div_div(test, device):
@@ -208,7 +204,7 @@ def test_approx_div_compound(test, device):
 
 
 def test_approx_div_backward(test, device):
-    """Verify that backward pass through approx division works correctly."""
+    """Verify that the backward pass through approximate division works."""
     n = 8
     rng = np.random.default_rng(42)
     # div_approx uses rcp.approx (float32 precision) even for float64, so use looser tolerance for f64
@@ -243,7 +239,7 @@ def test_approx_div_backward(test, device):
 
 
 def test_approx_inverse_backward(test, device):
-    """Verify that backward pass through inverse_approx works correctly."""
+    """Verify that the backward pass through ``inverse_approx`` works."""
     n = 4
     rng = np.random.default_rng(42)
     backward_kernels = {
@@ -276,7 +272,8 @@ def test_approx_inverse_backward(test, device):
 
 class TestFastMath(unittest.TestCase):
     def test_fast_math_cpu(self):
-        # on all systems pow() should handle negative base correctly
+        """Handle negative power bases with fast math enabled."""
+
         wp.set_module_options({"fast_math": True})
         try:
             wp.launch(test_pow, dim=1, inputs=[2.0, 4.0], device="cpu")

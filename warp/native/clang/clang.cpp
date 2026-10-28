@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "../native/cpu_block_runtime.h"
 #include "../native/crt.h"
-#include "../version.h"
+#include "../warp_clang.h"
 #include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
@@ -15,9 +16,14 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #endif
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <clang/Basic/TargetInfo.h>
@@ -27,8 +33,12 @@
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
+#if LLVM_VERSION_MAJOR >= 22
+#include <llvm/ExecutionEngine/Orc/Debugging/ELFDebugObjectPlugin.h>
+#else
 #include <llvm/ExecutionEngine/Orc/DebugObjectManagerPlugin.h>
 #include <llvm/ExecutionEngine/Orc/EPCDebugObjectRegistrar.h>
+#endif
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
@@ -43,7 +53,9 @@
 #include <llvm/Linker/Linker.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/PassRegistry.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #if LLVM_VERSION_MAJOR >= 16
 #include <llvm/TargetParser/Host.h>
@@ -76,12 +88,25 @@ extern void __jit_debug_register_code();
 namespace wp {
 
 #if defined(_WIN32)
-// Windows defaults to using the COFF binary format (aka. "msvc" in the target triple).
-// Override it to use the ELF format to support DWARF debug info, but keep using the
-// Microsoft calling convention (see also https://llvm.org/docs/DebuggingJITedCode.html).
+// Windows x86-64 uses ELF for DWARF debugging while retaining the Microsoft
+// calling convention. ARM64 stays native COFF because LLVM's ELF writer cannot
+// represent Windows relocations, and a non-Windows triple would select the
+// wrong stack-probing and TLS ABI. COFF ARM64 objects are linked by RTDyld
+// because JITLink supports COFF only for x86-64.
+#if defined(__aarch64__) || defined(_M_ARM64)
+static const char* target_triple = "aarch64-pc-windows-msvc";
+#else
 static const char* target_triple = "x86_64-pc-windows-elf";
+#endif
 #else
 static const char* target_triple = LLVM_DEFAULT_TARGET_TRIPLE;
+#endif
+
+// JITLink does not support COFF ARM64; RuntimeDyldCOFFAArch64 does.
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+static constexpr bool force_legacy_cpu_linker = true;
+#else
+static constexpr bool force_legacy_cpu_linker = false;
 #endif
 
 // Minimum CUDA compute capability that supports all of Warp's features.
@@ -91,10 +116,15 @@ static const char* cuda_target_arch = "sm_75";
 
 static void initialize_llvm()
 {
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmPrinters();
+    // LLVM target registration mutates a process-global registry and must not
+    // run concurrently when parallel module compilation enters native code.
+    static std::once_flag init_flag;
+    std::call_once(init_flag, []() {
+        llvm::InitializeAllTargetInfos();
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+    });
 }
 
 struct HostCpuInfo {
@@ -110,8 +140,13 @@ static const HostCpuInfo& get_host_cpu_info()
         HostCpuInfo result;
         result.name = llvm::sys::getHostCPUName().str();
 
+#if LLVM_VERSION_MAJOR >= 19
+        // LLVM 19 changed getHostCPUFeatures() to return the feature map by value.
+        llvm::StringMap<bool> feature_map = llvm::sys::getHostCPUFeatures();
+#else
         llvm::StringMap<bool> feature_map;
         llvm::sys::getHostCPUFeatures(feature_map);
+#endif
 
         for (const auto& f : feature_map) {
             // Skip avx10.1-256: getHostCPUFeatures() reports it on Intel Granite Rapids,
@@ -132,9 +167,209 @@ static const HostCpuInfo& get_host_cpu_info()
     return info;
 }
 
+static int get_effective_optimization_level(bool debug, int optimization_level)
+{
+    if (debug) {
+        return 0;
+    }
+
+    switch (optimization_level) {
+    case 0:
+    case 1:
+    case 2:
+        return optimization_level;
+    default:
+        return 3;
+    }
+}
+
+// LLVM command-line options are process-wide. Compilations with the same
+// ordered LLVM arguments share one parsed state until the last one finishes.
+struct LlvmOptionState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<std::string> active_flags;
+    std::unordered_map<llvm::cl::Option*, unsigned> original_positions;
+    unsigned users = 0;
+};
+
+static LlvmOptionState llvm_option_state;
+
+struct CpuCompilerFlags {
+    std::vector<const char*> clang_flags;
+    std::vector<std::string> llvm_flags;
+};
+
+static bool split_cpu_compiler_flags(const char** flags, CpuCompilerFlags& result)
+{
+    if (flags) {
+        for (const char** flag = flags; *flag; ++flag) {
+            const std::string value(*flag);
+            if (value == "-mllvm") {
+                if (!flag[1] || !*flag[1] || strcmp(flag[1], "-mllvm") == 0 || strncmp(flag[1], "-mllvm=", 7) == 0) {
+                    std::cerr << "Warp: -mllvm requires one LLVM option argument" << std::endl;
+                    return false;
+                }
+                result.llvm_flags.emplace_back(*++flag);
+            } else if (value.compare(0, 7, "-mllvm=") == 0) {
+                if (value.size() == 7) {
+                    std::cerr << "Warp: -mllvm= requires one LLVM option argument" << std::endl;
+                    return false;
+                }
+                result.llvm_flags.push_back(value.substr(7));
+            } else if (value.rfind("-mdebug-pass", 0) == 0 || value.rfind("-mlimit-float-precision", 0) == 0) {
+                // These Clang flags bypass the scoped -mllvm path.
+                std::cerr << "Warp: Unsupported CPU compiler flag '" << value << "'" << std::endl;
+                return false;
+            } else {
+                result.clang_flags.push_back(*flag);
+            }
+        }
+    }
+    result.clang_flags.push_back(nullptr);
+    return true;
+}
+
+static void reset_llvm_options(const std::unordered_map<llvm::cl::Option*, unsigned>& original_positions)
+{
+    // LLVM increments a target option's count even when parsing its value
+    // fails. Collect options first because reset() may change the registry.
+    std::unordered_set<llvm::cl::Option*> touched;
+    for (const auto& entry : llvm::cl::getRegisteredOptions()) {
+        if (entry.second->getNumOccurrences() != 0) {
+            touched.insert(entry.second);
+        }
+    }
+    for (llvm::cl::Option* option : touched) {
+        option->reset();
+    }
+    // Option::reset() does not restore Position, which some passes inspect.
+    for (const auto& original : original_positions) {
+        original.first->setPosition(original.second);
+    }
+}
+
+class ScopedLlvmOptions {
+    bool entered = false;
+
+public:
+    ScopedLlvmOptions() = default;
+    ScopedLlvmOptions(const ScopedLlvmOptions&) = delete;
+    ScopedLlvmOptions& operator=(const ScopedLlvmOptions&) = delete;
+
+    bool enter(const std::vector<std::string>& llvm_flags)
+    {
+        for (const std::string& argument : llvm_flags) {
+            if (argument[0] == '@') {
+                std::cerr
+                    << "Warp: -mllvm response files are unsupported because their contents bypass the kernel cache key"
+                    << std::endl;
+                return false;
+            }
+        }
+
+        LlvmOptionState& state = llvm_option_state;
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.changed.wait(lock, [&] { return state.users == 0 || state.active_flags == llvm_flags; });
+        if (state.users != 0) {
+            ++state.users;
+            entered = true;
+            return true;
+        }
+
+        if (llvm_flags.empty()) {
+            state.users = 1;
+            entered = true;
+            return true;
+        }
+
+        auto& registered = llvm::cl::getRegisteredOptions();
+        std::unordered_map<llvm::cl::Option*, unsigned> original_positions;
+
+        // The public Option API cannot snapshot arbitrary current values. Warp
+        // leaves registered options at their built-in defaults; if another
+        // caller has parsed options in this registry, fail instead of erasing
+        // state that cannot be restored faithfully.
+        for (const auto& entry : registered) {
+            if (entry.second->getNumOccurrences() != 0) {
+#if LLVM_VERSION_MAJOR >= 22
+                const std::string name = entry.first.str();
+#else
+                const std::string name = entry.first().str();
+#endif
+                std::cerr << "Warp: Cannot scope -mllvm while LLVM option -" << name << " has a process-wide value"
+                          << std::endl;
+                return false;
+            }
+            original_positions.emplace(entry.second, entry.second->getPosition());
+        }
+
+        std::vector<const char*> argv = { "warp" };
+        for (const std::string& argument : llvm_flags) {
+            argv.push_back(argument.c_str());
+        }
+        std::string error;
+        llvm::raw_string_ostream error_stream(error);
+        bool parsed;
+        try {
+            parsed = llvm::cl::ParseCommandLineOptions(static_cast<int>(argv.size()), argv.data(), "", &error_stream);
+            if (parsed) {
+                state.active_flags = llvm_flags;
+            }
+        } catch (...) {
+            reset_llvm_options(original_positions);
+            state.active_flags.clear();
+            state.changed.notify_all();
+            return false;
+        }
+        if (!parsed) {
+            error_stream.flush();
+            std::cerr << "Warp: Invalid -mllvm option";
+            for (const std::string& argument : llvm_flags) {
+                std::cerr << " " << argument;
+            }
+            if (!error.empty()) {
+                std::cerr << ": " << error;
+            }
+            std::cerr << std::endl;
+            reset_llvm_options(original_positions);
+            state.active_flags.clear();
+            state.changed.notify_all();
+            return false;
+        }
+
+        state.original_positions.swap(original_positions);
+        state.users = 1;
+        entered = true;
+        return true;
+    }
+
+    void enter_default() { (void)enter({}); }
+
+    ~ScopedLlvmOptions()
+    {
+        if (!entered) {
+            return;
+        }
+        LlvmOptionState& state = llvm_option_state;
+        std::unique_lock<std::mutex> lock(state.mutex);
+        if (--state.users == 0) {
+            if (!state.active_flags.empty()) {
+                reset_llvm_options(state.original_positions);
+            }
+            state.active_flags.clear();
+            state.original_positions.clear();
+            lock.unlock();
+            state.changed.notify_all();
+        }
+    }
+};
+
 static std::unique_ptr<clang::CompilerInstance> create_compiler(
     const std::string& input_file,
     const char* include_dir,
+    int num_extra_include_dirs,
+    const char** extra_include_dirs,
     bool is_cuda,
     bool debug,
     bool verify_fp,
@@ -144,31 +379,34 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
 )
 {
     auto compiler_instance = std::make_unique<clang::CompilerInstance>();
+    const int effective_optimization_level = get_effective_optimization_level(debug, optimization_level);
+    bool enable_loop_vectorization = effective_optimization_level >= 2;
+    bool enable_slp_vectorization = effective_optimization_level >= 2;
     // Compilation arguments
     std::vector<const char*> args;
     args.push_back(input_file.c_str());
 
     args.push_back("-I");
     args.push_back(include_dir);
+    for (int i = 0; i < num_extra_include_dirs; ++i) {
+        args.push_back("-I");
+        args.push_back(extra_include_dirs[i]);
+    }
     args.push_back("-std=c++17");
 
-    if (debug) {
+    switch (effective_optimization_level) {
+    case 0:
         args.push_back("-O0");
-    } else {
-        switch (optimization_level) {
-        case 0:
-            args.push_back("-O0");
-            break;
-        case 1:
-            args.push_back("-O1");
-            break;
-        case 2:
-            args.push_back("-O2");
-            break;
-        default:
-            args.push_back("-O3");
-            break;
-        }
+        break;
+    case 1:
+        args.push_back("-O1");
+        break;
+    case 2:
+        args.push_back("-O2");
+        break;
+    default:
+        args.push_back("-O3");
+        break;
     }
 
     if (is_cuda) {
@@ -196,6 +434,12 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
                         args.push_back("-target-feature");
                         args.push_back(feat.c_str());
                     }
+                } else if (strcmp(*flag, "-fno-vectorize") == 0) {
+                    // This driver option disables the loop vectorizer. Warp invokes cc1 directly.
+                    enable_loop_vectorization = false;
+                } else if (strcmp(*flag, "-fno-slp-vectorize") == 0) {
+                    // This driver option disables the SLP vectorizer. Warp invokes cc1 directly.
+                    enable_slp_vectorization = false;
                 } else {
                     args.push_back(*flag);
                 }
@@ -209,7 +453,7 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
         args.push_back("+f16c");
 #endif
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
         if (tiles_in_stack_memory) {
             // Static memory support is broken on AArch64 CPUs. As a workaround we reserve some stack memory on kernel
             // entry, and point the callee-saved x28 register to it so we can access it anywhere. See
@@ -221,7 +465,13 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
     }
 
 #if LLVM_VERSION_MAJOR >= 21
-    clang::DiagnosticOptions diagnostic_options;
+    // LLVM 21 stopped heap-allocating DiagnosticOptions: TextDiagnosticPrinter
+    // and DiagnosticsEngine take it by reference and the printer keeps that
+    // reference for its lifetime. Since the printer is transferred to and
+    // outlives create_compiler via the CompilerInstance, bind the reference to
+    // the invocation's options rather than a local that would leave the printer
+    // dangling once this function returns.
+    clang::DiagnosticOptions& diagnostic_options = compiler_instance->getInvocation().getDiagnosticOpts();
     std::unique_ptr<clang::TextDiagnosticPrinter> text_diagnostic_printer
         = std::make_unique<clang::TextDiagnosticPrinter>(llvm::errs(), diagnostic_options);
     clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diagnostic_ids;
@@ -240,6 +490,13 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
 
     auto& compiler_invocation = compiler_instance->getInvocation();
     clang::CompilerInvocation::CreateFromArgs(compiler_invocation, args, *diagnostic_engine);
+
+    // The Clang driver normally enables these passes for -O2/-O3, but Warp calls
+    // cc1 directly. Keep optimized CPU compilation consistent with the driver.
+    if (!is_cuda) {
+        compiler_invocation.getCodeGenOpts().VectorizeLoop = enable_loop_vectorization;
+        compiler_invocation.getCodeGenOpts().VectorizeSLP = enable_slp_vectorization;
+    }
 
     if (debug) {
 #if LLVM_VERSION_MAJOR >= 18
@@ -275,19 +532,23 @@ static std::unique_ptr<clang::CompilerInstance> create_compiler(
         compiler_instance->getLangOpts().DeclSpecKeyword = 1;  // __declspec
     }
 
-    // For LLVM >= 21, transfer ownership of the DiagnosticConsumer to the
-    // CompilerInstance so it outlives create_compiler's scope. First release
-    // the DiagnosticsEngine's ownership to avoid a double-free.
+    // For LLVM >= 21, transfer ownership of the DiagnosticConsumer from the
+    // local DiagnosticsEngine to the CompilerInstance so the printer outlives
+    // create_compiler's scope. takeClient() moves the owning unique_ptr out of
+    // the engine; setClient(getClient(), /*ShouldOwnClient=*/false) must NOT be
+    // used for this, because it resets the owning unique_ptr (deleting the
+    // printer) and then stores that freed pointer as the non-owned client,
+    // leaving the CompilerInstance's engine with a dangling consumer that every
+    // compile virtual-calls in FrontendAction::EndSourceFile().
     // For LLVM < 21, passing nullptr makes createDiagnostics create its own
     // internal printer (text_diagnostic_printer was already released into
     // diagnostic_engine above).
-#if LLVM_VERSION_MAJOR >= 21
-    diagnostic_engine->setClient(diagnostic_engine->getClient(), /*ShouldOwnClient=*/false);
-#endif
 #if LLVM_VERSION_MAJOR >= 22
-    compiler_instance->createDiagnostics(diagnostic_engine->getClient(), true);
+    compiler_instance->createDiagnostics(diagnostic_engine->takeClient().release(), true);
 #elif LLVM_VERSION_MAJOR == 21
-    compiler_instance->createDiagnostics(*llvm::vfs::getRealFileSystem(), diagnostic_engine->getClient(), true);
+    compiler_instance->createDiagnostics(
+        *llvm::vfs::getRealFileSystem(), diagnostic_engine->takeClient().release(), true
+    );
 #else
     compiler_instance->createDiagnostics(text_diagnostic_printer.get(), false);
 #endif
@@ -302,6 +563,7 @@ static bool generate_pch(
     bool verify_fp,
     bool tiles_in_stack_memory,
     const char** extra_flags,
+    int optimization_level,
     bool verbose,
     int block_dim
 )
@@ -312,8 +574,16 @@ static bool generate_pch(
 
     std::string input_file = "pch_gen.cpp";
 
-    auto compiler
-        = create_compiler(input_file, include_dir, false, debug, verify_fp, tiles_in_stack_memory, extra_flags);
+    // Build the PCH at the same optimization level as the modules that will
+    // consume it. Clang records the -O level in the PCH and rejects it with
+    // "OptimizationLevel differs in precompiled file" if a module is compiled
+    // at a different level. Without this the PCH defaulted to -O3 while CPU
+    // modules build at -O2 (see build_cpu in build.py), so every module failed
+    // the PCH check and paid a full no-PCH recompile.
+    auto compiler = create_compiler(
+        input_file, include_dir, 0, nullptr, false, debug, verify_fp, tiles_in_stack_memory, extra_flags,
+        optimization_level
+    );
 
     // Create a source buffer that includes the main header.
     // WP_NO_CRT skips system headers (assert.h, math.h, etc.) which aren't
@@ -345,6 +615,8 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
     const std::string& input_file,
     const char* cpp_src,
     const char* include_dir,
+    int num_extra_include_dirs,
+    const char** extra_include_dirs,
     bool debug,
     bool verify_fp,
     llvm::LLVMContext& context,
@@ -355,7 +627,8 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
 )
 {
     auto compiler = create_compiler(
-        input_file, include_dir, is_cuda, debug, verify_fp, tiles_in_stack_memory, extra_flags, optimization_level
+        input_file, include_dir, num_extra_include_dirs, extra_include_dirs, is_cuda, debug, verify_fp,
+        tiles_in_stack_memory, extra_flags, optimization_level
     );
 
     // Map code to a MemoryBuffer
@@ -384,6 +657,44 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
     return success ? std::move(emit_llvm_only_action.takeModule()) : nullptr;
 }
 
+// Return a stable filename component for the ordered flag tokens passed to
+// create_compiler(). Hash at the native boundary so the PCH key reflects the
+// tokenized flags, not inconsequential whitespace in the Python option string.
+//
+// FNV-1a is sufficient for this ephemeral cache key; this is not a security or
+// content-integrity hash. A null byte terminates each token in the hashed byte
+// stream, making token boundaries unambiguous because C strings cannot contain
+// embedded nulls. A null pointer and an empty array both represent no flags.
+static std::string hash_compiler_flags(const char** extra_flags)
+{
+    constexpr std::uint64_t fnv_offset_basis = 14695981039346656037ull;
+    constexpr std::uint64_t fnv_prime = 1099511628211ull;
+
+    std::uint64_t hash = fnv_offset_basis;
+    const auto hash_byte = [&hash, fnv_prime](unsigned char byte) {
+        hash ^= byte;
+        hash *= fnv_prime;
+    };
+
+    if (extra_flags) {
+        for (const char** flag = extra_flags; *flag; ++flag) {
+            const auto* byte = reinterpret_cast<const unsigned char*>(*flag);
+            while (*byte) {
+                hash_byte(*byte++);
+            }
+            hash_byte(0);
+        }
+    }
+
+    constexpr char hex_digits[] = "0123456789abcdef";
+    std::string hex_hash(16, '0');
+    for (size_t i = hex_hash.size(); i > 0; --i) {
+        hex_hash[i - 1] = hex_digits[hash & 0xf];
+        hash >>= 4;
+    }
+    return hex_hash;
+}
+
 extern "C" {
 
 WP_API int wp_compile_cpp(
@@ -404,6 +715,16 @@ WP_API int wp_compile_cpp(
 )
 {
     initialize_llvm();
+    CpuCompilerFlags compiler_flags;
+    if (!split_cpu_compiler_flags(extra_flags, compiler_flags)) {
+        return -1;
+    }
+    ScopedLlvmOptions llvm_options;
+    if (!llvm_options.enter(compiler_flags.llvm_flags)) {
+        return -1;
+    }
+    const char** clang_flags = compiler_flags.clang_flags.data();
+    const int effective_optimization_level = get_effective_optimization_level(debug, optimization_level);
 
     // Determine PCH path if requested.
     // Each block_dim value gets its own PCH file because tile.h templates
@@ -411,25 +732,15 @@ WP_API int wp_compile_cpp(
     std::string pch_path_str;
     const char* pch_path = nullptr;
     if (use_precompiled_headers && pch_dir) {
-        // Encode preprocessor-affecting flags into the filename so that
-        // modules with different settings get separate PCH files.
-        // Note: extra_flags are not encoded — they are assumed constant
-        // within a session. If they differ, Clang rejects the PCH and
-        // the fallback path handles it. The one exception is -fsanitize=address:
-        // an ASan-instrumented PCH is ABI-incompatible with a non-ASan one, so
-        // tag the filename to keep them from colliding across sessions/installs.
-        bool sanitize_address = false;
-        if (extra_flags) {
-            for (const char** flag = extra_flags; *flag; ++flag) {
-                if (strcmp(*flag, "-fsanitize=address") == 0) {
-                    sanitize_address = true;
-                    break;
-                }
-            }
-        }
+        // Keep fixed, bounded PCH inputs readable in the filename. Hash the
+        // compiler flag sequence because it is ordered, variable-length, and may
+        // contain characters unsuitable for filenames. Any new input that can
+        // change PCH contents or compatibility must be represented here, either
+        // directly or by a separately named digest.
+        const std::string compiler_flags_hash = hash_compiler_flags(extra_flags);
         pch_path_str = std::string(pch_dir) + "/builtin_bd" + std::to_string(block_dim) + (verify_fp ? "_vfp" : "")
-            + (debug ? "_dbg" : "") + (tiles_in_stack_memory ? "_tis" : "") + (sanitize_address ? "_asan" : "")
-            + ".pch";
+            + (debug ? "_dbg" : "") + (tiles_in_stack_memory ? "_tis" : "") + "_o"
+            + std::to_string(effective_optimization_level) + "_f" + compiler_flags_hash + ".pch";
 
         // Check if the PCH file already exists
         FILE* f = fopen(pch_path_str.c_str(), "rb");
@@ -441,7 +752,8 @@ WP_API int wp_compile_cpp(
         } else {
             // Generate the PCH file
             if (!generate_pch(
-                    include_dir, pch_path_str, debug, verify_fp, tiles_in_stack_memory, extra_flags, verbose, block_dim
+                    include_dir, pch_path_str, debug, verify_fp, tiles_in_stack_memory, clang_flags,
+                    effective_optimization_level, verbose, block_dim
                 )) {
                 std::cerr << "Warp: PCH generation failed, compiling without precompiled headers" << std::endl;
                 remove(pch_path_str.c_str());
@@ -458,8 +770,8 @@ WP_API int wp_compile_cpp(
     // The LLVMContext must outlive the module through codegen.
     auto llvm_context = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> module = source_to_llvm(
-        false, input_file, cpp_src, include_dir, debug, verify_fp, *llvm_context, tiles_in_stack_memory, extra_flags,
-        optimization_level, pch_path
+        false, input_file, cpp_src, include_dir, 0, nullptr, debug, verify_fp, *llvm_context, tiles_in_stack_memory,
+        clang_flags, effective_optimization_level, pch_path
     );
 
     // Fallback: if compilation failed with PCH, retry without it
@@ -473,8 +785,8 @@ WP_API int wp_compile_cpp(
         // Need a fresh LLVMContext for the retry
         llvm_context = std::make_unique<llvm::LLVMContext>();
         module = source_to_llvm(
-            false, input_file, cpp_src, include_dir, debug, verify_fp, *llvm_context, tiles_in_stack_memory,
-            extra_flags, optimization_level, nullptr
+            false, input_file, cpp_src, include_dir, 0, nullptr, debug, verify_fp, *llvm_context, tiles_in_stack_memory,
+            clang_flags, effective_optimization_level, nullptr
         );
     }
 
@@ -491,8 +803,8 @@ WP_API int wp_compile_cpp(
 
     // Check if -march=native was requested to set the backend target accordingly.
     bool use_native = false;
-    if (extra_flags) {
-        for (const char** flag = extra_flags; *flag; ++flag) {
+    if (clang_flags) {
+        for (const char** flag = clang_flags; *flag; ++flag) {
             if (strcmp(*flag, "-march=native") == 0) {
                 use_native = true;
                 break;
@@ -513,7 +825,14 @@ WP_API int wp_compile_cpp(
     else
         target_options.AllowFPOpFusion = llvm::FPOpFusion::Strict;
     llvm::Reloc::Model relocation_model = llvm::Reloc::PIC_;  // Position Independent Code
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+    // Windows ARM64 is always PIC. With the large code model, __chkstk uses
+    // ADRP+ADD relocations that RTDyld cannot range-extend to warp-clang.dll.
+    // The small model emits a BRANCH26 call, for which RTDyld creates a stub.
+    llvm::CodeModel::Model code_model = llvm::CodeModel::Small;
+#else
     llvm::CodeModel::Model code_model = llvm::CodeModel::Large;  // Don't make assumptions about displacement sizes
+#endif
 
 #if LLVM_VERSION_MAJOR >= 18
     llvm::CodeGenOptLevel codegen_opt;
@@ -521,23 +840,19 @@ WP_API int wp_compile_cpp(
     llvm::CodeGenOpt::Level codegen_opt;
 #define CodeGenOptLevel CodeGenOpt
 #endif
-    if (debug) {
+    switch (effective_optimization_level) {
+    case 0:
         codegen_opt = llvm::CodeGenOptLevel::None;
-    } else {
-        switch (optimization_level) {
-        case 0:
-            codegen_opt = llvm::CodeGenOptLevel::None;
-            break;
-        case 1:
-            codegen_opt = llvm::CodeGenOptLevel::Less;
-            break;
-        case 2:
-            codegen_opt = llvm::CodeGenOptLevel::Default;
-            break;
-        default:
-            codegen_opt = llvm::CodeGenOptLevel::Aggressive;
-            break;
-        }
+        break;
+    case 1:
+        codegen_opt = llvm::CodeGenOptLevel::Less;
+        break;
+    case 2:
+        codegen_opt = llvm::CodeGenOptLevel::Default;
+        break;
+    default:
+        codegen_opt = llvm::CodeGenOptLevel::Aggressive;
+        break;
     }
 
 #if LLVM_VERSION_MAJOR >= 20
@@ -572,14 +887,23 @@ WP_API int wp_compile_cpp(
 }
 
 WP_API int wp_compile_cuda(
-    const char* cpp_src, const char* input_file, const char* include_dir, const char* output_file, bool debug
+    const char* cpp_src,
+    const char* input_file,
+    const char* include_dir,
+    int num_cuda_include_dirs,
+    const char** cuda_include_dirs,
+    const char* output_file,
+    bool debug
 )
 {
     initialize_llvm();
+    ScopedLlvmOptions llvm_options;
+    llvm_options.enter_default();
 
     llvm::LLVMContext context;
-    std::unique_ptr<llvm::Module> module
-        = source_to_llvm(true, input_file, cpp_src, include_dir, debug, false, context, false);
+    std::unique_ptr<llvm::Module> module = source_to_llvm(
+        true, input_file, cpp_src, include_dir, num_cuda_include_dirs, cuda_include_dirs, debug, false, context, false
+    );
 
     if (!module) {
         return -1;
@@ -645,10 +969,31 @@ WP_API int wp_compile_cuda(
 static llvm::orc::LLJIT* jit_default = nullptr;
 static llvm::orc::LLJIT* jit_legacy = nullptr;
 
+// Protect lazy JIT creation and all access to their JITDylib registries.
+// ctypes releases the GIL around native calls, so parallel Module.load()
+// operations can enter wp_load_obj() concurrently. Serializing only these
+// native registry operations keeps module compilation parallel while ensuring
+// every successfully loaded module remains reachable for lookup and unloading.
+static std::mutex jit_mutex;
+
+// JIT-compiled cooperative kernels execute against the CPU block runtime in
+// the core Warp library. Python installs this table after loading both shared
+// libraries and before loading any CPU object files.
+static wp_cpu_block_runtime_api cpu_block_runtime = {};
+
+WP_API int wp_llvm_set_cpu_block_runtime(const wp_cpu_block_runtime_api* api)
+{
+    if (!api || !api->get_thread_idx || !api->get_active_count || !api->get_first_active_lane || !api->tile_sync
+        || !api->run_block)
+        return 0;
+
+    std::lock_guard<std::mutex> lock(jit_mutex);
+    cpu_block_runtime = *api;
+    return 1;
+}
+
 // Return the JIT instance for the given linker mode, creating it if needed.
-// Note: not thread-safe.  The caller (wp_load_obj) is serialized by Python's
-// Module._compile / Module.load, but if parallel loading is ever introduced at
-// the C++ level a mutex would be needed here.
+// The caller must hold jit_mutex.
 static llvm::orc::LLJIT* get_or_create_jit(bool use_legacy_linker)
 {
     if (use_legacy_linker && jit_legacy)
@@ -673,7 +1018,16 @@ static llvm::orc::LLJIT* get_or_create_jit(bool use_legacy_linker)
 #else
                 auto get_memory_manager = []() {
 #endif
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+                    // Keep code and data in one allocation so ADRP+ADD references
+                    // remain within ±4 GiB. RTDyld's COFF ARM64 relocator neither
+                    // range-checks nor creates stubs for page-relative relocations.
+                    return std::make_unique<llvm::SectionMemoryManager>(
+                        /*MM=*/nullptr, /*ReserveAllocationSpace=*/true
+                    );
+#else
                     return std::make_unique<llvm::SectionMemoryManager>();
+#endif
                 };
                 auto layer
                     = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(session, std::move(get_memory_manager));
@@ -696,8 +1050,28 @@ static llvm::orc::LLJIT* get_or_create_jit(bool use_legacy_linker)
                 -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
                 auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
 
+                // Register debug-object plugin for GDB/LLDB JIT debugging support.
                 if (WP_ENABLE_DEBUG) {
-                    // Register debug-object plugin for GDB/LLDB JIT debugging support.
+#if LLVM_VERSION_MAJOR >= 22
+                    // LLVM 22 replaced DebugObjectManagerPlugin + createJITLoaderGDBRegistrar
+                    // with ELFDebugObjectPlugin, which resolves the GDB registration action
+                    // internally and reports failure through an Error out-parameter.
+                    llvm::Error err = llvm::Error::success();
+                    auto plugin = std::make_shared<llvm::orc::ELFDebugObjectPlugin>(
+                        session, /*RequireDebugSections=*/true, /*AutoRegisterCode=*/true, err
+                    );
+                    if (!err) {
+                        layer->addPlugin(std::move(plugin));
+                    } else {
+                        llvm::consumeError(std::move(err));
+                        std::cout << "Warp notice: JIT debug support is not available with "
+                                     "this LLVM build. Step-through debugging of CPU kernels "
+                                     "requires building Warp with --build-llvm, or setting "
+                                     "wp.config.legacy_cpu_linker = True to use the legacy "
+                                     "RTDyld linker."
+                                  << std::endl;
+                    }
+#else
                     auto registrar = llvm::orc::createJITLoaderGDBRegistrar(session);
                     if (registrar) {
 #if LLVM_VERSION_MAJOR >= 21
@@ -720,6 +1094,7 @@ static llvm::orc::LLJIT* get_or_create_jit(bool use_legacy_linker)
                                      "RTDyld linker."
                                   << std::endl;
                     }
+#endif
                 }
 
                 return layer;
@@ -757,7 +1132,7 @@ static llvm::orc::LLJIT* find_jit_for_module(const char* module_name)
 // the sanitizer runtime (there must be a single in-process copy and shadow
 // memory). This gates both the reported sanitizer (wp_warp_clang_sanitizer) and
 // the process-symbol generator that resolves a kernel's __asan_* callbacks
-// (wp_load_obj).
+// (load_obj_buffer).
 static bool warp_clang_is_asan_build()
 {
 #if defined(__SANITIZE_ADDRESS__)
@@ -770,14 +1145,24 @@ static bool warp_clang_is_asan_build()
     return false;
 }
 
-// Load an object file into an in-memory DLL named `module_name`.
+// Add an object to a new in-memory DLL named `module_name`.
 // When `use_legacy_linker` is true, the legacy RTDyld linker is used instead
 // of JITLink; this provides debug support with pre-built LLVM but is less
 // robust against virtual address space fragmentation.
 // Debug support (GDB/LLDB step-through) is enabled automatically in debug
 // builds (WP_ENABLE_DEBUG=1).
-WP_API int wp_load_obj(const char* object_file, const char* module_name, bool use_legacy_linker)
+static int load_obj_buffer(std::unique_ptr<llvm::MemoryBuffer> buffer, const char* module_name, bool use_legacy_linker)
 {
+    // Windows ARM64 COFF objects require RTDyld.
+    use_legacy_linker = use_legacy_linker || force_legacy_cpu_linker;
+
+    std::lock_guard<std::mutex> lock(jit_mutex);
+
+    if (!cpu_block_runtime.run_block) {
+        std::cerr << "The Warp CPU block runtime has not been bound" << std::endl;
+        return -1;
+    }
+
     auto* jit = get_or_create_jit(use_legacy_linker);
     if (!jit)
         return -1;
@@ -801,18 +1186,27 @@ WP_API int wp_load_obj(const char* object_file, const char* module_name, bool us
 #if LLVM_VERSION_MAJOR >= 18
 #define SYMBOL(sym) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::orc::ExecutorAddr::fromPtr(&::sym), flags} }
 #define SYMBOL_T(sym, T) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::orc::ExecutorAddr::fromPtr(static_cast<T>(&::sym)), flags} }
+#define SYMBOL_PTR(sym, ptr) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::orc::ExecutorAddr::fromPtr(ptr), flags} }
 
         auto error = dll->define(llvm::orc::absoluteSymbols(llvm::orc::SymbolMap({
 #else
 #define SYMBOL(sym) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::pointerToJITTargetAddress(&::sym), flags} }
 #define SYMBOL_T(sym, T) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::pointerToJITTargetAddress(static_cast<T>(&::sym)), flags} }
+#define SYMBOL_PTR(sym, ptr) { jit->getExecutionSession().intern(MANGLING_PREFIX #sym), { llvm::pointerToJITTargetAddress(ptr), flags} }
 
         auto error = dll->define(llvm::orc::absoluteSymbols({
 #endif
+            // Keep this table function-only on Windows ARM64. RTDyld can create
+            // long-branch stubs for calls into warp-clang.dll, but not for
+            // page-relative data references. Do not add data symbols here.
             SYMBOL(printf), SYMBOL(puts), SYMBOL(putchar), SYMBOL_T(abs, int (*)(int)), SYMBOL(llabs), SYMBOL(fmodf),
                 SYMBOL_T(fmod, double (*)(double, double)), SYMBOL(logf), SYMBOL_T(log, double (*)(double)),
                 SYMBOL(log2f), SYMBOL_T(log2, double (*)(double)), SYMBOL(log10f), SYMBOL_T(log10, double (*)(double)),
-                SYMBOL(expf), SYMBOL_T(exp, double (*)(double)), SYMBOL(sqrtf), SYMBOL_T(sqrt, double (*)(double)),
+                SYMBOL(expf), SYMBOL_T(exp, double (*)(double)),
+                // LLVM may simplify power-of-two pow calls to exp2, then simplify exp2 with an integer-valued
+                // exponent to ldexp. The JIT must resolve both libcall families (GH-1562).
+                SYMBOL(exp2f), SYMBOL_T(exp2, double (*)(double)), SYMBOL(ldexpf),
+                SYMBOL_T(ldexp, double (*)(double, int)), SYMBOL(sqrtf), SYMBOL_T(sqrt, double (*)(double)),
                 SYMBOL(cbrtf), SYMBOL_T(cbrt, double (*)(double)), SYMBOL(powf),
                 SYMBOL_T(pow, double (*)(double, double)), SYMBOL(floorf), SYMBOL_T(floor, double (*)(double)),
                 SYMBOL(ceilf), SYMBOL_T(ceil, double (*)(double)), SYMBOL(fabsf), SYMBOL_T(fabs, double (*)(double)),
@@ -826,8 +1220,13 @@ WP_API int wp_load_obj(const char* object_file, const char* module_name, bool us
                 SYMBOL(fmaf), SYMBOL_T(fma, double (*)(double, double, double)), SYMBOL(erff),
                 SYMBOL_T(erf, double (*)(double)), SYMBOL(erfcf), SYMBOL_T(erfc, double (*)(double)), SYMBOL(erfinvf),
                 SYMBOL_T(erfinv, double (*)(double)), SYMBOL(erfcinvf), SYMBOL_T(erfcinv, double (*)(double)),
-                SYMBOL(memcpy), SYMBOL(memset), SYMBOL(memmove), SYMBOL(_wp_assert), SYMBOL(_wp_isfinite),
-                SYMBOL(_wp_isnan), SYMBOL(_wp_isinf),
+                SYMBOL(memcpy), SYMBOL(memset), SYMBOL(memmove), SYMBOL(malloc), SYMBOL(calloc), SYMBOL(free),
+                SYMBOL(_wp_assert), SYMBOL(_wp_isfinite), SYMBOL(_wp_isnan), SYMBOL(_wp_isinf),
+                SYMBOL_PTR(wp_cpu_get_thread_idx, cpu_block_runtime.get_thread_idx),
+                SYMBOL_PTR(wp_cpu_get_active_count, cpu_block_runtime.get_active_count),
+                SYMBOL_PTR(wp_cpu_get_first_active_lane, cpu_block_runtime.get_first_active_lane),
+                SYMBOL_PTR(wp_cpu_tile_sync, cpu_block_runtime.tile_sync),
+                SYMBOL_PTR(wp_cpu_run_block, cpu_block_runtime.run_block),
 #if defined(_WIN64)
                 // For functions with large stack frames the compiler will emit a call to
                 // __chkstk() to linearly touch each memory page. This grows the stack without
@@ -888,24 +1287,49 @@ WP_API int wp_load_obj(const char* object_file, const char* module_name, bool us
         (*dll).addGenerator(std::move(*generator));
     }
 
-    // Load the object file into a memory buffer
-    auto buffer = llvm::MemoryBuffer::getFile(object_file);
-    if (!buffer) {
-        std::cerr << "Failed to load object file: " << buffer.getError().message() << std::endl;
-        return -1;
-    }
-
-    auto err = jit->addObjectFile(*dll, std::move(*buffer));
+    auto err = jit->addObjectFile(*dll, std::move(buffer));
     if (err) {
         std::cerr << "Failed to add object file: " << llvm::toString(std::move(err)) << std::endl;
+        // Remove the empty DLL after addObjectFile fails.
+        if (auto remove_err = jit->getExecutionSession().removeJITDylib(*dll))
+            llvm::consumeError(std::move(remove_err));
         return -1;
     }
 
     return 0;
 }
 
+WP_API int wp_load_obj(const char* object_file, const char* module_name, bool use_legacy_linker)
+{
+    if (!object_file || !module_name) {
+        std::cerr << "Failed to load object: null path or module name" << std::endl;
+        return -1;
+    }
+    auto buffer = llvm::MemoryBuffer::getFile(object_file);
+    if (!buffer) {
+        std::cerr << "Failed to load object file: " << buffer.getError().message() << std::endl;
+        return -1;
+    }
+    return load_obj_buffer(std::move(*buffer), module_name, use_legacy_linker);
+}
+
+WP_API int wp_load_obj_from_bytes(const void* data, size_t size, const char* module_name, bool use_legacy_linker)
+{
+    if (!data || !module_name) {
+        std::cerr << "Failed to load object: null data or module name" << std::endl;
+        return -1;
+    }
+    // Copy the object, because the JIT links it lazily on the first symbol
+    // lookup, which can happen after the caller has released its buffer.
+    auto buffer
+        = llvm::MemoryBuffer::getMemBufferCopy(llvm::StringRef(static_cast<const char*>(data), size), module_name);
+    return load_obj_buffer(std::move(buffer), module_name, use_legacy_linker);
+}
+
 WP_API int wp_unload_obj(const char* module_name)
 {
+    std::lock_guard<std::mutex> lock(jit_mutex);
+
     auto* jit = find_jit_for_module(module_name);
     if (!jit)
         return 0;
@@ -923,6 +1347,8 @@ WP_API int wp_unload_obj(const char* module_name)
 
 WP_API uint64_t wp_lookup(const char* dll_name, const char* function_name)
 {
+    std::lock_guard<std::mutex> lock(jit_mutex);
+
     auto* jit = find_jit_for_module(dll_name);
     if (!jit) {
         std::cerr << "Failed to find module: " << dll_name << std::endl;
@@ -956,6 +1382,8 @@ WP_API const char* wp_llvm_version()
     snprintf(version, sizeof(version), "%d.%d.%d", LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR, LLVM_VERSION_PATCH);
     return version;
 }
+
+WP_API const char* wp_get_cpu_target_triple() { return target_triple; }
 
 WP_API const char* wp_get_host_cpu_name() { return get_host_cpu_info().name.c_str(); }
 

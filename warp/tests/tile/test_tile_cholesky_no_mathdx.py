@@ -6,7 +6,7 @@
 Setting ``enable_mathdx_solver=False`` at module scope routes
 ``tile_cholesky`` and ``tile_cholesky_inplace`` (and after Stage 4, the
 Cholesky adjoint) through the cooperative scalar implementation in
-``tile_cholesky.h`` on GPU (or the CPU sequential branch on CPU),
+``tile_cholesky.h`` on GPU and cooperative CPU blocks,
 exercising the path that runs whenever Warp is built without libmathdx or
 when a user disables the option per-module.
 
@@ -255,15 +255,31 @@ def test_cholesky_lower_backward_n32(test, device):
     assert_np_equal(np.triu(grad_A, k=1), np.zeros((N32, N32)), tol=0.0)
 
 
-# block_dim == 1 GPU smoke: thread-strided loops collapse to sequential, but
-# the GPU codegen path must still compile and run correctly.
+# This kernel lives in its own module so that the block_dim == 1 launch
+# specializes only it instead of recompiling every kernel in this module,
+# including the unrelated N=32 Cholesky adjoint. The module-scope
+# enable_mathdx_solver option does not carry over to a unique module, so it is
+# repeated here. The launch is always a single block, so the grid-stride
+# wrapper is not needed either.
+@wp.kernel(enable_backward=False, grid_stride=False, module="unique", module_options={"enable_mathdx_solver": False})
+def tile_cholesky_lower_isolated_kernel(gA: wp.array2d[wp.float64], gL: wp.array2d[wp.float64]):
+    A = wp.tile_load(gA, shape=(N, N))
+    L = wp.tile_cholesky(A)
+    wp.tile_store(gL, L)
+
+
 def test_cholesky_lower_block_dim_1(test, device):
+    """Check the lower Cholesky factorization with a single-thread block.
+
+    At ``block_dim == 1`` the thread-strided loops collapse to sequential, but
+    the codegen path must still compile and run correctly on every device.
+    """
     A_np, L_ref = _spd(N, seed=42)
 
     A = wp.array(A_np, dtype=wp.float64, device=device)
     L = wp.zeros((N, N), dtype=wp.float64, device=device)
 
-    wp.launch_tiled(tile_cholesky_lower_kernel, dim=[1], inputs=[A, L], block_dim=1, device=device)
+    wp.launch_tiled(tile_cholesky_lower_isolated_kernel, dim=[1], inputs=[A, L], block_dim=1, device=device)
     assert_np_equal(L.numpy(), L_ref, tol=1e-10)
 
 
@@ -278,7 +294,7 @@ class TestTileCholeskyNoMathDx(unittest.TestCase):
 
 _devices = get_test_devices()
 
-for name, func in [
+cholesky_tests = [
     ("test_cholesky_lower", test_cholesky_lower),
     ("test_cholesky_lower_inplace", test_cholesky_lower_inplace),
     ("test_cholesky_upper", test_cholesky_upper),
@@ -287,8 +303,22 @@ for name, func in [
     ("test_cholesky_upper_backward", test_cholesky_upper_backward),
     ("test_cholesky_lower_backward_n32", test_cholesky_lower_backward_n32),
     ("test_cholesky_lower_block_dim_1", test_cholesky_lower_block_dim_1),
-]:
+]
+
+for name, func in cholesky_tests:
     add_function_test(TestTileCholeskyNoMathDx, name, func, devices=_devices, check_output=False)
+
+for name, func in cholesky_tests:
+    if name.endswith("block_dim_1"):
+        continue
+    add_function_test(
+        TestTileCholeskyNoMathDx,
+        f"{name}_cpu_blocks",
+        func,
+        devices=get_cpu_test_devices(),
+        check_output=False,
+        enable_cpu_blocks=True,
+    )
 
 
 if __name__ == "__main__":

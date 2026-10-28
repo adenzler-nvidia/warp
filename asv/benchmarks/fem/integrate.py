@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import inspect
 
@@ -20,6 +8,8 @@ import warp._src.fem.integrate as fem_integrate_mod
 import warp.fem as fem
 import warp.sparse as wps
 from warp.examples.fem.utils import gen_tetmesh
+
+from ..benchmarks_utils import setup_once
 
 # ruff: noqa: RUF059
 
@@ -133,6 +123,17 @@ def _triplet_bsr_options():
     return {"construction": "triplets"}
 
 
+def _mapped_bsr_options(atomic: bool):
+    if hasattr(fem_integrate_mod, "_BSR_CONSTRUCTION_MAPPED"):
+        construction = "mapped_atomic" if atomic else "mapped"
+        return {"construction": construction}
+
+    # ASV evaluates this benchmark definition against the comparison commit,
+    # which predates mapped BSR construction. Use its equivalent triplet path
+    # there so the comparison remains runnable.
+    return _triplet_bsr_options()
+
+
 def _make_corotated_hessian_integrator(space: fem.FunctionSpace, assembly: str):
     u = fem.make_trial(space)
     v = fem.make_test(space)
@@ -177,21 +178,30 @@ class FemCorotatedElasticity:
 
         quadrature = fem.RegularQuadrature(v.domain, order=2 * u_cur.degree)
 
-        compressed_hessian_fn = None
-        self._compressed_hessian_output = None
+        reused_hessian_fn = None
+        self._reused_hessian_output = None
         if fn == "hessian_compressed":
             _require_padded_bsr_assembly()
             hessian_bsr_options = {"topology": "padded", "construction": "row_compress"}
             hessian_bsr_reuse_options = {**hessian_bsr_options, "capacity": "reuse"}
-            self._compressed_hessian_output = integrate_hessian(bsr_options=hessian_bsr_options)
+            self._reused_hessian_output = integrate_hessian(bsr_options=hessian_bsr_options)
 
-            if self._compressed_hessian_output.status_sync() != 0:
+            if self._reused_hessian_output.status_sync() != 0:
                 raise RuntimeError("Padded FEM Hessian assembly exceeded row capacity")
 
             def integrate_compressed_hessian():
-                return integrate_hessian(output=self._compressed_hessian_output, bsr_options=hessian_bsr_reuse_options)
+                return integrate_hessian(output=self._reused_hessian_output, bsr_options=hessian_bsr_reuse_options)
 
-            compressed_hessian_fn = integrate_compressed_hessian
+            reused_hessian_fn = integrate_compressed_hessian
+        elif fn in ("hessian_mapped", "hessian_mapped_atomic"):
+            hessian_bsr_options = _mapped_bsr_options(atomic=fn == "hessian_mapped_atomic")
+            hessian_bsr_reuse_options = {**hessian_bsr_options, "capacity": "reuse"}
+            self._reused_hessian_output = integrate_hessian(bsr_options=hessian_bsr_options)
+
+            def integrate_mapped_hessian():
+                return integrate_hessian(output=self._reused_hessian_output, bsr_options=hessian_bsr_reuse_options)
+
+            reused_hessian_fn = integrate_mapped_hessian
 
         self._integrate_funcs = {
             "energy": lambda: fem.integrate(
@@ -212,12 +222,12 @@ class FemCorotatedElasticity:
             ),
             "hessian": lambda: integrate_hessian(bsr_options=_triplet_bsr_options()),
         }
-        if compressed_hessian_fn is not None:
-            self._integrate_funcs["hessian_compressed"] = compressed_hessian_fn
+        if reused_hessian_fn is not None:
+            self._integrate_funcs[fn] = reused_hessian_fn
 
         integrate_fn = self._integrate_funcs[fn]
         integrate_fn()
-        if fn == "hessian_compressed" and self._compressed_hessian_output.status_sync() != 0:
+        if fn == "hessian_compressed" and self._reused_hessian_output.status_sync() != 0:
             raise RuntimeError("Padded FEM Hessian assembly exceeded row capacity")
 
         if self._use_graph:
@@ -310,7 +320,13 @@ class FemCorotatedElasticitySparseAssembly:
 
     repeat = 5
     number = 10
-    pool_size = 64
+    warmup_time = 0
+    pool_size = repeat * number
+
+    def _refill_sparse_source_pool(self):
+        self._src_pool = [_make_raw_bsr_copy(self._capture) for _ in range(self.pool_size)]
+        self._src_index = 0
+        wp.synchronize_device(self.device)
 
     def make_sparse_assembly_func(self, space: fem.FunctionSpace, fn: str, assembly: str):
         integrate_hessian = _make_corotated_hessian_integrator(space, assembly)
@@ -327,7 +343,13 @@ class FemCorotatedElasticitySparseAssembly:
         self._src_index = 0
         self._src_pool = []
         if self._capture.kind == "compress":
-            self._src_pool = [_make_raw_bsr_copy(self._capture) for _ in range(self.pool_size)]
+            self._refill_sparse_source_pool()
+
+    def _prepare_sparse_source(self):
+        if self._capture.kind != "compress" or self._src_index < len(self._src_pool):
+            return
+
+        self._refill_sparse_source_pool()
 
     def _run_impl(self):
         capture = self._capture
@@ -336,8 +358,8 @@ class FemCorotatedElasticitySparseAssembly:
             if _bsr_status_failed(capture.dest):
                 raise RuntimeError("FEM sparse assembly exceeded row capacity")
         else:
-            if self._src_index == len(self._src_pool):
-                self._src_pool.append(_make_raw_bsr_copy(capture))
+            if self._src_index >= len(self._src_pool):
+                raise RuntimeError("FEM sparse assembly source pool exhausted before setup")
 
             src = self._src_pool[self._src_index]
             self._src_index += 1
@@ -357,6 +379,7 @@ class FemCorotatedElasticityQuadraticTetmesh(FemCorotatedElasticity):
     params = (["energy", "forces", "hessian", "hessian_compressed"], ["dispatch"])
     param_names = ["fn", "assembly"]
 
+    @setup_once
     def setup(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
@@ -378,9 +401,13 @@ class FemCorotatedElasticityLinearGrid(FemCorotatedElasticity):
     repeat = 5
     number = 15
 
-    params = (["energy", "forces", "hessian", "hessian_compressed"], ["generic", "dispatch"])
+    params = (
+        ["energy", "forces", "hessian", "hessian_compressed", "hessian_mapped", "hessian_mapped_atomic"],
+        ["generic", "dispatch"],
+    )
     param_names = ["fn", "assembly"]
 
+    @setup_once
     def setup(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
@@ -404,6 +431,7 @@ class FemCorotatedElasticityVeryHighOrder(FemCorotatedElasticity):
     params = (["energy", "forces", "hessian", "hessian_compressed"], ["dispatch"])
     param_names = ["fn", "assembly"]
 
+    @setup_once
     def setup(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
@@ -425,6 +453,11 @@ class FemCorotatedElasticitySparseAssemblyQuadraticTetmesh(FemCorotatedElasticit
     param_names = ["fn", "assembly"]
 
     def setup(self, fn: str, assembly: str):
+        self._initialize(fn, assembly)
+        self._prepare_sparse_source()
+
+    @setup_once
+    def _initialize(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
 
@@ -446,6 +479,11 @@ class FemCorotatedElasticitySparseAssemblyLinearGrid(FemCorotatedElasticitySpars
     param_names = ["fn", "assembly"]
 
     def setup(self, fn: str, assembly: str):
+        self._initialize(fn, assembly)
+        self._prepare_sparse_source()
+
+    @setup_once
+    def _initialize(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
 
@@ -466,6 +504,11 @@ class FemCorotatedElasticitySparseAssemblyVeryHighOrder(FemCorotatedElasticitySp
     param_names = ["fn", "assembly"]
 
     def setup(self, fn: str, assembly: str):
+        self._initialize(fn, assembly)
+        self._prepare_sparse_source()
+
+    @setup_once
+    def _initialize(self, fn: str, assembly: str):
         wp.init()
         self.device = wp.get_device("cuda:0")
 

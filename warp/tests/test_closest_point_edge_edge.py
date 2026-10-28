@@ -13,14 +13,14 @@ epsilon = 0.00001
 
 @wp.kernel
 def closest_point_edge_edge_kernel(
-    p1: wp.array(dtype=wp.vec3),
-    q1: wp.array(dtype=wp.vec3),
-    p2: wp.array(dtype=wp.vec3),
-    q2: wp.array(dtype=wp.vec3),
+    p1: wp.array[wp.vec3],
+    q1: wp.array[wp.vec3],
+    p2: wp.array[wp.vec3],
+    q2: wp.array[wp.vec3],
     epsilon: float,
-    st0: wp.array(dtype=wp.vec3),
-    c1: wp.array(dtype=wp.vec3),
-    c2: wp.array(dtype=wp.vec3),
+    st0: wp.array[wp.vec3],
+    c1: wp.array[wp.vec3],
+    c2: wp.array[wp.vec3],
 ):
     tid = wp.tid()
     st = wp.closest_point_edge_edge(p1[tid], q1[tid], p2[tid], q2[tid], epsilon)
@@ -71,10 +71,12 @@ def test_edge_edge_middle_crossing(test, device):
 
 
 def test_edge_edge_near_parallel_middle_crossing(test, device):
-    # Two unit segments crossing at their midpoints with sin^2(theta) just
-    # below the adjoint stability tolerance (1e-6). The forward must still
-    # find the intersection — the relative-tolerance gate is for the adjoint
-    # only, not for forward correctness.
+    """Verify the forward solve finds the midpoint intersection of two near-parallel segments.
+
+    The two unit segments cross at their midpoints with ``sin^2(theta)`` just below the adjoint stability tolerance
+    (1e-6). The forward must still find the intersection. The relative-tolerance gate is for the adjoint only, not for
+    forward correctness.
+    """
     p1_h = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
     q1_h = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
     p2_h = np.array([[0.0, -4.9e-4, 0.0]], dtype=np.float32)
@@ -136,8 +138,11 @@ def test_edge_edge_degenerate_first_edge(test, device):
 
 
 def test_edge_edge_degenerate_first_edge_projection_outside(test, device):
-    # Edge 1 is a point at x=10; edge 2 is the segment from x=0 to x=1.
-    # The projection lands at t=10 on the infinite line, which must clamp to 1.
+    """Clamp the projection parameter to 1 when a degenerate edge projects past the segment end.
+
+    Edge 1 is a point at x=10; edge 2 is the segment from x=0 to x=1. The projection lands at t=10 on the
+    infinite line, which must clamp to 1.
+    """
     p1_h = np.array([[10, 0, 0]])
     q1_h = np.array([[10, 0, 0]])
     p2_h = np.array([[0, 0, 0]])
@@ -199,12 +204,11 @@ def test_edge_edge_perpendicular_s0_t1(test, device):
 
 @wp.func
 def check_edge_closest_point_sufficient_necessary(c1: wp.vec3, c2: wp.vec3, t: float, p: wp.vec3, q: wp.vec3):
-    """
-    This is a sufficient and necessary condition of closest point
-    c1: closest point on the other edge
-    c2: closest point on edge p-q
-    t: c2 = (1.0-t) * p + t * q
-    e1, e2: end points of the edge
+    """Check a sufficient and necessary condition for the closest point.
+
+    ``c1`` is the closest point on the other edge, ``c2`` is the closest point
+    on edge ``p``-``q``, and ``t`` satisfies
+    ``c2 = (1.0 - t) * p + t * q``.
     """
     eps = 1e-5
     e = p - q
@@ -222,10 +226,10 @@ def check_edge_closest_point_sufficient_necessary(c1: wp.vec3, c2: wp.vec3, t: f
 
 @wp.kernel
 def check_edge_closest_point_sufficient_necessary_kernel(
-    p1s: wp.array(dtype=wp.vec3),
-    q1s: wp.array(dtype=wp.vec3),
-    p2s: wp.array(dtype=wp.vec3),
-    q2s: wp.array(dtype=wp.vec3),
+    p1s: wp.array[wp.vec3],
+    q1s: wp.array[wp.vec3],
+    p2s: wp.array[wp.vec3],
+    q2s: wp.array[wp.vec3],
     epsilon: float,
 ):
     tid = wp.tid()
@@ -286,12 +290,12 @@ def check_edge_closest_point_random(test, device):
 
 @wp.kernel
 def cpee_dist_kernel(
-    p1: wp.array(dtype=wp.vec3),
-    q1: wp.array(dtype=wp.vec3),
-    p2: wp.array(dtype=wp.vec3),
-    q2: wp.array(dtype=wp.vec3),
+    p1: wp.array[wp.vec3],
+    q1: wp.array[wp.vec3],
+    p2: wp.array[wp.vec3],
+    q2: wp.array[wp.vec3],
     eps: float,
-    dist: wp.array(dtype=float),
+    dist: wp.array[float],
 ):
     tid = wp.tid()
     out = wp.closest_point_edge_edge(p1[tid], q1[tid], p2[tid], q2[tid], eps)
@@ -347,8 +351,9 @@ def _fd_dist_grads(p1_np, q1_np, p2_np, q2_np, device, h=1e-3):
 
 
 def _well_conditioned_mask(p1, q1, p2, q2):
-    """Accept inputs that fall *firmly inside* one of the smooth branches
-    (D, E, or F) of the forward function. Rejects:
+    """Accept inputs firmly inside a smooth forward-function branch.
+
+    Accept branches D, E, or F. Reject:
       - degenerate edges (epsilon branches)
       - near-parallel edges (boundary between D and D_DEGEN)
       - inputs near a clamp boundary or t-correction boundary, where finite
@@ -395,8 +400,11 @@ def _well_conditioned_mask(p1, q1, p2, q2):
 
 
 def test_edge_edge_grad_finite_difference(test, device):
-    """Analytic gradients of dist match central finite differences across all
-    forward branches at well-conditioned inputs (away from boundary transitions)."""
+    """Match analytic edge-distance gradients against finite differences.
+
+    Cover all forward branches at well-conditioned inputs away from boundary
+    transitions.
+    """
     rng = np.random.default_rng(2024)
     n = 500
     p1 = rng.standard_normal((n, 3)).astype(np.float32)
@@ -417,10 +425,11 @@ def test_edge_edge_grad_finite_difference(test, device):
 
 
 def test_edge_edge_grad_bounded_near_parallel(test, device):
-    """At near-parallel edges, the analytic gradient must remain finite and
-    physically bounded. The previous codegen'd adjoint produced gradients up
-    to ~1e6 here because it divided by a denom near machine epsilon; the
-    cross-product formulation keeps the chain rule well-conditioned.
+    """Keep near-parallel edge gradients finite and physically bounded.
+
+    The previous generated adjoint produced gradients up to ~1e6 because it
+    divided by a denominator near machine epsilon. The cross-product formulation
+    keeps the chain rule well-conditioned.
 
     Sampling: log-uniform sin θ ∈ [1e-7, 1e-2] covers both the parallel
     branch (sin θ < sqrt(REL_PARALLEL_TOL) ≈ 1e-3) and the near-threshold

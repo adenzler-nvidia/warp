@@ -11,8 +11,6 @@ from warp._src.fem.types import cached_coords_type
 
 from .shape_function import ShapeFunction
 
-_wp_module_name_ = "warp.fem.space.shape.triangle_shape_function"
-
 
 def _triangle_node_index(tx: int, ty: int, degree: int):
     VERTEX_NODE_COUNT = 3
@@ -346,6 +344,9 @@ class TrianglePolynomialShapeFunctions(TriangleShapeFunction):
 
         return None
 
+    def make_node_dual_weight(self):
+        return self._make_unit_node_dual_weight()
+
     def element_node_triangulation(self):
         if self.ORDER == 1:
             element_triangles = [[0, 1, 2]]
@@ -509,6 +510,9 @@ class TriangleNonConformingPolynomialShapeFunctions(ShapeFunction):
 
         return element_inner_weight_gradient
 
+    def make_node_dual_weight(self):
+        return self._make_unit_node_dual_weight()
+
 
 class TriangleNedelecFirstKindShapeFunctions(TriangleShapeFunction):
     """Nédélec first-kind (edge) shape functions on triangular elements for H(curl) spaces."""
@@ -623,6 +627,17 @@ class TriangleNedelecFirstKindShapeFunctions(TriangleShapeFunction):
 
         return None
 
+    def make_node_dual_weight(self):
+        vec2_type = wp.types.vector(length=2, dtype=self.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def node_edge_tangent(node_index_in_elt: int):
+            p0 = vec2_type(self._vertex_coords(node_index_in_elt))
+            p1 = vec2_type(self._vertex_coords((node_index_in_elt + 1) % 3))
+            return p1 - p0
+
+        return self._make_normalized_node_dual_weight(node_edge_tangent)
+
 
 class TriangleRaviartThomasShapeFunctions(TriangleShapeFunction):
     """Raviart-Thomas (face) shape functions on triangular elements for H(div) spaces."""
@@ -727,3 +742,15 @@ class TriangleRaviartThomasShapeFunctions(TriangleShapeFunction):
             return cache.get_func(element_inner_weight_gradient_linear, self.name)
 
         return None
+
+    def make_node_dual_weight(self):
+        vec2_type = wp.types.vector(length=2, dtype=self.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def node_edge_normal(node_index_in_elt: int):
+            p0 = vec2_type(self._vertex_coords(node_index_in_elt))
+            p1 = vec2_type(self._vertex_coords((node_index_in_elt + 1) % 3))
+            t = p1 - p0
+            return vec2_type(-t[1], t[0])
+
+        return self._make_normalized_node_dual_weight(node_edge_normal)

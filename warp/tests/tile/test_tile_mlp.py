@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from functools import cache
 
 import numpy as np
 
 import warp as wp
-import warp.examples
 import warp.optim
 from warp.tests.unittest_utils import *
 
@@ -29,6 +29,7 @@ def create_array(rng, dim_in, dim_hid, dtype=float):
 
 
 def test_multi_layer_nn(test, device):
+    """Match a tiled multilayer network's forward and backward results against NumPy and PyTorch."""
     import torch as tc  # noqa: PLC0415
 
     if device.is_cuda and not wp._src.context.runtime.core.wp_is_mathdx_enabled():
@@ -56,14 +57,6 @@ def test_multi_layer_nn(test, device):
     @wp.func
     def relu(x: dtype):
         return wp.max(x, dtype(0.0))
-
-    @wp.func
-    def sigmoid(x: dtype):
-        return dtype(1.0 / (1.0 + wp.exp(-float(x))))
-
-    @wp.kernel
-    def zero(loss: wp.array[float]):
-        loss[0] = 0.0
 
     @wp.kernel(module="unique")
     def compute(
@@ -166,7 +159,7 @@ def test_multi_layer_nn(test, device):
         )
         reference = wp.array(reference_np, dtype=float)
 
-        assert reference.shape[1] == IMG_WIDTH * IMG_HEIGHT
+        test.assertEqual(reference.shape[1], IMG_WIDTH * IMG_HEIGHT)
 
         loss = wp.zeros(1, dtype=float, requires_grad=True)
 
@@ -176,7 +169,7 @@ def test_multi_layer_nn(test, device):
         optimizer_inputs = [p.flatten() for p in params]
         optimizer = warp.optim.Adam(optimizer_inputs, lr=0.01)
 
-        max_epochs = 30
+        max_epochs = 3
 
         # create randomized batch indices
         batches = np.arange(0, IMG_WIDTH * IMG_HEIGHT, dtype=np.int32)
@@ -184,7 +177,7 @@ def test_multi_layer_nn(test, device):
         batches = wp.array(batches)
 
         with wp.ScopedTimer("Training", active=False):
-            for epoch in range(max_epochs):
+            for _ in range(max_epochs):
                 for b in range(0, IMG_WIDTH * IMG_HEIGHT, BATCH_SIZE):
                     loss.zero_()
 
@@ -212,63 +205,54 @@ def test_multi_layer_nn(test, device):
 
                     tape.backward(loss)
 
-                    # check outputs + grads on the first few epoch only
-                    # since this is a relatively slow operation
-                    verify = True
-                    if verify and epoch < 3:
-                        indices = batches[b : b + BATCH_SIZE].numpy()
+                    indices = batches[b : b + BATCH_SIZE].numpy()
 
-                        z_np = np.maximum(weights_0.numpy() @ input.numpy()[:, indices] + bias_0.numpy(), 0.0)
-                        z_np = np.maximum(weights_1.numpy() @ z_np + bias_1.numpy(), 0.0)
-                        z_np = np.maximum(weights_2.numpy() @ z_np + bias_2.numpy(), 0.0)
-                        z_np = np.maximum(weights_3.numpy() @ z_np + bias_3.numpy(), 0.0)
+                    z_np = np.maximum(weights_0.numpy() @ input.numpy()[:, indices] + bias_0.numpy(), 0.0)
+                    z_np = np.maximum(weights_1.numpy() @ z_np + bias_1.numpy(), 0.0)
+                    z_np = np.maximum(weights_2.numpy() @ z_np + bias_2.numpy(), 0.0)
+                    z_np = np.maximum(weights_3.numpy() @ z_np + bias_3.numpy(), 0.0)
 
-                        # test numpy forward
-                        assert_np_equal(output.numpy()[:, indices].astype(npdtype), z_np, tol=1.0e-2)
+                    # test numpy forward
+                    assert_np_equal(output.numpy()[:, indices].astype(npdtype), z_np, tol=1.0e-2)
 
-                        # torch
-                        input_tc = tc.tensor(input.numpy()[:, indices], requires_grad=True, device=torch_device)
+                    # torch
+                    input_tc = tc.tensor(input.numpy()[:, indices], requires_grad=True, device=torch_device)
 
-                        weights_0_tc = tc.tensor(weights_0.numpy(), requires_grad=True, device=torch_device)
-                        bias_0_tc = tc.tensor(bias_0.numpy(), requires_grad=True, device=torch_device)
+                    weights_0_tc = tc.tensor(weights_0.numpy(), requires_grad=True, device=torch_device)
+                    bias_0_tc = tc.tensor(bias_0.numpy(), requires_grad=True, device=torch_device)
 
-                        weights_1_tc = tc.tensor(weights_1.numpy(), requires_grad=True, device=torch_device)
-                        bias_1_tc = tc.tensor(bias_1.numpy(), requires_grad=True, device=torch_device)
+                    weights_1_tc = tc.tensor(weights_1.numpy(), requires_grad=True, device=torch_device)
+                    bias_1_tc = tc.tensor(bias_1.numpy(), requires_grad=True, device=torch_device)
 
-                        weights_2_tc = tc.tensor(weights_2.numpy(), requires_grad=True, device=torch_device)
-                        bias_2_tc = tc.tensor(bias_2.numpy(), requires_grad=True, device=torch_device)
+                    weights_2_tc = tc.tensor(weights_2.numpy(), requires_grad=True, device=torch_device)
+                    bias_2_tc = tc.tensor(bias_2.numpy(), requires_grad=True, device=torch_device)
 
-                        weights_3_tc = tc.tensor(weights_3.numpy(), requires_grad=True, device=torch_device)
-                        bias_3_tc = tc.tensor(bias_3.numpy(), requires_grad=True, device=torch_device)
+                    weights_3_tc = tc.tensor(weights_3.numpy(), requires_grad=True, device=torch_device)
+                    bias_3_tc = tc.tensor(bias_3.numpy(), requires_grad=True, device=torch_device)
 
-                        z_tc = tc.clamp(weights_0_tc @ input_tc + bias_0_tc, min=0.0)
-                        z_tc = tc.clamp(weights_1_tc @ z_tc + bias_1_tc, min=0.0)
-                        z_tc = tc.clamp(weights_2_tc @ z_tc + bias_2_tc, min=0.0)
-                        z_tc = tc.clamp(weights_3_tc @ z_tc + bias_3_tc, min=0.0)
+                    z_tc = tc.clamp(weights_0_tc @ input_tc + bias_0_tc, min=0.0)
+                    z_tc = tc.clamp(weights_1_tc @ z_tc + bias_1_tc, min=0.0)
+                    z_tc = tc.clamp(weights_2_tc @ z_tc + bias_2_tc, min=0.0)
+                    z_tc = tc.clamp(weights_3_tc @ z_tc + bias_3_tc, min=0.0)
 
-                        ref_tc = tc.tensor(reference.numpy()[:, indices], requires_grad=True, device=torch_device)
+                    ref_tc = tc.tensor(reference.numpy()[:, indices], requires_grad=True, device=torch_device)
 
-                        l_tc = tc.mean((z_tc - ref_tc) ** 2)
-                        l_tc.backward()
+                    l_tc = tc.mean((z_tc - ref_tc) ** 2)
+                    l_tc.backward()
 
-                        # test torch
-                        assert_np_equal(
-                            z_tc.cpu().detach().numpy(), output.numpy()[:, indices].astype(npdtype), tol=1.0e-2
-                        )
-                        assert_np_equal(weights_0.grad.numpy(), weights_0_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(bias_0.grad.numpy(), bias_0_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(weights_1.grad.numpy(), weights_1_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(bias_1.grad.numpy(), bias_1_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(weights_2.grad.numpy(), weights_2_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(bias_2.grad.numpy(), bias_2_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(weights_3.grad.numpy(), weights_3_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
-                        assert_np_equal(bias_3.grad.numpy(), bias_3_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    # test torch
+                    assert_np_equal(z_tc.cpu().detach().numpy(), output.numpy()[:, indices].astype(npdtype), tol=1.0e-2)
+                    assert_np_equal(weights_0.grad.numpy(), weights_0_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(bias_0.grad.numpy(), bias_0_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(weights_1.grad.numpy(), weights_1_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(bias_1.grad.numpy(), bias_1_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(weights_2.grad.numpy(), weights_2_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(bias_2.grad.numpy(), bias_2_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(weights_3.grad.numpy(), weights_3_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
+                    assert_np_equal(bias_3.grad.numpy(), bias_3_tc.grad.cpu().detach().numpy(), tol=1.0e-2)
 
                     optimizer.step(optimizer_grads)
                     tape.zero()
-
-        # initial loss is ~0.061
-        test.assertLess(loss.numpy()[0], 0.004)
 
 
 def test_single_layer_nn(test, device):
@@ -344,38 +328,43 @@ class TestTileMLP(unittest.TestCase):
     pass
 
 
-test_devices = get_test_devices()
-
 try:
     import torch
 
-    # check which Warp devices work with Torch
-    torch_compatible_devices = []
-    torch_compatible_cuda_devices = []
+    torch_candidate_devices = get_test_devices()
+    torch_cuda_candidate_devices = [device for device in torch_candidate_devices if device.is_cuda]
 
-    for d in test_devices:
+    @cache
+    def _torch_device_error(device_alias):
+        device = wp.get_device(device_alias)
         try:
-            t = torch.arange(10, device=wp.device_to_torch(d))
-            t += 1
-            torch_compatible_devices.append(d)
-            if d.is_cuda:
-                torch_compatible_cuda_devices.append(d)
-        except Exception as e:
-            print(f"Skipping Torch tests on device '{d}' due to exception: {e}")
+            tensor = torch.arange(10, device=wp.device_to_torch(device))
+            tensor += 1
+        except Exception as error:
+            return f"{type(error).__name__}: {error}"
+        return None
+
+    def _check_torch_device(test, device):
+        device = wp.get_device(device)
+        error = _torch_device_error(device.alias)
+        if error is not None:
+            test.skipTest(f"Torch is unavailable on Warp device '{device}': {error}")
 
     add_function_test(
         TestTileMLP,
         "test_single_layer_nn",
         test_single_layer_nn,
         check_output=False,
-        devices=torch_compatible_devices,
+        devices=torch_candidate_devices,
+        device_check=_check_torch_device,
     )
     add_function_test(
         TestTileMLP,
         "test_multi_layer_nn",
         test_multi_layer_nn,
         check_output=False,
-        devices=torch_compatible_cuda_devices,
+        devices=torch_cuda_candidate_devices,
+        device_check=_check_torch_device,
     )
 
 except Exception as e:

@@ -64,6 +64,7 @@ support named allocator types.
 ```python
 from typing import Protocol, runtime_checkable
 
+
 @runtime_checkable
 class Allocator(Protocol):
     def allocate(self, size_in_bytes: int) -> int: ...
@@ -104,6 +105,7 @@ duplication of the validation logic and error message.
 # In Device.__init__, CUDA branch, after existing allocator setup:
 self._custom_allocator = None
 
+
 # Modified get_allocator():
 def get_allocator(self, pinned: bool = False):
     if self.is_cuda:
@@ -143,6 +145,7 @@ def set_cuda_allocator(allocator: Allocator | None) -> None:
     for device in devices:
         device._custom_allocator = allocator
 
+
 def set_device_allocator(device: DeviceLike, allocator: Allocator | None) -> None:
     """Set the memory allocator for a specific CUDA device."""
     device = get_device(device)
@@ -150,6 +153,7 @@ def set_device_allocator(device: DeviceLike, allocator: Allocator | None) -> Non
         raise RuntimeError("Custom allocators are only supported on CUDA devices")
     _validate_allocator(allocator)
     device._custom_allocator = allocator
+
 
 def get_device_allocator(device: DeviceLike) -> Allocator:
     """Get the current effective memory allocator for a device."""
@@ -216,26 +220,31 @@ internals into the allocator surface.
 
 Current limitation: `wp.can_access(device, array)` and
 `warp.config.launch_array_access_mode = wp.config.LaunchArrayAccessMode.CHECKED`
-remain conservative for arrays allocated through custom allocators.
+remain conservative for arrays allocated through custom allocators when Warp
+cannot classify the pointer or prove the relevant access state.
 Same-device launches are accepted, but cross-device launches require Warp to
 know whether the allocation uses default CUDA memory, CUDA memory pools,
-pinned host memory, managed memory, or another memory type. The current custom
-allocator protocol only returns a pointer, so cross-device arrays backed by
-custom or externally wrapped allocators warn once per launch pattern in checked
+pinned host memory, managed memory, or another memory type. CUDA pointer
+attributes can classify externally wrapped managed and ordinary CUDA device
+pointers so Warp can use managed-memory or peer-access predicates. The current
+custom allocator protocol still only returns a pointer, so unclassified
+pointers and externally wrapped or custom memory-pool pointers whose specific
+pool access state cannot be proven warn once per launch pattern in checked
 mode and then proceed. Using `wp.config.LaunchArrayAccessMode.RELAXED` leaves
 access legality to the hardware without the diagnostic, matching the default
 launch path.
 
-Future solutions must provide enough allocation provenance for
+Future solutions must provide enough memory-kind and access metadata for
 `wp.can_access(device, array)` and `wp.config.LaunchArrayAccessMode.CHECKED` to
 make the same conservative decisions they make for Warp-owned allocations. At a
 minimum, Warp needs to distinguish the owning device and memory class for
 allocations that participate in cross-device launch verification, including
-default CUDA device memory, CUDA memory pools, managed memory, pinned host
-memory, and allocator-defined external memory.
+CUDA device memory that is neither managed nor memory-pool memory, CUDA
+memory pools, managed memory, pinned host memory, and allocator-defined
+external memory.
 
 Any future mechanism must remain backward compatible with simple custom
-allocators, preserve an "unknown" result when allocation provenance is
+allocators, preserve an "unknown" result when memory metadata is
 unavailable or unrecognized, and avoid exposing framework-specific internals as
 part of the basic allocator surface. It also needs to keep launch verification
 compatible with CUDA graph capture and use the same access predicates as
@@ -257,7 +266,7 @@ class RmmAllocator:
         except ImportError as e:
             raise ImportError(
                 "Failed to import 'rmm'. Ensure it is installed and compatible with your CUDA version. "
-                "See https://docs.rapids.ai/install/ for installation instructions."
+                "See https://docs.nvidia.com/datascience/install/ for installation instructions."
             ) from e
         self._buffers: dict[int, object] = {}
 
@@ -266,12 +275,14 @@ class RmmAllocator:
         """Return an RMM ``Stream`` wrapping the current Warp device's CUDA stream."""
         from rmm.pylibrmm.stream import Stream as RmmStream
         from warp._src.context import runtime
+
         return RmmStream(obj=runtime.get_current_cuda_device().stream)
 
     def allocate(self, size_in_bytes: int) -> int:
         if size_in_bytes == 0:
             return 0
         import rmm
+
         buf = rmm.DeviceBuffer(size=size_in_bytes, stream=self._get_rmm_stream())
         ptr = buf.ptr
         self._buffers[ptr] = buf
@@ -283,9 +294,7 @@ class RmmAllocator:
         try:
             del self._buffers[ptr]
         except KeyError:
-            raise RuntimeError(
-                f"RmmAllocator.deallocate called with unrecognized pointer {ptr:#x} ..."
-            ) from None
+            raise RuntimeError(f"RmmAllocator.deallocate called with unrecognized pointer {ptr:#x} ...") from None
 ```
 
 ##### Stream handling

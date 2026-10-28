@@ -49,7 +49,7 @@ def test_zeros():
 
 
 @wp.func
-def test_func_arg_func(arr: wp.array(ndim=2, dtype=int)):
+def test_func_arg_func(arr: wp.array2d[int]):
     for i in range(arr.shape[0]):
         for j in range(arr.shape[1]):
             arr[i][j] = i * arr.shape[1] + j
@@ -109,7 +109,7 @@ def test_func_return_annotation():
 
 def test_error_invalid_func_return_annotation(test, device):
     @wp.func
-    def func() -> wp.array(ndim=2, dtype=int):
+    def func() -> wp.array2d[int]:
         arr = wp.zeros(shape=(2, 3), dtype=int)
         for i in range(arr.shape[0]):
             for j in range(arr.shape[1]):
@@ -117,13 +117,14 @@ def test_error_invalid_func_return_annotation(test, device):
 
         return arr
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel():
         arr = func()
 
     with test.assertRaisesRegex(
         wp.WarpCodegenError,
-        r"The function `func` returns a fixed-size array whereas it has its return type annotated as `Array\[int32\]`.$",
+        r"The function `func` returns a fixed-size array whereas it has its return type annotated as "
+        r"`Array\[int32\]`\.$",
     ):
         wp.launch(kernel, 1, device=device)
 
@@ -211,7 +212,7 @@ def test_func_struct():
 
 
 @wp.kernel
-def test_fixedarray_ptr_reinterpret(output: wp.array(dtype=wp.vec2)):
+def test_fixedarray_ptr_reinterpret(output: wp.array[wp.vec2]):
     # Allocate a fixedarray inside the kernel
     m_b = wp.zeros(shape=(24,), dtype=wp.float32)
 
@@ -240,20 +241,20 @@ def test_fixedarray_ptr(test, device):
 # This test ensures that fixedarray can match array template parameters even when the template
 # has a concrete dtype (not Any), which is essential since fixedarray inherits from array.
 @wp.func
-def array_template_func_concrete(arr: wp.array(ndim=1, dtype=wp.vec2f)):
-    """Function with concrete array template - fixedarray should match"""
+def array_template_func_concrete(arr: wp.array[wp.vec2f]):
+    """Match a fixed array against a concrete array template."""
     return arr[0]
 
 
 @wp.func
-def array_template_func_generic(arr: wp.array(ndim=1, dtype=Any)):
-    """Function with generic array template - fixedarray should match"""
+def array_template_func_generic(arr: wp.array[Any]):
+    """Match a fixed array against a generic array template."""
     return arr[0]
 
 
 @wp.kernel
 def test_fixedarray_array_polymorphism():
-    """Test that fixedarray matches array templates with both concrete and generic dtypes"""
+    """Test that fixedarray matches array templates with both concrete and generic dtypes."""
     # Test with concrete dtype (vec2f)
     fixed_arr_vec2 = wp.zeros(shape=(3,), dtype=wp.vec2f)
     fixed_arr_vec2[0] = wp.vec2f(1.0, 2.0)

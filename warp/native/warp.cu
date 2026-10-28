@@ -63,7 +63,7 @@
 #define CHECK_CUBLASDX(code) \
 { \
     do { \
-        bool out = (check_cufftdx(code)); \
+        bool out = (check_cublasdx(code)); \
         if(!out) { \
             return out; \
         } \
@@ -151,6 +151,8 @@ struct DeviceInfo {
     int pageable_memory_access = 0;
     int direct_managed_mem_access_from_host = 0;
     int host_native_atomic_supported = 0;
+    int managed_memory = 0;
+    int concurrent_managed_access = 0;
     int is_mempool_supported = 0;
     int sm_count = 0;
     int is_ipc_supported = -1;
@@ -166,26 +168,6 @@ struct ContextInfo {
 
     // conditional graph node support, loaded on demand if the driver supports it (CUDA 12.4+)
     CUmodule conditional_module = NULL;
-};
-
-// Information used for freeing allocations.
-struct FreeInfo {
-    void* context = NULL;
-    void* ptr = NULL;
-    bool is_async = false;
-};
-
-struct CaptureInfo {
-    CUstream stream = NULL;  // the main stream where capture begins and ends
-    uint64_t id = 0;  // unique capture id from CUDA
-    bool external = false;  // whether this is an external capture
-    cudaStreamCaptureMode mode = cudaStreamCaptureModeThreadLocal;  // mode used to open the capture (for pause/resume)
-    std::vector<FreeInfo> tmp_allocs;  // temporary allocations owned by the graph (e.g., staged array fill values)
-};
-
-struct StreamInfo {
-    CUevent cached_event = NULL;  // event used for stream synchronization (cached to avoid creating temporary events)
-    CaptureInfo* capture = NULL;  // capture info (only if started on this stream)
 };
 
 // Extra resources tied to a graph, freed after the graph is released by CUDA.
@@ -207,19 +189,6 @@ struct GraphAllocInfo {
     cudaGraphNode_t node = NULL;  // corresponding mem alloc node in the graph
     bool ref_exists = false;  // whether user reference still exists
     bool graph_destroyed = false;  // whether graph instance was destroyed
-};
-
-// Information used when deferring module unloading.
-struct ModuleInfo {
-    void* context = NULL;
-    void* module = NULL;
-};
-
-// Information used when deferring graph destruction.
-struct GraphDestroyInfo {
-    void* context = NULL;
-    void* graph = NULL;
-    void* graph_exec = NULL;
 };
 
 static std::unordered_map<CUfunction, std::string> g_kernel_names;
@@ -245,17 +214,18 @@ static std::unordered_map<uint64_t, CaptureInfo*> g_captures;
 // See wp_alloc_device_async() and wp_free_device_async().
 static std::unordered_map<void*, GraphAllocInfo> g_graph_allocs;
 
-// Memory that cannot be freed immediately gets queued here.
-// Call free_deferred_allocs() to release.
-static std::vector<FreeInfo> g_deferred_free_list;
+// Allocations of captures Warp doesn't track, e.g. conditional bodies; their graph may never run.
+static std::unordered_set<void*> g_untracked_graph_allocs;
 
-// Modules that cannot be unloaded immediately get queued here.
-// Call unload_deferred_modules() to release.
-static std::vector<ModuleInfo> g_deferred_module_list;
-
-// Graphs that cannot be destroyed immediately get queued here.
-// Call destroy_deferred_graphs() to release.
-static std::vector<GraphDestroyInfo> g_deferred_graph_list;
+// Releases that would invalidate a graph capture, queued until all captures end.
+struct ReleaseInfo {
+    ReleaseKind kind;
+    void* context;  // NULL for releases that are not tied to a context
+    uint64_t handle;
+};
+static std::vector<ReleaseInfo> g_deferred_releases;
+// Garbage collection can release resources from any Python thread.
+static std::mutex g_deferred_releases_mutex;
 
 // Data from on_graph_destroy() callbacks that run on a different thread.
 static std::vector<GraphDestroyCallbackInfo*> g_deferred_graph_destroy_list;
@@ -300,6 +270,12 @@ int cuda_init()
                 ));
                 check_cu(cuDeviceGetAttribute_f(
                     &g_devices[i].host_native_atomic_supported, CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED, device
+                ));
+                check_cu(
+                    cuDeviceGetAttribute_f(&g_devices[i].managed_memory, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY, device)
+                );
+                check_cu(cuDeviceGetAttribute_f(
+                    &g_devices[i].concurrent_managed_access, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, device
                 ));
                 check_cu(cuDeviceGetAttribute_f(
                     &g_devices[i].is_mempool_supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device
@@ -386,7 +362,9 @@ static ContextInfo* get_context_info(CUcontext ctx)
         if (check_cu(cuCtxGetDevice_f(&device))) {
             DeviceInfo* device_info = g_device_map[device];
 
-            // workaround for https://nvbugspro.nvidia.com/bug/4456003
+            // Work around a CUDA driver bug observed with Linux driver 535.54.03: cudaFreeAsync() could crash when
+            // directly freeing a graph allocation on an uninitialized default stream. Prime the stream's allocator
+            // bookkeeping with an ordinary asynchronous allocation and free.
             if (device_info->is_mempool_supported) {
                 void* dummy = NULL;
                 check_cuda(cudaMallocAsync(&dummy, 1, NULL));
@@ -405,7 +383,7 @@ static ContextInfo* get_context_info(CUcontext ctx)
 
 static inline ContextInfo* get_context_info(void* context) { return get_context_info(static_cast<CUcontext>(context)); }
 
-static inline StreamInfo* get_stream_info(CUstream stream)
+StreamInfo* get_stream_info(CUstream stream)
 {
     auto it = g_streams.find(stream);
     if (it != g_streams.end())
@@ -414,7 +392,7 @@ static inline StreamInfo* get_stream_info(CUstream stream)
         return NULL;
 }
 
-static inline CaptureInfo* get_capture_info(CUstream stream)
+CaptureInfo* get_capture_info(CUstream stream)
 {
     if (!g_captures.empty() && wp_cuda_stream_is_capturing(stream)) {
         uint64_t capture_id = get_capture_id(stream);
@@ -423,6 +401,36 @@ static inline CaptureInfo* get_capture_info(CUstream stream)
             return capture_iter->second;
     }
     return NULL;
+}
+
+CaptureInfo* find_capture_info(uint64_t capture_id)
+{
+    // Find the registered capture that owns the given capture id, either directly
+    // (top-level capture) or as the parent of a child graph capture currently being
+    // recorded. While a child body graph is captured, the parent capture's main
+    // stream also reports the child's capture id (capture ids are stable across
+    // pause/resume), which identifies the parent from any participating stream,
+    // including forked streams that carry no capture info of their own.
+    for (const auto& capture_iter : g_captures) {
+        CaptureInfo* capture = capture_iter.second;
+        if (capture && (capture->id == capture_id || get_capture_id(capture->stream) == capture_id))
+            return capture;
+    }
+    return NULL;
+}
+
+static inline bool is_context_capturing(CUcontext context)
+{
+    if (g_captures.empty())
+        return false;
+
+    for (const auto& capture_iter : g_captures) {
+        CaptureInfo* capture = capture_iter.second;
+        if (capture && capture->context == context)
+            return true;
+    }
+
+    return false;
 }
 
 // helper function to copy a value to device memory in a graph-friendly way
@@ -523,102 +531,118 @@ static bool capturable_tmp_alloc(void* context, const void* data, size_t size, v
     return true;
 }
 
-static void deferred_free(void* ptr, void* context, bool is_async)
+// The resource's context, if any, must be current.
+static bool release_now(ReleaseKind kind, uint64_t handle)
 {
-    FreeInfo free_info;
-    free_info.ptr = ptr;
-    free_info.context = context ? context : get_current_context();
-    free_info.is_async = is_async;
-    g_deferred_free_list.push_back(free_info);
+    switch (kind) {
+    case ReleaseKind::DeviceFree:
+        return check_cuda(cudaFree((void*)handle));
+    case ReleaseKind::DeviceFreeAsync:
+        // postponed until a synchronization point, so preceding work on the pointer completes
+        return check_cuda(cudaFreeAsync((void*)handle, NULL));
+    case ReleaseKind::DeviceFreeAsyncUnmapped: {
+        cudaError_t res = cudaFreeAsync((void*)handle, NULL);
+        if (res == cudaErrorInvalidValue) {
+            // The graph was never launched, so the memory isn't mapped. Clear the error.
+            cudaGetLastError();
+            return true;
+        }
+        return check_cuda(res);
+    }
+    case ReleaseKind::PinnedFree:
+        // errors were never reported here; keep it that way
+        cudaFreeHost((void*)handle);
+        return true;
+    case ReleaseKind::Module:
+        return check_cu(cuModuleUnload_f((CUmodule)handle));
+    case ReleaseKind::Graph:
+        return check_cuda(cudaGraphDestroy((cudaGraph_t)handle));
+    case ReleaseKind::GraphExec:
+        return check_cuda(cudaGraphExecDestroy((cudaGraphExec_t)handle));
+    case ReleaseKind::TextureObject:
+        return check_cu(cuTexObjectDestroy_f((CUtexObject)handle));
+    case ReleaseKind::SurfaceObject:
+        return check_cuda(cudaDestroySurfaceObject((cudaSurfaceObject_t)handle));
+    case ReleaseKind::Array:
+        return check_cu(cuArrayDestroy_f((CUarray)handle));
+    case ReleaseKind::MipmappedArray:
+        return check_cu(cuMipmappedArrayDestroy_f((CUmipmappedArray)handle));
+    }
+    return false;
 }
 
-static int free_deferred_allocs(void* context = NULL)
+// Queue unconditionally, e.g. while tearing down a failed capture.
+static void defer_release(ReleaseKind kind, void* context, uint64_t handle)
 {
-    if (g_deferred_free_list.empty() || !g_captures.empty())
-        return 0;
+    if (kind == ReleaseKind::PinnedFree || kind == ReleaseKind::Graph)
+        context = NULL;
+    else if (!context)
+        context = get_current_context();
 
-    int num_freed_allocs = 0;
-    for (auto it = g_deferred_free_list.begin(); it != g_deferred_free_list.end(); /*noop*/) {
-        const FreeInfo& free_info = *it;
-
-        // free the pointer if it matches the given context or if the context is unspecified
-        if (free_info.context == context || !context) {
-            ContextGuard guard(free_info.context);
-
-            if (free_info.is_async) {
-                // this could be a regular stream-ordered allocation or a graph allocation
-                cudaError_t res = cudaFreeAsync(free_info.ptr, NULL);
-                if (res != cudaSuccess) {
-                    if (res == cudaErrorInvalidValue) {
-                        // This can happen if we try to release the pointer but the graph was
-                        // never launched, so the memory isn't mapped.
-                        // This is fine, so clear the error.
-                        cudaGetLastError();
-                    } else {
-                        // something else went wrong, report error
-                        check_cuda(res);
-                    }
-                }
-            } else {
-                check_cuda(cudaFree(free_info.ptr));
-            }
-
-            ++num_freed_allocs;
-
-            it = g_deferred_free_list.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    return num_freed_allocs;
+    std::lock_guard<std::mutex> lock(g_deferred_releases_mutex);
+    g_deferred_releases.push_back({ kind, context, handle });
 }
 
-static int unload_deferred_modules(void* context = NULL)
+bool release_or_defer(ReleaseKind kind, void* context, uint64_t handle)
 {
-    if (g_deferred_module_list.empty() || !g_captures.empty())
-        return 0;
+    if (!handle)
+        return true;
 
-    int num_unloaded_modules = 0;
-    for (auto it = g_deferred_module_list.begin(); it != g_deferred_module_list.end(); /*noop*/) {
-        // free the module if it matches the given context or if the context is unspecified
-        const ModuleInfo& module_info = *it;
-        if (module_info.context == context || !context) {
-            wp_cuda_unload_module(module_info.context, module_info.module);
-            ++num_unloaded_modules;
-            it = g_deferred_module_list.erase(it);
-        } else {
-            ++it;
-        }
+    // Conservative: the release may only be unsafe for some captures, depending on device and mode.
+    if (!g_captures.empty()) {
+        defer_release(kind, context, handle);
+        return true;
     }
 
-    return num_unloaded_modules;
+    ContextGuard guard(context);
+    return release_now(kind, handle);
 }
 
-static int destroy_deferred_graphs(void* context = NULL)
+static int release_deferred(void* context = NULL)
 {
-    if (g_deferred_graph_list.empty() || !g_captures.empty())
+    if (!g_captures.empty())
         return 0;
 
-    int num_destroyed_graphs = 0;
-    for (auto it = g_deferred_graph_list.begin(); it != g_deferred_graph_list.end(); /*noop*/) {
-        // destroy the graph if it matches the given context or if the context is unspecified
-        const GraphDestroyInfo& graph_info = *it;
-        if (graph_info.context == context || !context) {
-            if (graph_info.graph) {
-                check_cuda(cudaGraphDestroy((cudaGraph_t)graph_info.graph));
-            }
-            if (graph_info.graph_exec) {
-                check_cuda(cudaGraphExecDestroy((cudaGraphExec_t)graph_info.graph_exec));
-            }
-            ++num_destroyed_graphs;
-            it = g_deferred_graph_list.erase(it);
-        } else {
-            ++it;
+    // release outside the lock, since frees can block on device synchronization
+    std::vector<ReleaseInfo> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_deferred_releases_mutex);
+        std::vector<ReleaseInfo> kept;
+        for (const ReleaseInfo& info : g_deferred_releases) {
+            if (!context || !info.context || info.context == context)
+                pending.push_back(info);
+            else
+                kept.push_back(info);
         }
+        g_deferred_releases.swap(kept);
     }
 
-    return num_destroyed_graphs;
+    for (const ReleaseInfo& info : pending) {
+        // restore, since deferred work must not change the current device
+        ContextGuard guard(info.context, true);
+        release_now(info.kind, info.handle);
+    }
+
+    return int(pending.size());
+}
+
+// The driver releases a context's resources with it, except stream-ordered allocations,
+// which belong to the device's memory pool, so free those from another context of the device.
+static void discard_deferred_releases(void* context, void* device_context)
+{
+    std::lock_guard<std::mutex> lock(g_deferred_releases_mutex);
+    std::vector<ReleaseInfo> kept;
+    for (ReleaseInfo info : g_deferred_releases) {
+        if (info.context == context) {
+            bool stream_ordered
+                = info.kind == ReleaseKind::DeviceFreeAsync || info.kind == ReleaseKind::DeviceFreeAsyncUnmapped;
+            if (!stream_ordered || !device_context)
+                continue;
+            info.context = device_context;
+        }
+        kept.push_back(info);
+    }
+    g_deferred_releases.swap(kept);
 }
 
 static int process_deferred_graph_destroy_callbacks(void* context = NULL)
@@ -639,6 +663,9 @@ static int process_deferred_graph_destroy_callbacks(void* context = NULL)
                     GraphAllocInfo& alloc_info = alloc_iter->second;
                     alloc_info.graph_destroyed = true;
                     if (!alloc_info.ref_exists) {
+                        // Multi-GPU graphs own allocations of other contexts than their own.
+                        // Restore, since deferred work must not change the current device.
+                        ContextGuard guard(alloc_info.context, true);
                         wp_free_device_async(alloc_info.context, ptr);
                     }
                 }
@@ -647,7 +674,8 @@ static int process_deferred_graph_destroy_callbacks(void* context = NULL)
             // handle temporary allocations owned by the graph (no user references)
             for (const FreeInfo& tmp_info : graph_info->tmp_allocs) {
                 if (tmp_info.context) {
-                    // GPU alloc
+                    // GPU alloc; restore the context as above
+                    ContextGuard guard(tmp_info.context, true);
                     if (tmp_info.is_async) {
                         wp_free_device_async(tmp_info.context, tmp_info.ptr);
                     } else {
@@ -673,9 +701,7 @@ static int process_deferred_graph_destroy_callbacks(void* context = NULL)
 static int run_deferred_actions(void* context = NULL)
 {
     int num_actions = 0;
-    num_actions += free_deferred_allocs(context);
-    num_actions += unload_deferred_modules(context);
-    num_actions += destroy_deferred_graphs(context);
+    num_actions += release_deferred(context);
     num_actions += process_deferred_graph_destroy_callbacks(context);
     return num_actions;
 }
@@ -726,7 +752,7 @@ void wp_free_pinned(void* ptr)
 {
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_free(ptr);
-    cudaFreeHost(ptr);
+    release_or_defer(ReleaseKind::PinnedFree, NULL, (uint64_t)ptr);
 }
 
 void* wp_alloc_device(void* context, size_t s, const char* tag)
@@ -734,7 +760,7 @@ void* wp_alloc_device(void* context, size_t s, const char* tag)
     int ordinal = wp_cuda_context_get_device_ordinal(context);
 
     if (wp_cuda_device_is_mempool_supported(ordinal))
-        return wp_alloc_device_async(context, s, tag);
+        return wp_alloc_device_async(context, s, WP_CURRENT_STREAM, tag);
     else
         return wp_alloc_device_default(context, s, tag);
 }
@@ -767,28 +793,20 @@ void wp_free_device_default(void* context, void* ptr)
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_free(ptr);
 
-    ContextGuard guard(context);
-
-    // check if a capture is in progress
-    if (g_captures.empty()) {
-        check_cuda(cudaFree(ptr));
-    } else {
-        // we must defer the operation until graph captures complete
-        deferred_free(ptr, context, false);
-    }
+    release_or_defer(ReleaseKind::DeviceFree, context, (uint64_t)ptr);
 }
 
-void* wp_alloc_device_async(void* context, size_t s, const char* tag)
+void* wp_alloc_device_async(void* context, size_t s, void* stream_, const char* tag)
 {
     // stream-ordered allocations don't rely on the current context,
     // but we set the context here for consistent behaviour
     ContextGuard guard(context);
 
-    ContextInfo* context_info = get_context_info(context);
-    if (!context_info)
-        return NULL;
-
-    CUstream stream = context_info->stream;
+    CUstream stream;
+    if (stream_ != WP_CURRENT_STREAM)
+        stream = static_cast<CUstream>(stream_);
+    else
+        stream = get_current_stream(context);
 
     void* ptr = NULL;
     check_cuda(cudaMallocAsync(&ptr, s, stream));
@@ -833,9 +851,34 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
                 }
 
                 g_graph_allocs[ptr] = alloc_info;
+            } else {
+                g_untracked_graph_allocs.insert(ptr);
             }
         }
     }
+
+    if (g_alloc_tracker.enabled && ptr)
+        g_alloc_tracker.record_alloc(ptr, s, ALLOC_KIND_DEVICE, wp_cuda_context_get_device_ordinal(context), tag);
+
+    return ptr;
+}
+
+void* wp_alloc_device_managed(void* context, size_t s, const char* tag)
+{
+    ContextGuard guard(context);
+
+    ContextInfo* context_info = get_context_info(context);
+    if (!context_info || !context_info->device_info)
+        return NULL;
+
+    DeviceInfo* device_info = context_info->device_info;
+    if (!device_info->managed_memory)
+        return NULL;
+
+    void* ptr = NULL;
+
+    if (!check_cuda(cudaMallocManaged(&ptr, s, cudaMemAttachGlobal)))
+        return NULL;
 
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_alloc(ptr, s, ALLOC_KIND_DEVICE, wp_cuda_context_get_device_ordinal(context), tag);
@@ -860,25 +903,24 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
     // check if this allocation was made during graph capture
     auto alloc_iter = g_graph_allocs.find(ptr);
     if (alloc_iter == g_graph_allocs.end()) {
-        // Not a graph allocation.
-        // Check if graph capture is ongoing.
-        if (g_captures.empty()) {
-            // cudaFreeAsync on the null stream does not block or trigger synchronization, but it postpones
-            // the deallocation until a synchronization point is reached, so preceding work on this pointer
-            // should safely complete.
-            check_cuda(cudaFreeAsync(ptr, NULL));
-        } else {
-            // We must defer the free operation until graph capture completes.
-            deferred_free(ptr, context, true);
-        }
+        ReleaseKind kind
+            = g_untracked_graph_allocs.erase(ptr) ? ReleaseKind::DeviceFreeAsyncUnmapped : ReleaseKind::DeviceFreeAsync;
+        release_or_defer(kind, context, (uint64_t)ptr);
     } else {
         // get the graph allocation details
         GraphAllocInfo& alloc_info = alloc_iter->second;
         uint64_t capture_id = alloc_info.capture_id;
 
-        // check if the capture is still active
+        // Check if the capture is still active on its stream. The second condition guards
+        // against conditional body captures (wp.capture_if()/wp.capture_while()): while a
+        // body graph is being captured, the owning capture is paused and its stream is
+        // capturing the body graph under a different capture id. The allocation's node and
+        // dependencies live in the paused parent graph, so a free node cannot be added
+        // here; fall through and let the graph retain the allocation instead.
+        // Note: the capture id is stable across pause/resume of the same graph, so this
+        // path is taken again for frees that occur after the conditional completes.
         auto capture_iter = g_captures.find(capture_id);
-        if (capture_iter != g_captures.end()) {
+        if (capture_iter != g_captures.end() && capture_id == get_capture_id(capture_iter->second->stream)) {
             CaptureInfo* capture = capture_iter->second;
             cudaGraph_t graph = get_capture_graph(capture->stream);
             if (!graph) {
@@ -980,31 +1022,20 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
             // we're done with this allocation, it's owned by the graph
             g_graph_allocs.erase(alloc_iter);
         } else {
-            // the capture has ended
-            // if the owning graph was already destroyed, we can free the pointer now
+            // The capture has ended, or it is paused while a conditional body graph is
+            // being captured. If the owning graph was already destroyed, we can free the
+            // pointer now.
             if (alloc_info.graph_destroyed) {
-                if (g_captures.empty()) {
-                    // try to free the pointer now
-                    cudaError_t res = cudaFreeAsync(ptr, NULL);
-                    if (res == cudaErrorInvalidValue) {
-                        // This can happen if we try to release the pointer but the graph was
-                        // never launched, so the memory isn't mapped.
-                        // This is fine, so clear the error.
-                        cudaGetLastError();
-                    } else {
-                        // check for other errors
-                        check_cuda(res);
-                    }
-                } else {
-                    // We must defer the operation until graph capture completes.
-                    deferred_free(ptr, context, true);
-                }
+                release_or_defer(ReleaseKind::DeviceFreeAsyncUnmapped, context, (uint64_t)ptr);
 
                 // we're done with this allocation
                 g_graph_allocs.erase(alloc_iter);
             } else {
-                // graph still exists
-                // unreference the pointer so it will be deallocated once the graph instance is destroyed
+                // The graph still exists (or is still being captured).
+                // Unreference the pointer so it will be deallocated once the graph instance
+                // is destroyed. This keeps the memory alive for the lifetime of the graph,
+                // which is required when the free occurs during conditional body capture:
+                // the body may reference the allocation on any launch of the graph.
                 alloc_info.ref_exists = false;
             }
         }
@@ -1071,18 +1102,11 @@ bool wp_memcpy_d2d(void* context, void* dest, void* src, size_t n, void* stream)
     // make recording unconditional at capture time. For now we still execute
     // the CUDA op live under stream capture, but the record itself is API-
     // intent only and doesn't depend on the live call's result.
-    APICState* apic_state = wp_apic_get_recording_state();
-    if (apic_state) {
-        int32_t dst_region, src_region;
-        uint64_t dst_offset, src_offset;
-        bool dst_ok = apic_resolve_ptr(apic_state, (uint64_t)dest, &dst_region, &dst_offset);
-        bool src_ok = apic_resolve_ptr(apic_state, (uint64_t)src, &src_region, &src_offset);
-        if (!dst_ok)
-            fprintf(stderr, "APIC: Error - memcpy dst pointer not in any registered region\n");
-        if (!src_ok)
-            fprintf(stderr, "APIC: Error - memcpy src pointer not in any registered region\n");
-        if (dst_ok && src_ok)
-            apic_record_memcpy_d2d(apic_state, dst_region, dst_offset, src_region, src_offset, n);
+    APICState* apic_state = wp_apic_get_cuda_recording_state();
+    if (apic_state && n > 0) {
+        APICAddress dst_addr = apic_resolve_live_ptr(apic_state, (uint64_t)dest, n);
+        APICAddress src_addr = apic_resolve_live_ptr(apic_state, (uint64_t)src, n);
+        apic_record_memcpy_d2d(apic_state, dst_addr.region_id, dst_addr.offset, src_addr.region_id, src_addr.offset, n);
     }
 
     return result;
@@ -1255,14 +1279,10 @@ bool wp_memset_device(void* context, void* dest, int value, size_t n, void* stre
     // make recording unconditional at capture time. For now we still execute
     // the CUDA op live under stream capture, but the record itself is API-
     // intent only and doesn't depend on the live call's result.
-    APICState* apic_state = wp_apic_get_recording_state();
-    if (apic_state) {
-        int32_t region_id;
-        uint64_t offset;
-        if (apic_resolve_ptr(apic_state, (uint64_t)dest, &region_id, &offset))
-            apic_record_memset(apic_state, region_id, offset, n, value);
-        else
-            fprintf(stderr, "APIC: Error - memset dst pointer not in any registered region\n");
+    APICState* apic_state = wp_apic_get_cuda_recording_state();
+    if (apic_state && n > 0) {
+        APICAddress addr = apic_resolve_live_ptr(apic_state, (uint64_t)dest, n);
+        apic_record_memset(apic_state, addr.region_id, addr.offset, n, value);
     }
     return result;
 }
@@ -1336,9 +1356,32 @@ template <typename T> __global__ void memtile_value_kernel(T* dst, T value, size
     }
 }
 
+// Record-and-execute a contiguous memtile (multi-byte arr.fill_) under CUDA APIC
+// capture: record the fill value and destination into the byte stream, then fall
+// through so the live tile issues onto the captured stream. Only small fills are
+// recordable -- the value is embedded inline and replayed by value. Large fills
+// (> WP_FILL_VALUE_INLINE_BYTES_2) use capturable_tmp_alloc (pause/resume +
+// device staging) that the byte-stream rebuild cannot reproduce; the Python
+// fill_() path rejects those under CUDA APIC capture, so they never reach here
+// during a capture. No-op outside a CUDA APIC capture.
+static void apic_capture_memtile_device(void* dst, const void* src, size_t srcsize, size_t n)
+{
+    APICState* state = wp_apic_get_cuda_recording_state();
+    if (!state || n == 0 || srcsize == 0 || srcsize > WP_FILL_VALUE_INLINE_BYTES_2)
+        return;
+    // Guard the byte-span multiplication against overflow (srcsize is already
+    // bounded above, so this is defensive) before resolving the region.
+    if (n > (~static_cast<size_t>(0)) / srcsize)
+        return;
+    APICAddress addr = apic_resolve_live_ptr(state, reinterpret_cast<uint64_t>(dst), srcsize * n);
+    apic_record_memtile(state, addr.region_id, addr.offset, static_cast<uint32_t>(srcsize), src, n);
+}
+
 void wp_memtile_device(void* context, void* dst, const void* src, size_t srcsize, size_t n)
 {
     ContextGuard guard(context);
+
+    apic_capture_memtile_device(dst, src, srcsize, n);
 
     size_t dst_addr = reinterpret_cast<size_t>(dst);
     size_t src_addr = reinterpret_cast<size_t>(src);
@@ -2310,32 +2353,63 @@ WP_API void wp_array_fill_device(void* context, void* arr_ptr, int arr_type, con
     }
 }
 
-void wp_array_scan_int_device(
-    uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
+// Record an array_scan into the APIC byte stream during a CUDA capture, then
+// fall through so the live device scan still issues onto the captured stream
+// (record-and-execute). Unlike the CPU host path (record-only), the CUDA op
+// must execute so the driver captures it into the native graph; the byte
+// stream additionally carries it for persistent .wrp save/load. No-op outside
+// a CUDA APIC capture (wp_apic_get_cuda_recording_state returns null, including
+// during a CPU-targeted capture and during graph rebuild).
+static void apic_capture_array_scan_device(
+    uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, uint8_t dtype, bool inclusive
 )
 {
-    scan_device((const int*)in, (int*)out, len, in_stride, out_stride, type_len, inclusive);
+    APICState* state = wp_apic_get_cuda_recording_state();
+    if (!state || len <= 0)
+        return;
+    uint64_t scalar_size = apic_type_size(dtype);
+    uint64_t src_bytes = apic_strided_access_bytes(len, in_stride, type_len, scalar_size);
+    uint64_t dst_bytes = apic_strided_access_bytes(len, out_stride, type_len, scalar_size);
+    if (src_bytes == 0 || dst_bytes == 0)
+        return;
+    APICAddress dst_addr = apic_resolve_live_ptr(state, out, dst_bytes);
+    APICAddress src_addr = apic_resolve_live_ptr(state, in, src_bytes);
+    apic_record_scan(
+        state, dst_addr.region_id, dst_addr.offset, src_addr.region_id, src_addr.offset, static_cast<uint32_t>(len),
+        in_stride, out_stride, type_len, dtype, inclusive ? uint8_t(1) : uint8_t(0)
+    );
 }
 
-void wp_array_scan_int64_device(
+bool wp_array_scan_int_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 )
 {
-    scan_device((const int64_t*)in, (int64_t*)out, len, in_stride, out_stride, type_len, inclusive);
+    apic_capture_array_scan_device(in, out, len, in_stride, out_stride, type_len, APIC_TYPE_INT32, inclusive);
+    return scan_device((const int*)in, (int*)out, len, in_stride, out_stride, type_len, inclusive);
 }
 
-void wp_array_scan_float_device(
+bool wp_array_scan_int64_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 )
 {
-    scan_device((const float*)in, (float*)out, len, in_stride, out_stride, type_len, inclusive);
+    apic_capture_array_scan_device(in, out, len, in_stride, out_stride, type_len, APIC_TYPE_INT64, inclusive);
+    return scan_device((const int64_t*)in, (int64_t*)out, len, in_stride, out_stride, type_len, inclusive);
 }
 
-void wp_array_scan_double_device(
+bool wp_array_scan_float_device(
     uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
 )
 {
-    scan_device((const double*)in, (double*)out, len, in_stride, out_stride, type_len, inclusive);
+    apic_capture_array_scan_device(in, out, len, in_stride, out_stride, type_len, APIC_TYPE_FLOAT32, inclusive);
+    return scan_device((const float*)in, (float*)out, len, in_stride, out_stride, type_len, inclusive);
+}
+
+bool wp_array_scan_double_device(
+    uint64_t in, uint64_t out, int len, int in_stride, int out_stride, int type_len, bool inclusive
+)
+{
+    apic_capture_array_scan_device(in, out, len, in_stride, out_stride, type_len, APIC_TYPE_FLOAT64, inclusive);
+    return scan_device((const double*)in, (double*)out, len, in_stride, out_stride, type_len, inclusive);
 }
 
 int wp_cuda_driver_version()
@@ -2487,6 +2561,59 @@ int wp_cuda_device_get_host_native_atomic_supported(int ordinal)
     if (ordinal >= 0 && ordinal < int(g_devices.size()))
         return g_devices[ordinal].host_native_atomic_supported;
     return 0;
+}
+
+int wp_cuda_device_get_managed_memory_supported(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].managed_memory;
+    return 0;
+}
+
+int wp_cuda_device_get_concurrent_managed_access_supported(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].concurrent_managed_access;
+    return 0;
+}
+
+int wp_cuda_pointer_get_memory_kind(void* context, void* ptr)
+{
+    if (!ptr)
+        return WP_MEMORY_KIND_UNKNOWN;
+
+    ContextGuard guard(context);
+
+    unsigned int is_managed = 0;
+    CUresult managed_result
+        = cuPointerGetAttribute_f(&is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, reinterpret_cast<CUdeviceptr>(ptr));
+    if (managed_result != CUDA_SUCCESS)
+        return WP_MEMORY_KIND_UNKNOWN;
+    if (is_managed)
+        return WP_MEMORY_KIND_CUDA_MANAGED;
+
+    unsigned int memory_type = 0;
+    CUresult memory_type_result
+        = cuPointerGetAttribute_f(&memory_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, reinterpret_cast<CUdeviceptr>(ptr));
+    if (memory_type_result != CUDA_SUCCESS)
+        return WP_MEMORY_KIND_UNKNOWN;
+
+    if (memory_type == CU_MEMORYTYPE_HOST)
+        return WP_MEMORY_KIND_PINNED;
+
+    if (memory_type != CU_MEMORYTYPE_DEVICE)
+        return WP_MEMORY_KIND_UNKNOWN;
+
+    CUmemoryPool mempool = NULL;
+    CUresult mempool_result
+        = cuPointerGetAttribute_f(&mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, reinterpret_cast<CUdeviceptr>(ptr));
+    if (mempool_result != CUDA_SUCCESS)
+        return WP_MEMORY_KIND_CUDA_DEVICE;
+
+    if (mempool)
+        return WP_MEMORY_KIND_CUDA_MEMPOOL;
+
+    return WP_MEMORY_KIND_CUDA_DEVICE;
 }
 
 int wp_cuda_device_is_mempool_supported(int ordinal)
@@ -2707,9 +2834,16 @@ void wp_cuda_context_destroy(void* context)
         if (ctx == wp_cuda_context_get_current())
             wp_cuda_context_set_current(NULL);
 
+        // release the radix sort side stream associated with this context
+        radix_sort_context_release(context);
+
         // release the cached info about this context
         ContextInfo* info = get_context_info(ctx);
+        void* device_context = NULL;
         if (info) {
+            if (info->device_info)
+                device_context = wp_cuda_device_get_primary_context(info->device_info->ordinal);
+
             if (info->stream)
                 check_cu(cuStreamDestroy_f(info->stream));
 
@@ -2719,25 +2853,45 @@ void wp_cuda_context_destroy(void* context)
             g_contexts.erase(ctx);
         }
 
+        discard_deferred_releases(context, device_context);
+
         check_cu(cuCtxDestroy_f(ctx));
     }
 }
 
-void wp_cuda_context_synchronize(void* context)
+bool wp_cuda_context_synchronize(void* context)
 {
     ContextGuard guard(context);
 
-    check_cu(cuCtxSynchronize_f());
+    // Report failures from earlier asynchronous work before running deferred actions,
+    // which would replace the error string. Pending actions run after the next
+    // successful synchronization or graph capture.
+    if (!check_cu(cuCtxSynchronize_f()))
+        return false;
 
     if (!context)
         context = get_current_context();
 
     if (run_deferred_actions(context) > 0) {
         // ensure deferred asynchronous operations complete
-        check_cu(cuCtxSynchronize_f());
+        return check_cu(cuCtxSynchronize_f());
     }
 
     // check_cuda(cudaDeviceGraphMemTrim(wp_cuda_context_get_device_ordinal(context)));
+
+    return true;
+}
+
+bool wp_cuda_profiler_start(void* context)
+{
+    ContextGuard guard(context, true);
+    return check_cu(cuProfilerStart_f());
+}
+
+bool wp_cuda_profiler_stop(void* context)
+{
+    ContextGuard guard(context, true);
+    return check_cu(cuProfilerStop_f());
 }
 
 uint64_t wp_cuda_context_check(void* context)
@@ -2748,13 +2902,19 @@ uint64_t wp_cuda_context_check(void* context)
     cudaError_t e = cudaGetLastError();
     check_cuda(e);
 
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    check_cuda(cudaStreamIsCapturing(get_current_stream(), &status));
+    CUcontext current_context = get_current_context();
 
-    // synchronize if the stream is not capturing
-    if (status == cudaStreamCaptureStatusNone) {
-        check_cuda(cudaDeviceSynchronize());
-        e = cudaGetLastError();
+    // Device-wide synchronization is illegal while a Warp-known stream capture
+    // is active in this context, even if the current stream itself is not capturing.
+    if (!is_context_capturing(current_context)) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        check_cuda(cudaStreamIsCapturing(get_current_stream(), &status));
+
+        // synchronize if the stream is not capturing
+        if (status == cudaStreamCaptureStatusNone) {
+            check_cuda(cudaDeviceSynchronize());
+            e = cudaGetLastError();
+        }
     }
 
     return static_cast<uint64_t>(e);
@@ -3084,9 +3244,6 @@ void wp_cuda_stream_destroy(void* context, void* stream)
 
     wp_cuda_stream_unregister(context, stream);
 
-    // release temporary radix sort buffer associated with this stream
-    radix_sort_release(context, stream);
-
     check_cu(cuStreamDestroy_f(static_cast<CUstream>(stream)));
 }
 
@@ -3134,11 +3291,14 @@ void wp_cuda_stream_unregister(void* context, void* stream)
         if (cuda_stream == context_info->stream)
             context_info->stream = NULL;
     }
+
+    // release temporary radix sort scratch space associated with this stream
+    radix_sort_stream_release(context, stream);
 }
 
 void* wp_cuda_stream_get_current() { return get_current_stream(); }
 
-void wp_cuda_stream_synchronize(void* stream) { check_cu(cuStreamSynchronize_f(static_cast<CUstream>(stream))); }
+bool wp_cuda_stream_synchronize(void* stream) { return check_cu(cuStreamSynchronize_f(static_cast<CUstream>(stream))); }
 
 void wp_cuda_stream_wait_event(void* stream, void* event, bool external)
 {
@@ -3178,6 +3338,27 @@ int wp_cuda_stream_is_capturing(void* stream)
     check_cuda(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status));
 
     return int(status != cudaStreamCaptureStatusNone);
+}
+
+int wp_cuda_stream_is_blocking(void* stream)
+{
+    unsigned int flags = 0;
+    check_cuda(cudaStreamGetFlags(static_cast<cudaStream_t>(stream), &flags));
+    return !(flags & cudaStreamNonBlocking);
+}
+
+int wp_cuda_thread_exchange_capture_mode(int mode)
+{
+    // Swap this thread's stream capture mode and return the previous mode.
+    // Passing cudaStreamCaptureModeRelaxed allows otherwise-forbidden
+    // operations (e.g. legacy allocations on non-capturing streams) while a
+    // thread-local capture is active on another stream. Callers must restore
+    // the returned mode afterwards.
+    cudaStreamCaptureMode capture_mode = static_cast<cudaStreamCaptureMode>(mode);
+    if (!check_cuda(cudaThreadExchangeStreamCaptureMode(&capture_mode)))
+        return -1;
+
+    return int(capture_mode);
 }
 
 uint64_t wp_cuda_stream_get_capture_id(void* stream) { return get_capture_id(static_cast<CUstream>(stream)); }
@@ -3228,7 +3409,7 @@ void wp_cuda_event_record(void* event, void* stream, bool external)
     }
 }
 
-void wp_cuda_event_synchronize(void* event) { check_cu(cuEventSynchronize_f(static_cast<CUevent>(event))); }
+bool wp_cuda_event_synchronize(void* event) { return check_cu(cuEventSynchronize_f(static_cast<CUevent>(event))); }
 
 float wp_cuda_event_elapsed_time(void* start_event, void* end_event)
 {
@@ -3276,6 +3457,12 @@ bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int 
             return false;
         }
     } else {
+        // Lazily registering a context warms up CUDA mempool state with default-stream
+        // cudaMallocAsync/cudaFreeAsync calls; do that before capture starts.
+        if (!get_context_info(static_cast<CUcontext>(context))) {
+            wp::set_error_string("Warp error: failed to initialize CUDA context info");
+            return false;
+        }
         if (!check_cuda(cudaStreamBeginCapture(cuda_stream, capture_mode)))
             return false;
     }
@@ -3284,6 +3471,7 @@ bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int 
 
     CaptureInfo* capture = new CaptureInfo();
     capture->stream = cuda_stream;
+    capture->context = context ? static_cast<CUcontext>(context) : get_current_context();
     capture->id = capture_id;
     capture->external = bool(external);
     capture->mode = capture_mode;
@@ -3316,6 +3504,9 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
         return false;
     }
 
+    // clean up any capture-specific radix sort buffers
+    radix_sort_end_capture(capture->id);
+
     // get capture info
     bool external = capture->external;
     uint64_t capture_id = capture->id;
@@ -3329,10 +3520,20 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
     // a lambda to clean up on exit in case of error
     auto clean_up = [cuda_stream, capture_id, external]() {
         // unreference outstanding graph allocs so that they will be released with the user reference
-        for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); ++it) {
+        for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); /*noop*/) {
             GraphAllocInfo& alloc_info = it->second;
-            if (alloc_info.capture_id == capture_id)
+            if (alloc_info.capture_id == capture_id) {
+                if (!alloc_info.ref_exists) {
+                    // The user reference was already dropped (e.g., freed during conditional
+                    // body capture). No graph instance will exist to own the allocation, so
+                    // free it once graph captures complete.
+                    defer_release(ReleaseKind::DeviceFreeAsyncUnmapped, alloc_info.context, (uint64_t)it->first);
+                    it = g_graph_allocs.erase(it);
+                    continue;
+                }
                 alloc_info.graph_destroyed = true;
+            }
+            ++it;
         }
 
         // make sure we terminate the capture
@@ -3922,12 +4123,10 @@ bool wp_cuda_graph_insert_if_else(
         return false;
     }
 
-    // int driver_version = wp_cuda_driver_version();
-
-    // IF-ELSE nodes are only supported with CUDA 12.8+
-    // Somehow child graphs produce wrong results when an else branch is used
-    // Seems to be a bug in the CUDA driver: https://nvbugs/5241330
-    if (num_branches == 1 /*|| driver_version >= 12080*/) {
+    // Multi-graph IF-ELSE nodes are supported starting with CUDA 12.8, but CUDA 12.8 and 12.9 drivers
+    // can reparent nodes from child graphs incorrectly during instantiation. Use two single-body conditional nodes
+    // until CUDA 12.x is no longer supported; the driver issue was fixed in CUDA 13.0.
+    if (num_branches == 1) {
         cudaGraphConditionalHandle handle;
         check_cuda(cudaGraphConditionalHandleCreate(&handle, cuda_graph));
 
@@ -4101,7 +4300,7 @@ static bool is_valid_child_graph(void* child_graph)
 }
 
 // check if a graph can be used as a conditional body graph
-// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#condtional-node-body-graph-requirements
+// https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html#conditional-node-body-graph-requirements
 bool wp_cuda_graph_check_conditional_body(void* body_graph)
 {
     static const std::unordered_set<CUgraphNodeType> allowed_nodes {
@@ -4340,32 +4539,12 @@ bool wp_cuda_graph_launch(void* graph_exec, void* stream)
 
 bool wp_cuda_graph_destroy(void* context, void* graph)
 {
-    // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
-        ContextGuard guard(context);
-        return check_cuda(cudaGraphDestroy((cudaGraph_t)graph));
-    } else {
-        GraphDestroyInfo info;
-        info.context = context ? context : get_current_context();
-        info.graph = graph;
-        g_deferred_graph_list.push_back(info);
-        return true;
-    }
+    return release_or_defer(ReleaseKind::Graph, context, (uint64_t)graph);
 }
 
 bool wp_cuda_graph_exec_destroy(void* context, void* graph_exec)
 {
-    // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
-        ContextGuard guard(context);
-        return check_cuda(cudaGraphExecDestroy((cudaGraphExec_t)graph_exec));
-    } else {
-        GraphDestroyInfo info;
-        info.context = context ? context : get_current_context();
-        info.graph_exec = graph_exec;
-        g_deferred_graph_list.push_back(info);
-        return true;
-    }
+    return release_or_defer(ReleaseKind::GraphExec, context, (uint64_t)graph_exec);
 }
 
 bool write_file(const char* data, size_t size, std::string filename, const char* mode)
@@ -4408,6 +4587,110 @@ bool check_nvjitlink_result(nvJitLinkHandle handle, nvJitLinkResult result, cons
     }
 }
 #endif
+
+// Append every NVRTC option shared by Warp's normal module compiler and APIC's
+// portable source-recompile path. Keep path-specific options (include paths,
+// precompiled headers, link inputs, and compile-time tracing) in the callers.
+// In particular, CUDA-version workarounds belong here so a source-recompiled
+// APIC module cannot silently drift from the module used during capture.
+static void append_common_nvrtc_compile_options(
+    std::vector<const char*>& options,
+    bool use_ptx,
+    int arch,
+    bool debug,
+    int optimization_level,
+    bool verify_fp,
+    bool fast_math,
+    bool fuse_fp,
+    bool lineinfo
+)
+{
+    options.push_back("--std=c++20");
+
+#if CUDA_VERSION >= 12080 && CUDA_VERSION < 13000
+    // CUDA 12 miscompiles optimized CUBIN texture sampling when texture handles
+    // vary across lanes on sm_90 and newer targets. CUDA 12.8 is covered as a
+    // precaution because it is not exercised in CI.
+    const bool is_affected_texture_cubin_target = arch >= 90;
+#else
+    // CUDA 13 CUBIN has not reproduced the miscompile on any target tested so far.
+    const bool is_affected_texture_cubin_target = false;
+#endif
+
+#if CUDA_VERSION >= 12080 && CUDA_VERSION < 12090
+    // Precaution, untested: CUDA 12.8 is not expected to honor optimization
+    // levels here, so even level 0 may trigger the miscompile.
+    const bool optimizations_may_trigger_texture_bug = true;
+#else
+    const bool optimizations_may_trigger_texture_bug = optimization_level > 0;
+#endif
+
+    if (!use_ptx && is_affected_texture_cubin_target && optimizations_may_trigger_texture_bug)
+        options.push_back("--define-macro=WP_WORKAROUND_CUDA_TEXTURE_CUBIN");
+
+    // CUDA 12.9+ supports --Ofast-compile, which works inversely to normal -O
+    // optimization levels.
+#if CUDA_VERSION >= 12090
+    switch (optimization_level) {
+    case 0:
+#if CUDA_VERSION >= 13010
+        // CUDA 13.1+ corrupts process-wide NVRTC compiler state after a
+        // --Ofast-compile=max build. Later builds can then emit invalid parameter
+        // addressing, so use the next-fastest setting until NVIDIA fixes NVRTC.
+        options.push_back("--Ofast-compile=mid");
+#else
+        options.push_back("--Ofast-compile=max");
+#endif
+        break;
+    case 1:
+        options.push_back("--Ofast-compile=mid");
+        break;
+    case 2:
+        options.push_back("--Ofast-compile=min");
+        break;
+    default:
+        options.push_back("--Ofast-compile=0");
+        break;  // 3 and up
+    }
+#endif
+
+    if (debug) {
+        options.push_back("--define-macro=_DEBUG");
+        options.push_back("--generate-line-info");
+#ifndef _WIN32
+        options.push_back("--device-debug");  // -G
+#endif
+    } else {
+        options.push_back("--define-macro=NDEBUG");
+
+        if (lineinfo)
+            options.push_back("--generate-line-info");
+    }
+
+    if (verify_fp)
+        options.push_back("--define-macro=WP_VERIFY_FP");
+    else
+        options.push_back("--undefine-macro=WP_VERIFY_FP");
+
+#if WP_ENABLE_MATHDX
+    options.push_back("--define-macro=WP_ENABLE_MATHDX=1");
+#else
+    options.push_back("--define-macro=WP_ENABLE_MATHDX=0");
+#endif
+
+    if (fast_math)
+        options.push_back("--use_fast_math");
+
+    if (fuse_fp)
+        options.push_back("--fmad=true");
+    else
+        options.push_back("--fmad=false");
+
+    options.push_back("--device-as-default-execution-space");
+    options.push_back("--extra-device-vectorization");
+    options.push_back("--restrict");
+    options.push_back("--diag-suppress=177,550");  // "was declared but never referenced", "was set but never used"
+}
 
 size_t wp_cuda_compile_program(
     const char* cuda_src,
@@ -4482,29 +4765,10 @@ size_t wp_cuda_compile_program(
     std::vector<const char*> opts;
     opts.push_back(arch_opt);
     opts.push_back(include_opt);
-    opts.push_back("--std=c++20");
-
-    // CUDA 12.9+ supports --Ofast-compile
-#if CUDA_VERSION >= 12090
-    // --Ofast-compile works inversely to normal -O optimization levels
-    switch (optimization_level) {
-    case 0:
-        opts.push_back("--Ofast-compile=max");
-        break;
-    case 1:
-        opts.push_back("--Ofast-compile=mid");
-        break;
-    case 2:
-        opts.push_back("--Ofast-compile=min");
-        break;
-    default:
-        opts.push_back("--Ofast-compile=0");
-        break;  // 3 and up
-    }
-#endif
 
     // Vector to store dynamically created option strings
     std::vector<std::string> stored_options;
+    stored_options.reserve(static_cast<size_t>(num_cuda_include_dirs) + 2);
 
     if (precompiled_headers) {
         // CUDA 12.8+ supports precompiled headers
@@ -4524,47 +4788,14 @@ size_t wp_cuda_compile_program(
 #endif
     }
 
-    if (debug) {
-        opts.push_back("--define-macro=_DEBUG");
-        opts.push_back("--generate-line-info");
-#ifndef _WIN32
-        opts.push_back("--device-debug");  // -G
-#endif
-    } else {
-        opts.push_back("--define-macro=NDEBUG");
-
-        if (lineinfo)
-            opts.push_back("--generate-line-info");
-    }
-
-    if (verify_fp)
-        opts.push_back("--define-macro=WP_VERIFY_FP");
-    else
-        opts.push_back("--undefine-macro=WP_VERIFY_FP");
-
-#if WP_ENABLE_MATHDX
-    opts.push_back("--define-macro=WP_ENABLE_MATHDX=1");
-#else
-    opts.push_back("--define-macro=WP_ENABLE_MATHDX=0");
-#endif
-
-    if (fast_math)
-        opts.push_back("--use_fast_math");
-
-    if (fuse_fp)
-        opts.push_back("--fmad=true");
-    else
-        opts.push_back("--fmad=false");
+    append_common_nvrtc_compile_options(
+        opts, use_ptx, arch, debug, optimization_level, verify_fp, fast_math, fuse_fp, lineinfo
+    );
 
     for (int i = 0; i < num_cuda_include_dirs; i++) {
         stored_options.push_back(std::string("--include-path=") + cuda_include_dirs[i]);
         opts.push_back(stored_options.back().c_str());
     }
-
-    opts.push_back("--device-as-default-execution-space");
-    opts.push_back("--extra-device-vectorization");
-    opts.push_back("--restrict");
-    opts.push_back("--diag-suppress=177,550");  // "was declared but never referenced", "was set but never used"
 
     if (num_ltoirs > 0) {
         opts.push_back("-dlto");
@@ -4902,7 +5133,15 @@ bool wp_cuda_compile_dot(
     int arrangement_A,
     int arrangement_B,
     int arrangement_C,
-    int num_threads
+    int num_threads,
+    int lda,
+    int ldb,
+    int ldc,
+    int alignment_A,
+    int alignment_B,
+    int alignment_C,
+    int enable_static_block_dim,
+    int suppress_errors
 )
 {
 
@@ -4945,10 +5184,39 @@ bool wp_cuda_compile_dot(
         h, cublasdxOperatorType::CUBLASDX_OPERATOR_ARRANGEMENT, arrangement.size(), arrangement.data()
     ));
 
+    // non-positive values leave the leading dimensions at their dense defaults
+    if (lda > 0 && ldb > 0 && ldc > 0) {
+        std::array<long long int, 3> ld = { lda, ldb, ldc };
+        CHECK_CUBLASDX(cublasdxSetOperatorInt64s(
+            h, cublasdxOperatorType::CUBLASDX_OPERATOR_LEADING_DIMENSION, ld.size(), ld.data()
+        ));
+    }
+
+    // any non-positive value leaves cuBLASDx at its default (each value type's natural alignment)
+    if (alignment_A > 0 && alignment_B > 0 && alignment_C > 0) {
+        std::array<long long int, 3> align = { alignment_A, alignment_B, alignment_C };
+        CHECK_CUBLASDX(
+            cublasdxSetOperatorInt64s(h, cublasdxOperatorType::CUBLASDX_OPERATOR_ALIGNMENT, align.size(), align.data())
+        );
+    }
+
+    if (enable_static_block_dim) {
+        CHECK_CUBLASDX(cublasdxSetOperatorInt64(h, cublasdxOperatorType::CUBLASDX_OPERATOR_STATIC_BLOCK_DIM, 1));
+    }
+
     CHECK_CUBLASDX(cublasdxSetOptionStr(h, commondxOption::COMMONDX_OPTION_SYMBOL_NAME, symbol_name));
 
+    // generating the LTO is where cuBLASDx compiles the GEMM; a rejected configuration is
+    // expected when the caller probes an alignment it can fall back from, so do not report it then
     size_t lto_size = 0;
-    CHECK_CUBLASDX(cublasdxGetLTOIRSize(h, &lto_size));
+    commondxStatusType lto_status = cublasdxGetLTOIRSize(h, &lto_size);
+    if (lto_status != commondxStatusType::COMMONDX_SUCCESS) {
+        if (!suppress_errors) {
+            check_cublasdx(lto_status);
+        }
+        cublasdxDestroyDescriptor(h);
+        return false;
+    }
 
     std::vector<char> lto(lto_size);
     CHECK_CUBLASDX(cublasdxGetLTOIR(h, lto.size(), lto.data()));
@@ -5068,40 +5336,243 @@ bool wp_cuda_compile_solver(
 
 #endif
 
-void* wp_cuda_load_module(void* context, const char* path)
+static const char* apic_nvptx_error_string(nvPTXCompileResult result)
+{
+    switch (result) {
+    case NVPTXCOMPILE_SUCCESS:
+        return "success";
+    case NVPTXCOMPILE_ERROR_INVALID_COMPILER_HANDLE:
+        return "invalid compiler handle";
+    case NVPTXCOMPILE_ERROR_INVALID_INPUT:
+        return "invalid input";
+    case NVPTXCOMPILE_ERROR_COMPILATION_FAILURE:
+        return "compilation failure";
+    case NVPTXCOMPILE_ERROR_INTERNAL:
+        return "internal error";
+    case NVPTXCOMPILE_ERROR_OUT_OF_MEMORY:
+        return "out of memory";
+    case NVPTXCOMPILE_ERROR_COMPILER_INVOCATION_INCOMPLETE:
+        return "incomplete compiler invocation";
+    case NVPTXCOMPILE_ERROR_UNSUPPORTED_PTX_VERSION:
+        return "unsupported PTX version";
+    default:
+        return "unknown error";
+    }
+}
+
+static std::string apic_cuda_error_string(CUresult result)
+{
+    const char* name = nullptr;
+    const char* description = nullptr;
+    cuGetErrorName_f(result, &name);
+    cuGetErrorString_f(result, &description);
+    std::string message = name ? name : "CUDA_ERROR_UNKNOWN";
+    if (description) {
+        message += ": ";
+        message += description;
+    }
+    return message;
+}
+
+// Load PTX or CUBIN bytes without printing. APIC uses this primitive to try
+// packaged and cached candidates before reporting one combined diagnostic.
+static bool apic_cuda_load_module_data(
+    void* context, const uint8_t* data, size_t size, bool load_ptx, CUmodule* module, std::string& diagnostic
+)
+{
+    if (!data || size == 0 || !module) {
+        diagnostic = "module data is empty";
+        return false;
+    }
+
+    ContextGuard guard(context);
+    *module = nullptr;
+
+    std::vector<uint8_t> terminated_input;
+    const void* input = data;
+    size_t input_size = size;
+    if (load_ptx && data[size - 1] != 0) {
+        terminated_input.assign(data, data + size);
+        terminated_input.push_back(0);
+        input = terminated_input.data();
+        input_size = terminated_input.size();
+    }
+
+    if (load_ptx) {
+        int driver_cuda_version = 0;
+        CUresult driver_version_result = cuDriverGetVersion_f(&driver_cuda_version);
+        if (driver_version_result == CUDA_SUCCESS && driver_cuda_version >= CUDA_VERSION) {
+            CUjit_option options[2];
+            void* option_values[2];
+            char error_log[8192] = "";
+            options[0] = CU_JIT_ERROR_LOG_BUFFER;
+            option_values[0] = error_log;
+            options[1] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
+            option_values[1] = reinterpret_cast<void*>(sizeof(error_log));
+            CUresult result = cuModuleLoadDataEx_f(module, input, 2, options, option_values);
+            if (result != CUDA_SUCCESS) {
+                diagnostic = apic_cuda_error_string(result);
+                if (error_log[0]) {
+                    diagnostic += "\n";
+                    diagnostic += error_log;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        ContextInfo* context_info = get_context_info(static_cast<CUcontext>(context));
+        if (!context_info || !context_info->device_info) {
+            diagnostic = "could not determine the CUDA device architecture";
+            return false;
+        }
+
+        char arch_option[64];
+        snprintf(arch_option, sizeof(arch_option), "--gpu-name=sm_%d", context_info->device_info->arch);
+        const char* compiler_options[] = { arch_option };
+        nvPTXCompilerHandle compiler = nullptr;
+        nvPTXCompileResult result = nvPTXCompilerCreate(&compiler, input_size, reinterpret_cast<const char*>(input));
+        if (result == NVPTXCOMPILE_SUCCESS) {
+            result = nvPTXCompilerCompile(compiler, 1, compiler_options);
+        }
+        if (result != NVPTXCOMPILE_SUCCESS) {
+            diagnostic = std::string("nvPTXCompiler: ") + apic_nvptx_error_string(result);
+            if (compiler) {
+                size_t log_size = 0;
+                if (nvPTXCompilerGetErrorLogSize(compiler, &log_size) == NVPTXCOMPILE_SUCCESS && log_size > 1) {
+                    std::vector<char> log(log_size);
+                    if (nvPTXCompilerGetErrorLog(compiler, log.data()) == NVPTXCOMPILE_SUCCESS) {
+                        diagnostic += "\n";
+                        diagnostic += log.data();
+                    }
+                }
+                nvPTXCompilerDestroy(&compiler);
+            }
+            return false;
+        }
+
+        size_t cubin_size = 0;
+        result = nvPTXCompilerGetCompiledProgramSize(compiler, &cubin_size);
+        std::vector<uint8_t> cubin(cubin_size);
+        if (result == NVPTXCOMPILE_SUCCESS) {
+            result = nvPTXCompilerGetCompiledProgram(compiler, reinterpret_cast<char*>(cubin.data()));
+        }
+        nvPTXCompilerDestroy(&compiler);
+        if (result != NVPTXCOMPILE_SUCCESS) {
+            diagnostic = std::string("nvPTXCompiler output: ") + apic_nvptx_error_string(result);
+            return false;
+        }
+
+        CUresult load_result = cuModuleLoadDataEx_f(module, cubin.data(), 0, nullptr, nullptr);
+        if (load_result != CUDA_SUCCESS) {
+            diagnostic = apic_cuda_error_string(load_result);
+            return false;
+        }
+        return true;
+    }
+
+    CUresult result = cuModuleLoadDataEx_f(module, input, 0, nullptr, nullptr);
+    if (result != CUDA_SUCCESS) {
+        diagnostic = apic_cuda_error_string(result);
+        return false;
+    }
+    return true;
+}
+
+// Compile generated Warp CUDA source to memory with the semantic options
+// captured in the .wrp. External includes, link inputs, PCH, and tracing are
+// intentionally excluded from the portable fallback contract.
+static bool apic_cuda_compile_program_to_memory(
+    const std::string& cuda_source,
+    const char* program_name,
+    int arch,
+    const char* arch_suffix,
+    const char* include_dir,
+    bool use_ptx,
+    const APICCudaCompileRecipe& recipe,
+    std::vector<uint8_t>& output,
+    std::string& diagnostic
+)
+{
+    if (!include_dir || !include_dir[0]) {
+        diagnostic = "the Warp native include directory was not provided";
+        return false;
+    }
+    if (strlen(include_dir) > 4096) {
+        diagnostic = "the Warp native include path is too long";
+        return false;
+    }
+
+    std::string arch_option = std::string("--gpu-architecture=") + (use_ptx ? "compute_" : "sm_") + std::to_string(arch)
+        + (arch_suffix ? arch_suffix : "");
+    std::string include_option = std::string("--include-path=") + include_dir;
+    std::vector<std::string> stored_options = { arch_option, include_option };
+    std::vector<const char*> options;
+    options.push_back(stored_options[0].c_str());
+    options.push_back(stored_options[1].c_str());
+    append_common_nvrtc_compile_options(
+        options, use_ptx, arch, recipe.debug, recipe.optimization_level, recipe.verify_fp, recipe.fast_math,
+        recipe.fuse_fp, recipe.lineinfo
+    );
+
+    nvrtcProgram program = nullptr;
+    nvrtcResult result = nvrtcCreateProgram(
+        &program, cuda_source.c_str(), program_name ? program_name : "apic_module.cu", 0, nullptr, nullptr
+    );
+    if (result == NVRTC_SUCCESS) {
+        result = nvrtcCompileProgram(program, static_cast<int>(options.size()), options.data());
+    }
+    if (result != NVRTC_SUCCESS) {
+        diagnostic = std::string("NVRTC: ") + nvrtcGetErrorString(result);
+        if (program) {
+            size_t log_size = 0;
+            if (nvrtcGetProgramLogSize(program, &log_size) == NVRTC_SUCCESS && log_size > 1) {
+                std::vector<char> log(log_size);
+                if (nvrtcGetProgramLog(program, log.data()) == NVRTC_SUCCESS) {
+                    diagnostic += "\n";
+                    diagnostic += log.data();
+                }
+            }
+            nvrtcDestroyProgram(&program);
+        }
+        return false;
+    }
+
+    size_t output_size = 0;
+    result = use_ptx ? nvrtcGetPTXSize(program, &output_size) : nvrtcGetCUBINSize(program, &output_size);
+    if (result == NVRTC_SUCCESS) {
+        output.resize(output_size);
+        result = use_ptx ? nvrtcGetPTX(program, reinterpret_cast<char*>(output.data()))
+                         : nvrtcGetCUBIN(program, reinterpret_cast<char*>(output.data()));
+    }
+    nvrtcDestroyProgram(&program);
+    if (result != NVRTC_SUCCESS) {
+        output.clear();
+        diagnostic = std::string("NVRTC output: ") + nvrtcGetErrorString(result);
+        return false;
+    }
+    return true;
+}
+
+// Whether a module binary's path or recorded filename names a PTX module. The
+// file extension decides, matching how Warp names its compiled modules.
+static bool cuda_module_path_is_ptx(const char* path)
+{
+    const char* ext = strrchr(path, '.');
+    return ext && strcmp(ext + 1, "ptx") == 0;
+}
+
+// Load a CUDA module from an in-memory image. A PTX image must end with a NUL
+// byte, which `size` includes. The driver copies the image, so it only needs
+// to stay valid for the call.
+static void* cuda_load_module_image(void* context, const char* image, size_t size, bool is_ptx)
 {
     ContextGuard guard(context);
-
-    // use file extension to determine whether to load PTX or CUBIN
-    const char* input_ext = strrchr(path, '.');
-    bool load_ptx = input_ext && strcmp(input_ext + 1, "ptx") == 0;
-
-    std::vector<char> input;
-
-    FILE* file = fopen(path, "rb");
-    if (file) {
-        fseek(file, 0, SEEK_END);
-        size_t length = ftell(file);
-        fseek(file, 0, SEEK_SET);
-
-        input.resize(length + 1);
-        if (fread(input.data(), 1, length, file) != length) {
-            fprintf(stderr, "Warp error: Failed to read input file '%s'\n", path);
-            fclose(file);
-            return NULL;
-        }
-        fclose(file);
-
-        input[length] = '\0';
-    } else {
-        fprintf(stderr, "Warp error: Failed to open input file '%s'\n", path);
-        return NULL;
-    }
 
     int driver_cuda_version = 0;
     CUmodule module = NULL;
 
-    if (load_ptx) {
+    if (is_ptx) {
         if (check_cu(cuDriverGetVersion_f(&driver_cuda_version)) && driver_cuda_version >= CUDA_VERSION) {
             // let the driver compile the PTX
 
@@ -5117,7 +5588,7 @@ void* wp_cuda_load_module(void* context, const char* path)
             options[1] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
             option_vals[1] = (void*)(size_t)log_size;
 
-            if (!check_cu(cuModuleLoadDataEx_f(&module, input.data(), 2, options, option_vals))) {
+            if (!check_cu(cuModuleLoadDataEx_f(&module, image, 2, options, option_vals))) {
                 fprintf(stderr, "Warp error: Loading PTX module failed\n");
                 // print error log if not empty
                 if (*error_log)
@@ -5141,7 +5612,7 @@ void* wp_cuda_load_module(void* context, const char* path)
             const char* compiler_options[] = { arch_opt };
 
             nvPTXCompilerHandle compiler = NULL;
-            if (!check_nvptx(nvPTXCompilerCreate(&compiler, input.size(), input.data())))
+            if (!check_nvptx(nvPTXCompilerCreate(&compiler, size, image)))
                 return NULL;
 
             if (!check_nvptx(nvPTXCompilerCompile(
@@ -5166,7 +5637,7 @@ void* wp_cuda_load_module(void* context, const char* path)
         }
     } else {
         // load CUBIN
-        if (!check_cu(cuModuleLoadDataEx_f(&module, input.data(), 0, NULL, NULL))) {
+        if (!check_cu(cuModuleLoadDataEx_f(&module, image, 0, NULL, NULL))) {
             fprintf(stderr, "Warp CUDA error: Loading module failed\n");
             return NULL;
         }
@@ -5175,19 +5646,36 @@ void* wp_cuda_load_module(void* context, const char* path)
     return module;
 }
 
+void* wp_cuda_load_module(void* context, const char* path)
+{
+    std::vector<char> input;
+
+    FILE* file = fopen(path, "rb");
+    if (file) {
+        fseek(file, 0, SEEK_END);
+        size_t length = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        input.resize(length + 1);
+        if (fread(input.data(), 1, length, file) != length) {
+            fprintf(stderr, "Warp error: Failed to read input file '%s'\n", path);
+            fclose(file);
+            return NULL;
+        }
+        fclose(file);
+
+        input[length] = '\0';
+    } else {
+        fprintf(stderr, "Warp error: Failed to open input file '%s'\n", path);
+        return NULL;
+    }
+
+    return cuda_load_module_image(context, input.data(), input.size(), cuda_module_path_is_ptx(path));
+}
+
 void wp_cuda_unload_module(void* context, void* module)
 {
-    // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
-        ContextGuard guard(context);
-        check_cu(cuModuleUnload_f((CUmodule)module));
-    } else {
-        // defer until graph capture completes
-        ModuleInfo module_info;
-        module_info.context = context ? context : get_current_context();
-        module_info.module = module;
-        g_deferred_module_list.push_back(module_info);
-    }
+    release_or_defer(ReleaseKind::Module, context, (uint64_t)module);
 }
 
 
@@ -5215,6 +5703,128 @@ bool wp_cuda_configure_kernel_shared_memory(void* kernel, int size)
     return true;
 }
 
+static int get_cuda_kernel_attribute(void* context, void* kernel, CUfunction_attribute attribute)
+{
+    if (!kernel)
+        return -1;
+
+    ContextGuard guard(context);
+
+    int value = 0;
+    if (!check_cu(cuFuncGetAttribute_f(&value, attribute, (CUfunction)kernel)))
+        return -1;
+
+    return value;
+}
+
+int wp_cuda_get_kernel_static_shared_memory(void* context, void* kernel)
+{
+    return get_cuda_kernel_attribute(context, kernel, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES);
+}
+
+bool wp_cuda_get_kernel_properties(void* context, void* kernel, int* properties, int property_count)
+{
+    constexpr int kernel_property_count = 2;
+    if (!kernel || !properties || property_count != kernel_property_count)
+        return false;
+
+    ContextGuard guard(context);
+    int queried_properties[kernel_property_count] = {};
+
+    if (!check_cu(cuFuncGetAttribute_f(&queried_properties[0], CU_FUNC_ATTRIBUTE_NUM_REGS, (CUfunction)kernel)))
+        return false;
+    if (!check_cu(cuFuncGetAttribute_f(&queried_properties[1], CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, (CUfunction)kernel)))
+        return false;
+
+    properties[0] = queried_properties[0];
+    properties[1] = queried_properties[1];
+    return true;
+}
+
+bool wp_cuda_set_kernel_cluster_attrs(void* kernel, int cx, int cy, int cz)
+{
+    if (!kernel)
+        return false;
+
+    int total = cx * cy * cz;
+    if (total <= 1)
+        return true;  // (1,1,1) and other unit shapes are pure no-ops.
+
+    if (total > 8) {
+        // CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED == 14
+        // (defined in CUDA 12.0 headers; declared as a constant here to
+        // decouple from any future header reorg).
+        const CUfunction_attribute non_portable_attr = (CUfunction_attribute)14;
+        CUresult res = cuFuncSetAttribute_f((CUfunction)kernel, non_portable_attr, 1);
+        if (res != CUDA_SUCCESS)
+            return false;
+    }
+
+    return true;
+}
+
+int wp_cuda_get_max_cluster_dim(void* context, void* kernel, int block_dim, int dynamic_smem_bytes)
+{
+    if (!kernel || !context)
+        return 1;
+
+    ContextGuard guard(context);
+
+    // Opt into non-portable cluster sizes so probes above 8 are valid on
+    // hardware that supports them. The attribute is a no-op on cluster sizes
+    // <= 8. CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED == 14.
+    //
+    // This is a query helper, so save and restore the attribute to avoid
+    // permanently opting the caller's kernel into non-portable cluster sizes
+    // as a side effect of probing. If the attribute can't be read back,
+    // prior_non_portable stays 0 (disabled), which is the value we restore.
+    const CUfunction_attribute non_portable_attr = (CUfunction_attribute)14;
+    int prior_non_portable = 0;
+    cuFuncGetAttribute_f(&prior_non_portable, non_portable_attr, (CUfunction)kernel);
+    cuFuncSetAttribute_f((CUfunction)kernel, non_portable_attr, 1);
+
+    // Descending probe via cuOccupancyMaxActiveClusters: return the largest
+    // cluster_dim the driver reports as launchable. For plain kernels this
+    // reveals the device's true cluster limit (8 on integrated Hopper+ SoCs
+    // like Thor sm_101 and DGX Spark sm_121, up to 16 on Hopper/Blackwell
+    // desktop parts). For kernels with __cluster_dims__ baked in, the driver
+    // only accepts the declared size, so we get the declared value back (or
+    // 1 if the device can't support it).
+    CUlaunchAttribute cluster_attr = {};
+    cluster_attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    cluster_attr.value.clusterDim.y = 1;
+    cluster_attr.value.clusterDim.z = 1;
+
+    CUlaunchConfig config = {};
+    config.gridDimY = 1;
+    config.gridDimZ = 1;
+    config.blockDimX = (unsigned int)block_dim;
+    config.blockDimY = 1;
+    config.blockDimZ = 1;
+    config.sharedMemBytes = (unsigned int)dynamic_smem_bytes;
+    config.hStream = 0;
+    config.attrs = &cluster_attr;
+    config.numAttrs = 1;
+
+    int max_cluster_dim = 1;
+    for (int cd = 16; cd >= 2; --cd) {
+        cluster_attr.value.clusterDim.x = (unsigned int)cd;
+        config.gridDimX = (unsigned int)cd;
+        int num_clusters = 0;
+        CUresult res = cuOccupancyMaxActiveClusters_f(&num_clusters, (CUfunction)kernel, &config);
+        if (res == CUDA_SUCCESS && num_clusters >= 1) {
+            max_cluster_dim = cd;
+            break;
+        }
+    }
+
+    // Restore the prior value (disabled when the read-back above failed) so
+    // probing leaves no observable side effect on the caller's kernel.
+    cuFuncSetAttribute_f((CUfunction)kernel, non_portable_attr, prior_non_portable);
+
+    return max_cluster_dim;
+}
+
 void* wp_cuda_get_kernel(void* context, void* module, const char* name)
 {
     ContextGuard guard(context);
@@ -5235,6 +5845,8 @@ size_t wp_cuda_launch_kernel(
     size_t dim,
     int max_blocks,
     int block_dim,
+    int grid_stride,
+    int cluster_dim,
     int shared_memory_bytes,
     void** args,
     void* stream,
@@ -5250,35 +5862,107 @@ size_t wp_cuda_launch_kernel(
         block_dim = 256;
     }
 
-    // CUDA specs up to compute capability 9.0 says the max x-dim grid is 2**31-1, so
-    // grid_dim is fine as an int for the near future
-    int grid_dim = (dim + block_dim - 1) / block_dim;
-
-    if (max_blocks <= 0) {
-        max_blocks = 2147483647;
+    if (cluster_dim <= 0) {
+        cluster_dim = 1;
+    }
+    if (cluster_dim > 1) {
+        ContextInfo* context_info = get_context_info(static_cast<CUcontext>(context));
+        if (!context_info || !context_info->device_info || context_info->device_info->arch < 90) {
+            cluster_dim = 1;
+        }
     }
 
-    if (grid_dim < 0) {
-#if defined(_DEBUG)
-        fprintf(
-            stderr,
-            "Warp warning: Overflow in grid dimensions detected for %zu total elements and 256 threads "
-            "per block.\n    Setting block count to %d.\n",
-            dim, max_blocks
-        );
-#endif
-        grid_dim = max_blocks;
-    } else {
-        if (grid_dim > max_blocks) {
-            grid_dim = max_blocks;
+    unsigned int grid_x, grid_y = 1, grid_z = 1;
+
+    if (grid_stride) {
+        // Grid-stride loop kernel: a 1D grid suffices because the loop covers every work item.
+        // max_blocks (when set) caps the block count; otherwise use the CUDA gridDim.x max (2**31-1).
+        // A clustered kernel needs gridDim.x to be a multiple of cluster_dim: an untruncated grid must
+        // already be aligned (pad dim), while a grid truncated by max_blocks rounds down to a whole
+        // number of clusters (the loop still covers every work item).
+        int natural_grid_dim = (dim + block_dim - 1) / block_dim;
+        int grid_dim = natural_grid_dim;
+        int cap = (max_blocks > 0) ? max_blocks : 2147483647;
+        if (grid_dim < 0)
+            grid_dim = cap;
+        else if (grid_dim > cap)
+            grid_dim = cap;
+        if (cluster_dim > 1 && grid_dim > 0) {
+            if (grid_dim == natural_grid_dim) {
+                if (grid_dim % cluster_dim != 0) {
+                    wp::set_error_string(
+                        "Warp CUDA error: clustered kernel launch requires the block count to be a multiple of "
+                        "cluster_dim (got %d blocks, cluster_dim=%d); pad dim to a whole number of clusters",
+                        grid_dim, cluster_dim
+                    );
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+            } else {
+                grid_dim = (grid_dim / cluster_dim) * cluster_dim;
+                if (grid_dim == 0) {
+                    wp::set_error_string(
+                        "Warp CUDA error: clustered kernel launch requires max_blocks to be 0 or at least cluster_dim "
+                        "(got max_blocks=%d, cluster_dim=%d)",
+                        max_blocks, cluster_dim
+                    );
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+            }
         }
+        grid_x = (unsigned int)(grid_dim <= 0 ? 1 : grid_dim);
+    } else {
+        // Lean 3D kernel (no loop): spread blocks across a 3D grid so the launch can exceed the
+        // gridDim.x limit. Cap grid.x so gridDim.x*blockDim.x stays within uint32 (matching the
+        // lean kernel template's index math on the IMAD.WIDE.U32 fast path), then spill the
+        // remaining blocks into grid.y and grid.z (each capped at 65535).
+        //
+        // Clusters group cluster_dim blocks along x, but a lean block early-returns (before any
+        // cluster barrier) when _idx >= dim.size. To keep every cluster all-run or all-return, require
+        // the block count to be a whole number of clusters (pad dim) and keep grid.x a multiple of
+        // cluster_dim, so the run/early-return boundary lands on a cluster boundary.
+        size_t total_blocks = (dim + block_dim - 1) / block_dim;
+        if (cluster_dim > 1 && (total_blocks % (size_t)cluster_dim) != 0) {
+            wp::set_error_string(
+                "Warp CUDA error: clustered kernel launch requires the block count to be a multiple of "
+                "cluster_dim (got %zu blocks, cluster_dim=%d); pad dim to a whole number of clusters",
+                total_blocks, cluster_dim
+            );
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        unsigned int max_grid_x = (1u << 24) / (unsigned int)block_dim;
+        if (cluster_dim > 1) {
+            max_grid_x = (max_grid_x / (unsigned int)cluster_dim) * (unsigned int)cluster_dim;
+            if (max_grid_x == 0)
+                max_grid_x = (unsigned int)cluster_dim;
+        }
+        unsigned int gx = (unsigned int)(total_blocks < (size_t)max_grid_x ? total_blocks : (size_t)max_grid_x);
+        if (gx == 0)
+            gx = 1;
+        size_t remaining = (total_blocks + gx - 1) / gx;
+        unsigned int gy = (unsigned int)(remaining < 65535u ? remaining : 65535u);
+        if (gy == 0)
+            gy = 1;
+        unsigned int gz = (unsigned int)((remaining + gy - 1) / gy);
+        if (gz == 0)
+            gz = 1;
+        if (gz > 65535u)
+            gz = 65535u;
+        grid_x = gx;
+        grid_y = gy;
+        grid_z = gz;
     }
 
     begin_cuda_range(WP_TIMING_KERNEL, stream, context, get_cuda_kernel_name(kernel));
 
-    CUresult res = cuLaunchKernel_f(
-        (CUfunction)kernel, grid_dim, 1, 1, block_dim, 1, 1, shared_memory_bytes, static_cast<CUstream>(stream), args, 0
-    );
+    // Skip the launch for an empty grid (no work): the dummy gridDim.x=1 fallback is not a multiple
+    // of cluster_dim, so an empty clustered launch (e.g. a recorded lean launch resized via
+    // set_dim(0)) would otherwise be rejected by CUDA.
+    CUresult res = CUDA_SUCCESS;
+    if (dim > 0)
+        res = cuLaunchKernel_f(
+            (CUfunction)kernel, grid_x, grid_y, grid_z, block_dim, 1, 1, shared_memory_bytes,
+            static_cast<CUstream>(stream), args, 0
+        );
 
     check_cu(res);
 
@@ -5286,7 +5970,7 @@ size_t wp_cuda_launch_kernel(
 
     // APIC recording: record kernel launch to byte stream if capturing
     if (apic_info) {
-        APICState* state = wp_apic_get_recording_state();
+        APICState* state = wp_apic_get_cuda_recording_state();
         if (state) {
             // Read shape and size from launch_bounds_t<N> in args[0].
             int ndim = apic_info->kernel_dim;
@@ -5295,10 +5979,10 @@ size_t wp_cuda_launch_kernel(
             if (ndim > APIC_LAUNCH_MAX_DIMS)
                 ndim = APIC_LAUNCH_MAX_DIMS;
 
-            int shape[APIC_LAUNCH_MAX_DIMS] = {};
+            uint32_t shape[APIC_LAUNCH_MAX_DIMS] = {};
             uint64_t launch_size = dim;
             if (args && args[0]) {
-                const int* bounds_shape = static_cast<const int*>(args[0]);
+                const uint32_t* bounds_shape = static_cast<const uint32_t*>(args[0]);
                 for (int d = 0; d < ndim; d++)
                     shape[d] = bounds_shape[d];
 
@@ -5306,14 +5990,14 @@ size_t wp_cuda_launch_kernel(
                 const uint8_t* bounds_bytes = static_cast<const uint8_t*>(args[0]);
                 launch_size = *reinterpret_cast<const size_t*>(bounds_bytes + size_offset);
             } else {
-                shape[0] = (int)dim;
+                shape[0] = static_cast<uint32_t>(dim);
             }
 
             apic_record_kernel_launch(
                 state, apic_info->kernel_key, apic_info->module_hash, apic_info->is_forward, shape, ndim, launch_size,
-                max_blocks, block_dim, shared_memory_bytes, apic_info->params, apic_info->num_params,
-                apic_info->adj_params, apic_info->relocs, apic_info->num_relocs, apic_info->value_data,
-                apic_info->value_data_size
+                max_blocks, block_dim, grid_stride, cluster_dim, shared_memory_bytes, apic_info->params,
+                apic_info->num_params, apic_info->adj_params, apic_info->relocs, apic_info->num_relocs,
+                apic_info->value_data, apic_info->value_data_size
             );
         }
     }

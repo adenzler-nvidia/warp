@@ -7,12 +7,10 @@ from typing import Any, ClassVar
 import warp as wp
 from warp._src.fem import cache
 from warp._src.fem.space import FunctionSpace, SpacePartition
-from warp._src.fem.types import NULL_NODE_INDEX, ElementIndex
+from warp._src.fem.types import NULL_DOF_INDEX, NULL_NODE_INDEX, ElementIndex
 from warp._src.fem.utils import type_zero_element
 
 from .field import DiscreteField
-
-_wp_module_name_ = "warp.fem.field.nodal_field"
 
 
 class NodalFieldBase(DiscreteField):
@@ -435,7 +433,10 @@ class NodalFieldBase(DiscreteField):
             node_coords = self.space.basis.node_coords_in_element(
                 args.elt_arg, args.eval_arg.topo_arg, args.eval_arg.basis_arg, s.element_index, node_index_in_elt
             )
-            return self.SampleType(s.element_index, node_coords, s.qp_index, s.qp_weight, s.test_dof, s.trial_dof)
+            # Test and trial functions are only defined at the original sample, not at this field's nodes
+            return self.SampleType(
+                s.element_index, node_coords, s.qp_index, s.qp_weight, NULL_DOF_INDEX, NULL_DOF_INDEX
+            )
 
         return at_node
 

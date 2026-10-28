@@ -77,6 +77,8 @@ CUresult cuCtxSetCurrent_f(CUcontext ctx);
 CUresult cuCtxPushCurrent_f(CUcontext ctx);
 CUresult cuCtxPopCurrent_f(CUcontext* ctx);
 CUresult cuCtxSynchronize_f();
+CUresult cuProfilerStart_f();
+CUresult cuProfilerStop_f();
 CUresult cuCtxGetDevice_f(CUdevice* dev);
 CUresult cuCtxCreate_f(CUcontext* ctx, unsigned int flags, CUdevice dev);
 CUresult cuCtxDestroy_f(CUcontext ctx);
@@ -162,7 +164,9 @@ CUresult cuGraphicsSubResourceGetMappedArray_f(
 );
 CUresult cuGraphicsUnregisterResource_f(CUgraphicsResource resource);
 CUresult cuModuleGetGlobal_f(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name);
+CUresult cuOccupancyMaxActiveClusters_f(int* numClusters, CUfunction func, const CUlaunchConfig* config);
 CUresult cuFuncSetAttribute_f(CUfunction hfunc, CUfunction_attribute attrib, int value);
+CUresult cuFuncGetAttribute_f(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
 CUresult cuIpcGetEventHandle_f(CUipcEventHandle* pHandle, CUevent event);
 CUresult cuIpcOpenEventHandle_f(CUevent* phEvent, CUipcEventHandle handle);
 CUresult cuIpcGetMemHandle_f(CUipcMemHandle* pHandle, CUdeviceptr dptr);
@@ -253,6 +257,19 @@ inline CUcontext get_stream_context(CUstream stream)
 }
 
 inline CUcontext get_stream_context(void* stream) { return get_stream_context(static_cast<CUstream>(stream)); }
+
+// Returns the process-unique id of the stream. Stream ids are never reused,
+// unlike stream handles.
+// CAUTION: Must not be called on a capturing stream
+// (returns cudaErrorStreamCaptureUnsupported and invalidates the capture).
+inline uint64_t get_stream_id(CUstream stream)
+{
+    unsigned long long id = 0;
+    check_cuda(cudaStreamGetId(stream, &id));
+    return uint64_t(id);
+}
+
+inline uint64_t get_stream_id(void* stream) { return get_stream_id(static_cast<CUstream>(stream)); }
 
 
 //
@@ -362,6 +379,53 @@ constexpr int WP_TIMING_GRAPH = 16;  // graph launch
 
 extern CudaTimingState* g_cuda_timing_state;
 
+// Information used for freeing allocations.
+struct FreeInfo {
+    void* context = NULL;
+    void* ptr = NULL;
+    bool is_async = false;
+};
+
+struct CaptureInfo {
+    CUstream stream = NULL;  // the main stream where capture begins and ends
+    CUcontext context = NULL;  // context where capture was started
+    uint64_t id = 0;  // unique capture id from CUDA
+    bool external = false;  // whether this is an external capture
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeThreadLocal;  // mode used to open the capture (for pause/resume)
+    std::vector<FreeInfo> tmp_allocs;  // temporary allocations owned by the graph (e.g., staged array fill values)
+};
+
+struct StreamInfo {
+    CUevent cached_event = NULL;  // event used for stream synchronization (cached to avoid creating temporary events)
+    CaptureInfo* capture = NULL;  // capture info (only if started on this stream)
+};
+
+CaptureInfo* get_capture_info(CUstream stream);
+StreamInfo* get_stream_info(CUstream stream);
+
+// Find the registered capture that owns the given capture id, either directly
+// (top-level capture) or as the parent of a child graph capture currently being
+// recorded. Works for any stream participating in the capture, including forked
+// streams. Returns NULL for unregistered captures.
+CaptureInfo* find_capture_info(uint64_t capture_id);
+
+// Resources whose release would invalidate a graph capture in progress.
+enum class ReleaseKind {
+    DeviceFree,
+    DeviceFreeAsync,
+    DeviceFreeAsyncUnmapped,  // tolerates memory left unmapped by a graph that never ran
+    PinnedFree,  // not tied to a context
+    Module,
+    Graph,  // not tied to a context, so it outlives a destroyed one
+    GraphExec,
+    TextureObject,
+    SurfaceObject,
+    Array,
+    MipmappedArray,
+};
+
+// Returns false if an immediate release failed.
+bool release_or_defer(ReleaseKind kind, void* context, uint64_t handle);
 
 #else
 

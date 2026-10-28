@@ -7,36 +7,34 @@ import concurrent.futures
 import functools
 import os
 import pathlib
-import platform
 import re
 import shutil
 import subprocess
 import sys
-import sysconfig
 import time
 
+from warp._src.build_architecture import Architecture, machine_architecture
 from warp._src.utils import ScopedTimer
-
-_wp_module_name_ = "warp.build_dll"
 
 verbose_cmd = True  # print command lines before executing them
 
 MIN_CTK_VERSION = (12, 0)
 
-# Echoed by our wrapper command before dumping the environment; vcvars64.bat does not emit it.
+# Echoed by our wrapper command before dumping the environment; the MSVC
+# environment script does not emit it.
 _VCVARS_ENV_DUMP_MARKER = "__WARP_VCVARS_ENV_BEGIN__"
 
 
 def _parse_vcvars_environment(output: str) -> dict[str, str]:
-    """Parse environment variables from ``vcvars64.bat && set`` output.
+    """Parse environment variables from selected MSVC script ``&& set`` output.
 
     Scans the command output for ``_VCVARS_ENV_DUMP_MARKER`` and only begins parsing
-    after it, so any banner text emitted by ``vcvars64.bat`` is ignored. Each
+    after it, so any banner text emitted by the selected MSVC script is ignored. Each
     subsequent line is split on the first ``=`` into a ``KEY=VALUE`` pair; lines
     without a separator or with an empty key are skipped.
 
     Args:
-        output: Decoded output of ``vcvars64.bat && echo MARKER && set``.
+        output: Decoded output of selected MSVC script ``&& echo MARKER && set``.
 
     Returns:
         Mapping of environment variable names to values found after the marker.
@@ -59,17 +57,37 @@ def _parse_vcvars_environment(output: str) -> dict[str, str]:
     return env
 
 
-def machine_architecture() -> str:
-    """Return a canonical machine architecture string.
-    - "x86_64" for x86-64, aka. AMD64, aka. x64
-    - "aarch64" for AArch64, aka. ARM64
+def _msvc_toolchain_layout(arch: Architecture) -> tuple[str, str]:
+    if arch == "aarch64":
+        return "HostARM64", "arm64"
+    return "HostX64", "x64"
+
+
+def _msvc_environment_script(vs_path: str, arch: Architecture) -> tuple[str, list[str]]:
+    if arch == "aarch64":
+        return (
+            os.path.join(vs_path, "Common7", "Tools", "VsDevCmd.bat"),
+            ["-arch=arm64", "-host_arch=arm64"],
+        )
+    return os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat"), []
+
+
+def packman_llvm_platform(arch: str) -> str:
+    """Map a Warp architecture string to the Packman platform token for the prebuilt Clang/LLVM SDK.
+
+    These tokens are the ones used in ``deps/llvm-deps.packman.xml``. They follow
+    ``packman.utils.get_platform()`` rather than the spelling inside the release asset names, so that a
+    manual ``packman pull`` with no ``--platform`` resolves on a native host.
+
+    ``build_llvm.py`` star-imports this module, so this is the single definition for both the library
+    and the build scripts. Keep it in sync with ``warp_get_llvm_packman_platform()`` in
+    ``tools/cmake/WarpDependencies.cmake``, which must express the same mapping in CMake.
     """
-    machine = platform.machine()
-    if machine == "x86_64" or machine == "AMD64":
-        return "x86_64"
-    if machine == "aarch64" or machine == "arm64":
-        return "aarch64"
-    raise RuntimeError(f"Unrecognized machine architecture {machine}")
+    if os.name == "nt":
+        return f"windows-{arch}"
+    if sys.platform == "darwin":
+        return f"macos-{arch}"
+    return f"linux-{arch}"
 
 
 def run_cmd(cmd, print_success_output=True):
@@ -92,9 +110,12 @@ def run_cmd(cmd, print_success_output=True):
         raise e
 
 
-# cut-down version of vcvars64.bat that allows using
+# Cut-down version of the MSVC environment script that allows using
 # custom toolchain locations, returns the compiler program path
-def set_msvc_env(msvc_path, sdk_path):
+def set_msvc_env(msvc_path, sdk_path, host_arch: Architecture | None = None) -> str:
+    host_arch = host_arch or machine_architecture()
+    host_directory, target_directory = _msvc_toolchain_layout(host_arch)
+
     if "INCLUDE" not in os.environ:
         os.environ["INCLUDE"] = ""
 
@@ -110,17 +131,17 @@ def set_msvc_env(msvc_path, sdk_path):
     os.environ["INCLUDE"] += os.pathsep + os.path.join(sdk_path, "include/ucrt")
     os.environ["INCLUDE"] += os.pathsep + os.path.join(sdk_path, "include/shared")
 
-    os.environ["LIB"] += os.pathsep + os.path.join(msvc_path, "lib/x64")
-    os.environ["LIB"] += os.pathsep + os.path.join(sdk_path, "lib/ucrt/x64")
-    os.environ["LIB"] += os.pathsep + os.path.join(sdk_path, "lib/um/x64")
+    os.environ["LIB"] += os.pathsep + os.path.join(msvc_path, "lib", target_directory)
+    os.environ["LIB"] += os.pathsep + os.path.join(sdk_path, "lib", "ucrt", target_directory)
+    os.environ["LIB"] += os.pathsep + os.path.join(sdk_path, "lib", "um", target_directory)
 
-    os.environ["PATH"] += os.pathsep + os.path.join(msvc_path, "bin/HostX64/x64")
-    os.environ["PATH"] += os.pathsep + os.path.join(sdk_path, "bin/x64")
+    os.environ["PATH"] += os.pathsep + os.path.join(msvc_path, "bin", host_directory, target_directory)
+    os.environ["PATH"] += os.pathsep + os.path.join(sdk_path, "bin", target_directory)
 
-    return os.path.join(msvc_path, "bin", "HostX64", "x64", "cl.exe")
+    return os.path.join(msvc_path, "bin", host_directory, target_directory, "cl.exe")
 
 
-def find_host_compiler() -> str:
+def find_host_compiler(host_arch: Architecture | None = None) -> str:
     """Find the host C++ compiler.
 
     On Windows, checks for pre-configured Visual Studio environment before
@@ -131,36 +152,52 @@ def find_host_compiler() -> str:
         Path to compiler executable, or empty string if not found (Windows only).
         Note: Empty string return allows build_lib.py to handle error gracefully.
     """
-    if os.name == "nt":
-        # Check if Visual Studio environment already configured (conda, Docker, vcvars64, etc.)
-        # VCINSTALLDIR and VCToolsVersion are set by vcvars64.bat
-        if os.environ.get("VCINSTALLDIR") or os.environ.get("VCToolsVersion"):
-            if verbose_cmd:
-                print("Visual Studio environment already configured, skipping vcvars64.bat")
+    host_arch = host_arch or machine_architecture()
 
-            cl_path = shutil.which("cl.exe")
-            if cl_path:
+    if os.name == "nt":
+        # Check if Visual Studio environment already configured (conda, Docker, etc.)
+        # VCINSTALLDIR and VCToolsVersion are set by the MSVC environment script.
+        if os.environ.get("VCINSTALLDIR") or os.environ.get("VCToolsVersion"):
+            arm_environment_matches = (
+                os.environ.get("VSCMD_ARG_HOST_ARCH") == "arm64" and os.environ.get("VSCMD_ARG_TGT_ARCH") == "arm64"
+            )
+            if host_arch != "aarch64" or arm_environment_matches:
                 if verbose_cmd:
-                    print(f"Using cl.exe from pre-configured environment: {cl_path}")
-                return cl_path
-            else:
-                # Fall through to auto-configuration if cl.exe not actually available
+                    print("Visual Studio environment already configured, skipping MSVC environment script")
+
+                cl_path = shutil.which("cl.exe")
+                if cl_path:
+                    if verbose_cmd:
+                        print(f"Using cl.exe from pre-configured environment: {cl_path}")
+                    return cl_path
+                # Fall through to auto-configuration if cl.exe is not actually available.
                 if verbose_cmd:
                     print("Warning: VS environment variables set but cl.exe not found, attempting auto-configuration")
+            else:
+                if verbose_cmd:
+                    print("Warning: VS environment is not configured for native ARM64, attempting auto-configuration")
 
         vswhere_path = r"%ProgramFiles(x86)%/Microsoft Visual Studio/Installer/vswhere.exe"
         vswhere_path = os.path.expandvars(vswhere_path)
         if not os.path.isfile(vswhere_path):
             return ""  # Signal to caller that VS not found
 
-        vs_path = run_cmd(f'"{vswhere_path}" -latest -property installationPath').decode().rstrip()
-        vsvars_path = os.path.join(vs_path, "VC\\Auxiliary\\Build\\vcvars64.bat")
+        component = (
+            "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+            if host_arch == "aarch64"
+            else "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+        )
+        vs_path = (
+            run_cmd(f'"{vswhere_path}" -latest -requires {component} -property installationPath').decode().rstrip()
+        )
+        vsvars_path, vsvars_arguments = _msvc_environment_script(vs_path, host_arch)
 
         if not os.path.isfile(vsvars_path):
             return ""  # Signal to caller that VS environment script not found
 
+        vsvars_command = " ".join([f'"{vsvars_path}"', *vsvars_arguments])
         output = run_cmd(
-            f'"{vsvars_path}" && echo {_VCVARS_ENV_DUMP_MARKER} && set', print_success_output=False
+            f"{vsvars_command} && echo {_VCVARS_ENV_DUMP_MARKER} && set", print_success_output=False
         ).decode()
 
         os.environ.update(_parse_vcvars_environment(output))
@@ -172,6 +209,11 @@ def find_host_compiler() -> str:
         vc_tools_version = os.environ.get("VCToolsVersion")
         if not vc_tools_version:
             return ""  # Signal to caller that VS environment script did not configure MSVC
+
+        if host_arch == "aarch64" and (
+            os.environ.get("VSCMD_ARG_HOST_ARCH") != "arm64" or os.environ.get("VSCMD_ARG_TGT_ARCH") != "arm64"
+        ):
+            return ""  # Signal to caller that the MSVC environment script selected the wrong architecture
 
         cl_version = vc_tools_version.split(".")
 
@@ -339,7 +381,7 @@ def get_llvm_include_paths(args, warp_home_path, mode: str, arch: str) -> list[s
         FileNotFoundError: If user-provided llvm_path include directory doesn't exist.
     """
     if hasattr(args, "llvm_path") and args.llvm_path:
-        # Use LLVM include path if provided (e.g., from Docker /opt/llvm)
+        # Use LLVM include path if the caller supplied one
         include_path = os.path.join(args.llvm_path, "include")
         if not os.path.isdir(include_path):
             print(f"Warning: LLVM include directory not found: {include_path}")
@@ -355,7 +397,12 @@ def get_llvm_include_paths(args, warp_home_path, mode: str, arch: str) -> list[s
             warp_home_path.parent, "external", "llvm-project", "out", "install", f"{mode}-{arch}", "include"
         )
         packman_path = os.path.join(
-            warp_home_path.parent, "_build", "host-deps", "llvm-project", f"release-{arch}", "include"
+            warp_home_path.parent,
+            "_build",
+            "host-deps",
+            "llvm-project",
+            f"release-{packman_llvm_platform(arch)}",
+            "include",
         )
 
         # Check paths in priority order
@@ -380,6 +427,10 @@ def _get_architectures_cu12(
     gencode_opts = []
     clang_arch_flags = []
 
+    # Clang 24 rejects targets below sm_60 because it lowers generic CUDA atomics with system scope.
+    # See https://github.com/llvm/llvm-project/issues/224420.
+    # Keep sm_52 and sm_53 in the nvcc flags because production builds still support Maxwell.
+
     if quick_build:
         gencode_opts = ["-gencode=arch=compute_75,code=compute_75"]
         clang_arch_flags = ["--cuda-gpu-arch=sm_75"]
@@ -402,7 +453,6 @@ def _get_architectures_cu12(
             )
             clang_arch_flags.extend(
                 [
-                    "--cuda-gpu-arch=sm_52",
                     "--cuda-gpu-arch=sm_60",
                     "--cuda-gpu-arch=sm_61",
                     "--cuda-gpu-arch=sm_70",
@@ -447,7 +497,6 @@ def _get_architectures_cu12(
             clang_arch_flags.extend(
                 [
                     "--cuda-gpu-arch=sm_87",
-                    "--cuda-gpu-arch=sm_53",
                     "--cuda-gpu-arch=sm_62",
                     "--cuda-gpu-arch=sm_72",
                 ]
@@ -532,7 +581,16 @@ def _get_architectures_cu13(
     return gencode_opts, clang_arch_flags
 
 
-def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str] | None = None, mode=None):
+def build_dll_for_arch(
+    args,
+    dll_path,
+    cpp_paths,
+    cu_paths,
+    arch,
+    libs: list[str] | None = None,
+    mode=None,
+    exported_symbols_file: str | None = None,
+):
     mode = args.mode if (mode is None) else mode
     cuda_home = args.cuda_path
     cuda_cmd = None
@@ -559,20 +617,17 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
     native_dir = os.path.join(warp_home, "native")
 
-    # Validate Python development headers for fastcall.cpp
-    python_include_dir = sysconfig.get_path("include")
-    if not python_include_dir or not os.path.isfile(os.path.join(python_include_dir, "Python.h")):
-        raise RuntimeError(
-            f"Python development headers not found (looked in {python_include_dir}).\n"
-            f"Install the Python development package, e.g.: `sudo apt install libpython{sys.version_info.major}.{sys.version_info.minor}-dev`"
-        )
-
     if cu_paths:
         # check CUDA Toolkit version
         ctk_version = get_cuda_toolkit_version(cuda_home)
         if ctk_version < MIN_CTK_VERSION:
             raise Exception(
                 f"CUDA Toolkit version {MIN_CTK_VERSION[0]}.{MIN_CTK_VERSION[1]}+ is required (found {ctk_version[0]}.{ctk_version[1]} in {cuda_home})"
+            )
+        if sys.platform == "win32" and arch == "aarch64" and ctk_version < (13, 4):
+            raise RuntimeError(
+                f"CUDA Toolkit 13.4+ is required for Windows ARM64 builds "
+                f"(found {ctk_version[0]}.{ctk_version[1]} in {cuda_home})"
             )
 
         # Get architecture flags based on CUDA version
@@ -583,15 +638,24 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
         nvcc_opts = [
             *gencode_opts,
+            "-DWP_BUILD_DLL",
             "-t0",  # multithreaded compilation
             "--extended-lambda",
             "-diag-suppress=221",  # suppress "floating-point value does not fit" warning from INFINITY macro in CUDA headers
         ]
 
+        if sys.platform == "win32":
+            # CCCL headers require MSVC's standard conforming preprocessor.
+            nvcc_opts.append("-Xcompiler /Zc:preprocessor")
+            if arch == "aarch64":
+                nvcc_opts.append("-target-dir arm64")
+                nvcc_opts.append(f'--compiler-bindir="{os.path.dirname(args.host_compiler)}"')
+
         # Clang options
         clang_opts = [
             *clang_arch_flags,
             "-std=c++20",
+            "-DWP_BUILD_DLL",
             "-xcuda",
             f'--cuda-path="{cuda_home}"',
             "-D_GLIBCXX_USE_CXX11_ABI=0",
@@ -627,6 +691,8 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
         mathdx_enabled = "WP_ENABLE_MATHDX=0"
 
     if os.name == "nt":
+        cuda_lib_arch = "arm64" if arch == "aarch64" else "x64"
+
         if args.host_compiler:
             host_linker = os.path.join(os.path.dirname(args.host_compiler), "link.exe")
         else:
@@ -648,7 +714,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             iter_dbg = "_ITERATOR_DEBUG_LEVEL=2"
             debug = "_DEBUG"
 
-        cpp_flags = f'/nologo /std:c++20 /GR- /EHsc {runtime} /D "{debug}" /D "{cuda_enabled}" /D "{mathdx_enabled}" /D "{cuda_compat_enabled}" /D "{iter_dbg}" /I"{native_dir}" {includes} '
+        cpp_flags = f'/nologo /std:c++20 /GR- /EHsc {runtime} /D "WP_BUILD_DLL" /D "{debug}" /D "{cuda_enabled}" /D "{mathdx_enabled}" /D "{cuda_compat_enabled}" /D "{iter_dbg}" /I"{native_dir}" {includes} '
 
         if args.mode == "debug":
             cpp_flags += "/FS /Zi /Od /D WP_ENABLE_DEBUG=1"
@@ -686,8 +752,6 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 extra_flags = ""
                 if "clang/clang.cpp" in cpp_path.replace("\\", "/"):
                     extra_flags = " /wd4624"  # suppress C4624: destructor was implicitly defined as deleted
-                if "fastcall.cpp" in cpp_path:
-                    extra_flags += f' /I"{python_include_dir}" /DPy_LIMITED_API=0x030a0000'  # Python 3.10
                 cpp_cmd = f'"{args.host_compiler}" {cpp_flags}{extra_flags} -c "{cpp_path}" /Fo"{cpp_out}"'
                 cpp_cmds.append(cpp_cmd)
 
@@ -718,19 +782,21 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
                 if args.use_dynamic_cuda:
                     linkopts.append(
-                        f'cudart.lib nvrtc.lib nvptxcompiler_static.lib ws2_32.lib user32.lib /LIBPATH:"{cuda_home}/lib/x64"'
+                        f'cudart.lib nvrtc.lib nvptxcompiler_static.lib ws2_32.lib user32.lib /LIBPATH:"{cuda_home}/lib/{cuda_lib_arch}"'
                     )
                 else:
                     linkopts.append(
-                        f'cudart_static.lib nvrtc_static.lib nvrtc-builtins_static.lib nvptxcompiler_static.lib ws2_32.lib user32.lib /LIBPATH:"{cuda_home}/lib/x64"'
+                        f'cudart_static.lib nvrtc_static.lib nvrtc-builtins_static.lib nvptxcompiler_static.lib ws2_32.lib user32.lib ntdll.lib /LIBPATH:"{cuda_home}/lib/{cuda_lib_arch}"'
                     )
 
                 if args.libmathdx_path:
                     if args.use_dynamic_cuda:
-                        linkopts.append(f'nvJitLink.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx.lib')
+                        linkopts.append(
+                            f'nvJitLink.lib /LIBPATH:"{args.libmathdx_path}/lib/{cuda_lib_arch}" mathdx.lib'
+                        )
                     else:
                         linkopts.append(
-                            f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/x64" mathdx_static.lib'
+                            f'nvJitLink_static.lib /LIBPATH:"{args.libmathdx_path}/lib/{cuda_lib_arch}" mathdx_static.lib'
                         )
 
             if args.jobs <= 1:
@@ -750,14 +816,9 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 elapsed = (time.perf_counter_ns() - wall_clock) / 1000000.0
                 print(f"build took {elapsed:.2f} ms ({args.jobs:d} workers)")
 
-        # Python stable ABI library for fastcall.cpp. /DELAYLOAD defers loading
-        # python3.dll until a Python C API function is actually called -- without
-        # it, warp.dll cannot be LoadLibrary'd from non-Python C++ hosts.
-        python_libs_dir = os.path.join(sys.base_prefix, "libs")
-        linkopts.append(f'python3.lib /LIBPATH:"{python_libs_dir}" /DELAYLOAD:python3.dll delayimp.lib')
-
         with ScopedTimer("link", active=args.verbose):
-            link_cmd = f'"{host_linker}" {" ".join(linkopts + libs)} /out:"{dll_path}"'
+            implib_path = os.path.splitext(dll_path)[0] + ".lib"
+            link_cmd = f'"{host_linker}" {" ".join(linkopts + libs)} /out:"{dll_path}" /IMPLIB:"{implib_path}"'
             run_cmd(link_cmd)
 
     else:
@@ -782,7 +843,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             else:
                 version = ""
 
-        cpp_flags = f'-Werror -Wuninitialized {version} --std=c++20 -fno-rtti -D{cuda_enabled} -D{mathdx_enabled} -D{cuda_compat_enabled} -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -D_GLIBCXX_USE_CXX11_ABI=0 -I"{native_dir}" {includes} '
+        cpp_flags = f'-Werror -Wuninitialized {version} --std=c++20 -fno-rtti -DWP_BUILD_DLL -D{cuda_enabled} -D{mathdx_enabled} -D{cuda_compat_enabled} -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -D_GLIBCXX_USE_CXX11_ABI=0 -I"{native_dir}" {includes} '
 
         if mode == "debug":
             cpp_flags += "-Og -g -D_DEBUG -DWP_ENABLE_DEBUG=1"
@@ -809,8 +870,6 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 cpp_out = cpp_path + _obj_tag + ".o"
                 ld_inputs.append(quote(cpp_out))
                 extra_flags = ""
-                if "fastcall.cpp" in cpp_path:
-                    extra_flags = f' -I"{python_include_dir}" -DPy_LIMITED_API=0x030a0000'  # Python 3.10
                 cpp_cmd = f'{cpp_compiler} {cpp_flags}{extra_flags} -c "{cpp_path}" -o "{cpp_out}"'
                 cpp_cmds.append(cpp_cmd)
 
@@ -857,9 +916,9 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
                 if args.libmathdx_path:
                     if args.use_dynamic_cuda:
-                        ld_inputs.append(f"-lnvJitLink -L{args.libmathdx_path}/lib -lmathdx")
+                        ld_inputs.append(f"-lnvJitLink -L{quote(args.libmathdx_path + '/lib')} -lmathdx")
                     else:
-                        ld_inputs.append(f"-lnvJitLink_static -L{args.libmathdx_path}/lib -lmathdx_static")
+                        ld_inputs.append(f"-lnvJitLink_static -L{quote(args.libmathdx_path + '/lib')} -lmathdx_static")
 
             if args.jobs <= 1:
                 with ScopedTimer("build_cuda", active=args.verbose):
@@ -878,30 +937,33 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 elapsed = (time.perf_counter_ns() - wall_clock) / 1000000.0
                 print(f"build took {elapsed:.2f} ms ({args.jobs:d} workers)")
 
-        # Python C API function symbols from fastcall.cpp are left unresolved at link
-        # time and resolved lazily on first call by the interpreter. A post-link nm/readelf
-        # check (below) verifies no eagerly-resolved data symbols remain.
+        opt_exported_symbols = ""
+
         if sys.platform == "darwin":
-            # macOS linker rejects undefined symbols by default; this is the standard
-            # convention for Python extensions (used by CPython, pybind11).
+            # macOS linker rejects undefined symbols by default. Permit dynamic
+            # lookup here, then validate below so unexpected unresolved symbols
+            # produce a consistent diagnostic across platforms.
             opt_undefined = "-Wl,-undefined,dynamic_lookup"
             opt_exclude_libs = ""
             opt_static_runtime = ""
+            if exported_symbols_file is not None:
+                opt_exported_symbols = f'-Wl,-exported_symbols_list,"{exported_symbols_file}"'
         else:
             # -z lazy: pin lazy PLT binding so dlopen(..., RTLD_LAZY) works for non-Python
             # C++ hosts even on distros that flip the default to -z now via RELRO.
             opt_undefined = "-Wl,-z,lazy"
             opt_exclude_libs = "-Wl,--exclude-libs,ALL"
-            opt_static_runtime = f"-static-libstdc++ -static-libgcc -Wl,--version-script={native_dir}/warp.map"
+            opt_static_runtime = (
+                f"-static-libstdc++ -static-libgcc -Wl,--version-script={quote(native_dir + '/warp.map')}"
+            )
 
         sanitize_ld = f" -fsanitize={args.sanitize}" if args.sanitize else ""
 
         with ScopedTimer("link", active=args.verbose):
             origin = "@loader_path" if (sys.platform == "darwin") else "$ORIGIN"
-            link_cmd = f"{cpp_compiler} {version} -shared -Wl,-rpath,'{origin}' {opt_static_runtime} {opt_undefined} {opt_exclude_libs}{sanitize_ld} -o '{dll_path}' {' '.join(ld_inputs + libs)}"
+            link_cmd = f"{cpp_compiler} {version} -shared -Wl,-rpath,'{origin}' {opt_static_runtime} {opt_undefined} {opt_exported_symbols} {opt_exclude_libs}{sanitize_ld} -o '{dll_path}' {' '.join(ld_inputs + libs)}"
             run_cmd(link_cmd)
 
-            # Verify that only Python C API symbols are truly undefined.
             # Platform-specific paths collect all undefined symbol names.
             undefined = []
             if sys.platform == "darwin":
@@ -919,7 +981,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             else:
                 # readelf --dyn-syms lists dynamic symbols with type info. Symbols
                 # from linked dependencies (glibc, libm) have type FUNC or OBJECT,
-                # while truly undefined symbols (e.g. Python C API) have type NOTYPE.
+                # while truly undefined symbols have type NOTYPE.
                 # Format: "  54: 0...0  0 NOTYPE  GLOBAL DEFAULT  UND PyFloat_FromDouble"
                 readelf_output = subprocess.check_output(["readelf", "-W", "--dyn-syms", dll_path])
                 for line in readelf_output.decode().splitlines():
@@ -930,40 +992,18 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                     if sym_bind == "GLOBAL" and sym_ndx == "UND" and sym_type == "NOTYPE":
                         undefined.append(sym_name)
 
-            unexpected = [sym for sym in undefined if not sym.startswith(("Py", "_Py"))]
-            if unexpected:
-                raise RuntimeError("Unexpected undefined symbols in " + dll_path + ":\n" + "\n".join(unexpected))
-
-            # Forbid eagerly-resolved Python data symbol references. Function imports
-            # go through PLT/GOT (R_*_JUMP_SLOT) and are lazily bound; data imports use
-            # R_*_GLOB_DAT and are resolved at load time, which would break dlopen()
-            # from non-Python C++ hosts.
-            if sys.platform != "darwin":
-                relocs_output = subprocess.check_output(["readelf", "-r", "--wide", dll_path])
-                eager_py_data = []
-                for line in relocs_output.decode().splitlines():
-                    fields = line.split()
-                    if len(fields) < 5 or "GLOB_DAT" not in fields[2]:
-                        continue
-                    sym_name = fields[4]
-                    if sym_name.startswith(("Py", "_Py")):
-                        eager_py_data.append(sym_name)
-                if eager_py_data:
-                    raise RuntimeError(
-                        "Eagerly-resolved Python data symbols in "
-                        + dll_path
-                        + " (would break loading from non-Python hosts):\n"
-                        + "\n".join(eager_py_data)
-                    )
+            if undefined:
+                raise RuntimeError("Unexpected undefined symbols in " + dll_path + ":\n" + "\n".join(undefined))
 
             # Strip symbols to reduce the binary size
             if mode == "release":
                 if sys.platform == "darwin":
-                    run_cmd(f"strip -x {dll_path}")  # Strip all local symbols
+                    run_cmd(f"strip -x {quote(dll_path)}")  # Strip all local symbols
                 else:  # Linux
-                    # Strip all symbols except for those needed to support debugging JIT-compiled code
+                    # Strip symbols not needed for dynamic linking, except those needed to support debugging JIT-compiled code
                     run_cmd(
-                        f"strip --strip-all --keep-symbol=__jit_debug_register_code --keep-symbol=__jit_debug_descriptor {dll_path}"
+                        f"strip --strip-unneeded --keep-symbol=__jit_debug_register_code "
+                        f"--keep-symbol=__jit_debug_descriptor {quote(dll_path)}"
                     )
 
 

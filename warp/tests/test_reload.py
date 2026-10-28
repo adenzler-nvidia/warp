@@ -14,6 +14,7 @@ import warp.tests.aux_test_class_kernel
 # dummy modules used for testing reload with dependencies
 import warp.tests.aux_test_dependent as test_dependent
 import warp.tests.aux_test_dependent_local as test_dependent_local
+import warp.tests.aux_test_module_unload as aux_module_unload
 import warp.tests.aux_test_reference as test_reference
 import warp.tests.aux_test_reference_reference as test_reference_reference
 import warp.tests.aux_test_square as test_square
@@ -22,8 +23,11 @@ from warp.tests.unittest_utils import *
 
 
 def reload_module(module):
-    # Clearing the .pyc file associated with a module is a necessary workaround
-    # for `importlib.reload` to work as expected when run from within Kit.
+    """Reload ``module`` after clearing its cached ``.pyc`` file.
+
+    Clearing the ``.pyc`` file is a necessary workaround for ``importlib.reload`` to work as expected when run from
+    within Kit.
+    """
     cache_file = importlib.util.cache_from_source(module.__file__)
     if os.path.exists(cache_file):
         os.remove(cache_file)
@@ -35,7 +39,7 @@ def test_redefine(test, device):
     # first pass
 
     @wp.kernel
-    def basic(x: wp.array(dtype=float)):
+    def basic(x: wp.array[float]):
         tid = wp.tid()
 
         x[tid] = float(tid) * 1.0
@@ -50,7 +54,7 @@ def test_redefine(test, device):
     # redefine kernel, should trigger a recompile
 
     @wp.kernel
-    def basic(x: wp.array(dtype=float)):
+    def basic(x: wp.array[float]):
         tid = wp.tid()
 
         x[tid] = float(tid) * 2.0
@@ -64,9 +68,10 @@ def test_redefine(test, device):
 
 
 def test_redefine_command(test, device):
-    # Test whether executable modules are retained correctly.
-    # A module can have multiple executable versions in use if something
-    # still holds a reference to them.
+    """Verify executable modules are retained correctly.
+
+    A module can have multiple executable versions in use if something still holds a reference to them.
+    """
 
     @wp.kernel
     def k(value: int):
@@ -220,10 +225,12 @@ def test_reload_references(test, device):
 
 
 def test_reference_through_local(test, device):
-    # A function bound to a kernel-local (`f = ref.magic`) or to several locals via tuple
-    # unpacking (`f, g = ref.a, ref.b`) must still register a dependency on the module(s)
-    # that define them, so reloading those modules invalidates this kernel just as a direct
-    # call would. See Module._find_references.
+    """Verify a kernel-local function binding registers a module dependency for reload invalidation.
+
+    A function bound to a kernel-local (``f = ref.magic``) or to several locals via tuple unpacking
+    (``f, g = ref.a, ref.b``) must still register a dependency on the module(s) that define them, so reloading those
+    modules invalidates this kernel just as a direct call would. See ``Module._find_references``.
+    """
 
     # Building the dependent module scans its kernels for references.
     test_dependent_local.kern.module.get_module_hash()
@@ -239,7 +246,7 @@ def test_reference_through_local(test, device):
 
 def test_graph_launch_after_module_reload(test, device):
     @wp.kernel
-    def foo(a: wp.array(dtype=int)):
+    def foo(a: wp.array[int]):
         a[0] = 42
 
     with wp.ScopedDevice(device):
@@ -263,7 +270,7 @@ def test_graph_launch_after_module_reload(test, device):
 
 def test_module_unload_during_graph_capture(test, device):
     @wp.kernel
-    def foo(a: wp.array(dtype=int)):
+    def foo(a: wp.array[int]):
         a[0] = 42
 
     # preload module before graph capture
@@ -273,9 +280,7 @@ def test_module_unload_during_graph_capture(test, device):
     # during capture exercises the retention path (on CPU, the APIC state
     # holds raw function pointers into the module's loaded object; on CUDA,
     # the captured graph retains the module_exec).
-    import warp.tests.aux_test_module_unload as aux  # noqa: PLC0415
-
-    other_module = wp.get_module(aux.__name__)
+    other_module = wp.get_module(aux_module_unload.__name__)
     other_module.load(device)
 
     with wp.ScopedDevice(device):
@@ -283,10 +288,10 @@ def test_module_unload_during_graph_capture(test, device):
 
         with wp.ScopedCapture(force_module_load=False) as capture:
             wp.launch(foo, dim=1, inputs=[a])
-            wp.launch(aux.k, dim=1, inputs=[])
+            wp.launch(aux_module_unload.k, dim=1, inputs=[])
 
             # Unloading a module whose kernel was captured should be deferred
-            # until the graph is destroyed — the graph retains module_execs.
+            # until the graph is destroyed. The graph retains module_execs.
             other_module.unload()
 
         wp.capture_launch(capture.graph)

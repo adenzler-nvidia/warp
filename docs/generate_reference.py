@@ -41,6 +41,7 @@ from types import ModuleType
 from typing import TypeVar, get_origin
 
 import warp as wp
+from docs._ext.warp_function_reference import validate_public_functions
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 # Module containing Warp's built-ins functions and requiring special handling.
 BUILTINS_MODULE = "warp._src.lang"
+
+# Public cross-reference labels for selected built-in categories.
+BUILTINS_CATEGORY_LABELS = {
+    "Textures": "builtins-textures",
+    "Volumes": "builtins-volumes",
+}
 
 # Fallback category for items not explicitly categorized.
 DEFAULT_CATEGORY = "Misc"
@@ -81,11 +88,14 @@ BUILTINS_REF_DIR = "language_reference"
 SKIP = (
     "warp._src",
     "warp.examples",
-    "warp.jax_experimental",
     "warp.tests",
 )
 
-ROOT_REEXPORTS_DOCUMENTED_IN_ROOT = ()
+ROOT_REEXPORTS_DOCUMENTED_IN_ROOT = ("DeterministicMode",)
+
+MODULE_SYMBOL_EXCLUDES = {
+    "warp.config": frozenset(("DeterministicMode",)),
+}
 
 
 # Mock Dependencies
@@ -160,7 +170,7 @@ VALUE_TYPES = (
     float,
     set,
     Mapping,
-    type(None),  # NoneType is only available in types module from Python 3.10+
+    type(None),
     Sequence,
     *wp._src.types.scalar_types,
     *wp._src.types.vector_types,
@@ -215,11 +225,15 @@ def get_public_symbols(
     run_isolated: bool = False,
 ) -> tuple[str, ...]:
     """Return the list of public names for a given module name."""
+    excluded_symbols = MODULE_SYMBOL_EXCLUDES.get(module_name, ())
+
     if run_isolated:
-        return tuple(sorted(filter(is_symbol_public, get_isolated_dir(module_name))))
+        return tuple(
+            sorted(x for x in filter(is_symbol_public, get_isolated_dir(module_name)) if x not in excluded_symbols)
+        )
 
     module = importlib.import_module(module_name)
-    return tuple(sorted(filter(is_symbol_public, dir(module))))
+    return tuple(sorted(x for x in filter(is_symbol_public, dir(module)) if x not in excluded_symbols))
 
 
 class SymbolType(IntEnum):
@@ -493,6 +507,10 @@ def render_category_to_rst(
         lines: List to append RST lines to
         module_name: Name of the module being documented (for special handling)
     """
+    if module_name == BUILTINS_MODULE and (label := BUILTINS_CATEGORY_LABELS.get(cat.display_name)):
+        lines.append(f".. _{label}:")
+        lines.append("")
+
     # Render section header
     underline = "^" * len(cat.display_name) if cat.is_subcategory else "-" * len(cat.display_name)
     lines.append(cat.display_name)
@@ -506,7 +524,7 @@ def render_category_to_rst(
         lines.append("   :nosignatures:")
         lines.append(f"   :toctree: {TOCTREE_DIR}")
         if module_name == BUILTINS_MODULE:
-            lines.append("   :template: builtins.rst")
+            lines.append("   :template: warp_function.rst")
         lines.append("")
         lines.extend(f"   {s}" for s in non_aliased)
         lines.append("")
@@ -720,11 +738,11 @@ def run():
             if "." not in submodule_rel_name:
                 submodules.append(other_module_name)
 
+        validate_public_functions(module_name, module, symbols, aliased_symbols)
         write_module_page(module_name, symbols, aliased_symbols, submodules, output_api_dir)
 
     # Third pass: handle the built-ins symbols.
     # Include a builtin if ANY of its overloads are visible (not hidden).
-    # This matches the behavior of the old export_functions_rst system.
     def has_visible_overload(func):
         """Check if a builtin function has at least one non-hidden overload."""
         if hasattr(func, "overloads"):

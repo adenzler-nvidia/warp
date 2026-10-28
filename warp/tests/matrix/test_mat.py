@@ -19,6 +19,12 @@ np_signed_int_types = [np.int8, np.int16, np.int32, np.int64, np.byte]
 
 kernel_cache = {}
 
+# Compilation hygiene
+#
+# This file's shared module is large, so compile only entry points exercised by the tests. Register dtype-specific
+# kernels before the first launch, disable backward generation for forward-only coverage, and keep kernels declared
+# inside tests in unique modules so they cannot invalidate the shared module after it loads.
+
 
 def test_shape_mismatch(test, device):
     test.assertNotEqual(wp.mat33f(0.0), wp.mat22f(0.0))
@@ -78,8 +84,6 @@ def test_py_arithmetic_ops(test, device, dtype):
 
 
 def test_negation(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 1.0e-2,
         np.float32: 1.0e-6,
@@ -92,7 +96,8 @@ def test_negation(test, device, dtype, register_kernels=False):
     mat44 = wp.types.matrix(shape=(4, 4), dtype=wptype)
     mat55 = wp.types.matrix(shape=(5, 5), dtype=wptype)
 
-    output_select_kernel = get_select_kernel(kernel_cache, wptype)
+    if dtype in np_float_types:
+        output_select_kernel = get_select_kernel(kernel_cache, wptype)
 
     def check_mat_negation(
         m2: wp.array[mat22],
@@ -128,10 +133,17 @@ def test_negation(test, device, dtype, register_kernels=False):
                 outcomponents[idx] = wptype(2) * mat5[i, j]
                 idx = idx + 1
 
-    kernel = getkernel(kernel_cache, check_mat_negation, suffix=dtype.__name__)
+    kernel = getkernel(
+        kernel_cache,
+        check_mat_negation,
+        suffix=dtype.__name__,
+        enable_backward=dtype in np_float_types,
+    )
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     m2 = wp.array(randvals(rng, [1, 2, 2], dtype), dtype=mat22, requires_grad=True, device=device)
     m3 = wp.array(randvals(rng, [1, 3, 3], dtype), dtype=mat33, requires_grad=True, device=device)
@@ -167,8 +179,6 @@ def test_negation(test, device, dtype, register_kernels=False):
 
 
 def test_matmul(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -181,8 +191,6 @@ def test_matmul(test, device, dtype, register_kernels=False):
     mat23 = wp.types.matrix(shape=(2, 3), dtype=wptype)
     mat32 = wp.types.matrix(shape=(3, 2), dtype=wptype)
     mat44 = wp.types.matrix(shape=(4, 4), dtype=wptype)
-
-    output_select_kernel = get_select_kernel(kernel_cache, wptype)
 
     def check_mat_mul(
         i23: wp.array[mat23],
@@ -197,10 +205,17 @@ def test_matmul(test, device, dtype, register_kernels=False):
         o33[i] = i32[i] @ i23[i]
         o44[i] = i44[i] @ i44[i]
 
-    kernel = getkernel(kernel_cache, check_mat_mul, suffix=dtype.__name__)
+    kernel = getkernel(
+        kernel_cache,
+        check_mat_mul,
+        suffix=dtype.__name__,
+        enable_backward=dtype in np_float_types,
+    )
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     test_adj = dtype in np_float_types
 
@@ -238,8 +253,6 @@ def test_matmul(test, device, dtype, register_kernels=False):
 
 
 def test_subtraction(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -252,7 +265,8 @@ def test_subtraction(test, device, dtype, register_kernels=False):
     mat44 = wp.types.matrix(shape=(4, 4), dtype=wptype)
     mat55 = wp.types.matrix(shape=(5, 5), dtype=wptype)
 
-    output_select_kernel = get_select_kernel(kernel_cache, wptype)
+    if dtype in np_float_types:
+        output_select_kernel = get_select_kernel(kernel_cache, wptype)
 
     def check_mat_sub(
         s2: wp.array[mat22],
@@ -292,10 +306,17 @@ def test_subtraction(test, device, dtype, register_kernels=False):
                 outcomponents[idx] = wptype(2) * v5result[i, j]
                 idx = idx + 1
 
-    kernel = getkernel(kernel_cache, check_mat_sub, suffix=dtype.__name__)
+    kernel = getkernel(
+        kernel_cache,
+        check_mat_sub,
+        suffix=dtype.__name__,
+        enable_backward=dtype in np_float_types,
+    )
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     s2 = wp.array(randvals(rng, [1, 2, 2], dtype), dtype=mat22, requires_grad=True, device=device)
     s3 = wp.array(randvals(rng, [1, 3, 3], dtype), dtype=mat33, requires_grad=True, device=device)
@@ -359,8 +380,6 @@ def test_subtraction(test, device, dtype, register_kernels=False):
 
 
 def test_determinant(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -388,6 +407,8 @@ def test_determinant(test, device, dtype, register_kernels=False):
     kernel = getkernel(kernel_cache, check_mat_det, suffix=dtype.__name__)
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     v2 = wp.array(randvals(rng, [1, 2, 2], dtype), dtype=mat22, requires_grad=True, device=device)
     v3 = wp.array(randvals(rng, [1, 3, 3], dtype), dtype=mat33, requires_grad=True, device=device)
@@ -552,8 +573,6 @@ def test_determinant(test, device, dtype, register_kernels=False):
 
 
 def test_inverse(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-2,
         np.float32: 1.0e-5,
@@ -598,6 +617,8 @@ def test_inverse(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     m2 = wp.array(
         2 * (randvals(rng, [1, 2, 2], dtype) + 0.2 * np.eye(2)), dtype=mat22, requires_grad=True, device=device
@@ -722,8 +743,6 @@ def test_inverse(test, device, dtype, register_kernels=False):
 
 
 def test_svd(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 1.0e-3,
         np.float32: 1.0e-6,
@@ -773,6 +792,8 @@ def test_svd(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     m3 = wp.array(randvals(rng, [1, 3, 3], dtype) + np.eye(3), dtype=mat33, requires_grad=True, device=device)
 
@@ -841,8 +862,6 @@ def test_svd(test, device, dtype, register_kernels=False):
 
 
 def test_svd_2D(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 1.0e-3,
         np.float32: 1.0e-6,
@@ -898,6 +917,8 @@ def test_svd_2D(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     mats = np.concatenate(
         (
@@ -989,8 +1010,6 @@ def test_svd_2D(test, device, dtype, register_kernels=False):
 
 
 def test_qr(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 2.5e-3,
         np.float32: 1.0e-6,
@@ -1031,6 +1050,8 @@ def test_qr(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     m3 = wp.array(0.5 * (randvals(rng, [1, 3, 3], dtype) + np.eye(3)), dtype=mat33, requires_grad=True, device=device)
 
@@ -1101,8 +1122,6 @@ def test_qr(test, device, dtype, register_kernels=False):
 
 
 def test_eig(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 4.0e-2,
         np.float32: 1.0e-5,
@@ -1143,6 +1162,8 @@ def test_eig(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     m3_np = randvals(rng, [1, 3, 3], dtype) + np.eye(3, dtype=dtype)
     m3 = wp.array(m3_np, dtype=mat33, requires_grad=True, device=device)
@@ -1212,9 +1233,131 @@ def test_eig(test, device, dtype, register_kernels=False):
                 assert_np_equal((plusval - minusval) / (2 * dx), m3grads[ii, jj], tol=fdtol)
 
 
-def test_skew(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
+def test_eig_value_gradients(test, device, dtype, output_arguments):
+    """Check eigenvalue-only losses and gradients at repeated and closely spaced eigenvalues."""
+    tol = {
+        np.float16: 1.0e-2,
+        np.float32: 1.0e-5,
+        np.float64: 1.0e-10,
+    }[dtype]
 
+    wptype = wp.dtype_from_numpy(np.dtype(dtype))
+    mat33 = wp.types.matrix(shape=(3, 3), dtype=wptype)
+    vec3 = wp.types.vector(length=3, dtype=wptype)
+
+    @wp.kernel(module="unique")
+    def eigenvalue_loss(matrices: wp.array[mat33], mode: int, losses: wp.array[wptype]):
+        i = wp.tid()
+        A = matrices[i]
+        Q = mat33()
+        d = vec3()
+        if wp.static(output_arguments):
+            wp.eig3(A, Q, d)
+        else:
+            Q, d = wp.eig3(A)
+
+        if mode == 1:
+            losses[i] = wp.dot(d, d)
+        elif mode == 2:
+            losses[i] = d[0] + d[1] + d[2] + wp.trace(A)
+        else:
+            losses[i] = d[0] + d[1] + d[2]
+
+    rotation = np.array(((1.0, 2.0, 2.0), (2.0, 1.0, -2.0), (-2.0, 2.0, -1.0))) / 3.0
+    cases = {
+        "repeated": np.diag([2.0, 2.0, 3.0]),
+        "identity": np.eye(3),
+        "zero": np.zeros((3, 3)),
+        "negative_repeated": np.diag([-2.0, -2.0, 3.0]),
+        "distinct": np.diag([1.0, 2.0, 3.0]),
+        "near_repeated": np.diag([2.0, 2.0 + 1.0e-5, 3.0]),
+        "small_distinct": np.diag([0.0, 1.0e-5, 1.0]),
+        "rotated_repeated": rotation @ np.diag([2.0, 2.0, 3.0]) @ rotation.T,
+    }
+    matrices_np = np.array(list(cases.values()), dtype=dtype)
+    matrices = wp.array(matrices_np, dtype=mat33, device=device, requires_grad=True)
+    losses = wp.zeros(len(cases), dtype=wptype, device=device, requires_grad=True)
+    seed = wp.ones_like(losses)
+
+    # These spectral losses equal trace(A), trace(A^2), and 2 * trace(A), even at repeated eigenvalues.
+    matrices_fp64 = matrices_np.astype(np.float64)
+    traces = np.trace(matrices_fp64, axis1=1, axis2=2)
+    identity = np.broadcast_to(np.eye(3), matrices_np.shape)
+    expected_losses = (traces, np.sum(matrices_fp64**2, axis=(1, 2)), 2.0 * traces)
+    expected_gradients = (identity, 2.0 * matrices_fp64, 2.0 * identity)
+
+    for mode in range(3):
+        with wp.Tape() as tape:
+            wp.launch(eigenvalue_loss, dim=len(cases), inputs=[matrices, mode], outputs=[losses], device=device)
+        tape.backward(grads={losses: seed})
+        losses_np = losses.numpy().astype(np.float64)
+        gradients_np = matrices.grad.numpy().astype(np.float64)
+        for i, name in enumerate(cases):
+            with test.subTest(matrix=name, mode=mode):
+                np.testing.assert_allclose(losses_np[i], expected_losses[mode][i], atol=tol, rtol=tol)
+                np.testing.assert_allclose(gradients_np[i], expected_gradients[mode][i], atol=tol, rtol=tol)
+        tape.zero()
+
+
+def test_eig_mixed_gradients(test, device, dtype, output_arguments):
+    """Check zero and small nonzero eigenvector gradients in the same batch."""
+    tol = {
+        np.float16: 1.0e-2,
+        np.float32: 1.0e-5,
+        np.float64: 1.0e-10,
+    }[dtype]
+    q_seed_scale = dtype({np.float16: 1.0e-4, np.float32: 1.0e-8, np.float64: 1.0e-12}[dtype])
+
+    wptype = wp.dtype_from_numpy(np.dtype(dtype))
+    mat33 = wp.types.matrix(shape=(3, 3), dtype=wptype)
+    vec3 = wp.types.vector(length=3, dtype=wptype)
+
+    @wp.kernel(module="unique")
+    def mixed_loss(matrices: wp.array[mat33], eigenvectors: wp.array[mat33], losses: wp.array[wptype]):
+        i = wp.tid()
+        A = matrices[i] + wp.transpose(matrices[i])
+        Q = mat33()
+        d = vec3()
+        if wp.static(output_arguments):
+            wp.eig3(A, Q, d)
+        else:
+            Q, d = wp.eig3(A)
+        eigenvectors[i] = Q
+        losses[i] = d[0] + d[1] + d[2] + wp.trace(matrices[i])
+
+    matrices_np = np.array([np.diag([1.0, 1.0, 1.5]), np.diag([0.5, 1.0, 2.0])], dtype=dtype)
+    matrices = wp.array(matrices_np, dtype=mat33, device=device, requires_grad=True)
+    eigenvectors = wp.zeros(2, dtype=mat33, device=device, requires_grad=True)
+    losses = wp.zeros(2, dtype=wptype, device=device, requires_grad=True)
+
+    with wp.Tape() as tape:
+        wp.launch(mixed_loss, dim=2, inputs=[matrices], outputs=[eigenvectors, losses], device=device)
+
+    # Keep Q's gradient zero at repeated eigenvalues. For diag(1, 2, 4), seed
+    # its first row with Q's second row to remove dependence on column order and signs.
+    q_seed_np = np.zeros((2, 3, 3), dtype=dtype)
+    q_seed_np[1, 0, :] = q_seed_scale * eigenvectors.numpy()[1, 1, :]
+    tape.backward(
+        grads={
+            losses: wp.ones_like(losses),
+            eigenvectors: wp.array(q_seed_np, dtype=mat33, device=device),
+        }
+    )
+
+    # The eigenvalue sum plus trace(matrices[i]) has gradient 3I. The seeded
+    # eigenvector contributes q_seed_scale to entries (0, 1) and (1, 0), since
+    # its eigenvalue gap is one and A is symmetrized.
+    expected_gradients = np.broadcast_to(3.0 * np.eye(3), (2, 3, 3)).copy()
+    expected_gradients[1, 0, 1] = expected_gradients[1, 1, 0] = float(q_seed_scale)
+    gradients_np = matrices.grad.numpy().astype(np.float64)
+    np.testing.assert_allclose(losses.numpy(), [10.5, 10.5], atol=tol, rtol=tol)
+    np.testing.assert_allclose(gradients_np, expected_gradients, atol=tol, rtol=tol)
+
+    # Normalize the small contribution so the absolute tolerance cannot hide its removal.
+    np.testing.assert_allclose(gradients_np[1, [0, 1], [1, 0]] / float(q_seed_scale), [1.0, 1.0], atol=tol, rtol=tol)
+
+
+def test_skew(test, device, dtype, register_kernels=False):
     tol = {
         np.float16: 1.0e-3,
         np.float32: 1.0e-6,
@@ -1243,6 +1386,8 @@ def test_skew(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     v3 = wp.array(randvals(rng, [1, 3], dtype), dtype=vec3, requires_grad=True, device=device)
 
@@ -1314,8 +1459,6 @@ def test_skew(test, device, dtype, register_kernels=False):
 
 
 def test_transform_point(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -1344,6 +1487,8 @@ def test_transform_point(test, device, dtype, register_kernels=False):
 
     if register_kernels:
         return
+
+    rng = np.random.default_rng(123)
 
     v3 = wp.array(randvals(rng, [1, 3], dtype), dtype=vec3, requires_grad=True, device=device)
     m4 = wp.array(randvals(rng, [1, 4, 4], dtype), dtype=mat44, requires_grad=True, device=device)
@@ -1375,8 +1520,6 @@ def test_transform_point(test, device, dtype, register_kernels=False):
 
 
 def test_transform_vector(test, device, dtype, register_kernels=False):
-    rng = np.random.default_rng(123)
-
     tol = {
         np.float16: 5.0e-3,
         np.float32: 1.0e-6,
@@ -1406,6 +1549,8 @@ def test_transform_vector(test, device, dtype, register_kernels=False):
     if register_kernels:
         return
 
+    rng = np.random.default_rng(123)
+
     v3 = wp.array(randvals(rng, [1, 3], dtype), dtype=vec3, requires_grad=True, device=device)
     m4 = wp.array(randvals(rng, [1, 4, 4], dtype), dtype=mat44, requires_grad=True, device=device)
 
@@ -1434,7 +1579,7 @@ def test_transform_vector(test, device, dtype, register_kernels=False):
             tape.zero()
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def test_matrix_mutation(expected: wp.types.matrix(shape=(10, 3), dtype=float)):
     m = wp.types.matrix(shape=(10, 3), dtype=float)
 
@@ -1453,7 +1598,7 @@ def test_matrix_mutation(expected: wp.types.matrix(shape=(10, 3), dtype=float)):
 Mat23 = wp.types.matrix((2, 3), dtype=wp.float16)
 
 
-@wp.kernel(module="unique")
+@wp.kernel(enable_backward=False, module="unique")
 def matrix_len_kernel(
     m1: wp.mat22,
     m2: wp.types.matrix((3, 3), float),
@@ -1929,7 +2074,7 @@ def test_mat_from_rows_indexing_assign(test, device):
         wp.expect_eq(m[-3][-1], 456.0)
         wp.expect_eq(m[-3][-2], 345.0)
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel():
         fn()
 
@@ -1999,7 +2144,7 @@ def test_mat_from_cols_indexing_assign(test, device):
         wp.expect_eq(m[-2][-2], 1134.0)
         wp.expect_eq(m[-2][-3], 456.0)
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel():
         fn()
 
@@ -2650,7 +2795,7 @@ def test_mat_from_rows_slicing_assign(test, device):
             True,
         )
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel():
         fn()
 
@@ -3313,7 +3458,7 @@ def test_mat_from_cols_slicing_assign(test, device):
             True,
         )
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def kernel():
         fn()
 
@@ -3442,6 +3587,24 @@ for dtype in np_float_types:
     )
     add_function_test_register_kernel(TestMat, f"test_qr_{dtype.__name__}", test_qr, devices=devices, dtype=dtype)
     add_function_test_register_kernel(TestMat, f"test_eig_{dtype.__name__}", test_eig, devices=devices, dtype=dtype)
+    for output_arguments in (False, True):
+        overload = "output_arguments" if output_arguments else "return_values"
+        add_function_test(
+            TestMat,
+            f"test_eig_value_gradients_{overload}_{dtype.__name__}",
+            test_eig_value_gradients,
+            devices=devices,
+            dtype=dtype,
+            output_arguments=output_arguments,
+        )
+        add_function_test(
+            TestMat,
+            f"test_eig_mixed_gradients_{overload}_{dtype.__name__}",
+            test_eig_mixed_gradients,
+            devices=devices,
+            dtype=dtype,
+            output_arguments=output_arguments,
+        )
     add_function_test_register_kernel(
         TestMat, f"test_transform_point_{dtype.__name__}", test_transform_point, devices=devices, dtype=dtype
     )

@@ -124,7 +124,7 @@ template <typename T> CUDA_CALLABLE inline T& index(const fabricarray_t<T>& fa, 
     size_t index_in_bucket = i - bucket->index_start;
 
     void* ptr = *((void**)bucket->ptr + index_in_bucket);
-    size_t length = *((size_t*)bucket->lengths + index_in_bucket);
+    size_t length = *(reinterpret_cast<size_t*>(bucket->lengths) + index_in_bucket);
 
     assert(j < length && "Fabric array inner index out of range");
 
@@ -146,7 +146,7 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(fabricarray_t<T>& fa,
     size_t index_in_bucket = i - bucket->index_start;
 
     void* ptr = *((void**)bucket->ptr + index_in_bucket);
-    size_t length = *((size_t*)bucket->lengths + index_in_bucket);
+    size_t length = *(reinterpret_cast<size_t*>(bucket->lengths) + index_in_bucket);
 
     return array_t<T>((T*)ptr, int(length));
 }
@@ -186,7 +186,7 @@ template <typename T> CUDA_CALLABLE inline T& index(const indexedfabricarray_t<T
     size_t index_in_bucket = i - bucket->index_start;
 
     void* ptr = *((void**)bucket->ptr + index_in_bucket);
-    size_t length = *((size_t*)bucket->lengths + index_in_bucket);
+    size_t length = *(reinterpret_cast<size_t*>(bucket->lengths) + index_in_bucket);
 
     assert(j < length && "Fabric array inner index out of range");
 
@@ -212,9 +212,16 @@ template <typename T> CUDA_CALLABLE inline array_t<T> view(indexedfabricarray_t<
     size_t index_in_bucket = i - bucket->index_start;
 
     void* ptr = *((void**)bucket->ptr + index_in_bucket);
-    size_t length = *((size_t*)bucket->lengths + index_in_bucket);
+    size_t length = *(reinterpret_cast<size_t*>(bucket->lengths) + index_in_bucket);
 
     return array_t<T>((T*)ptr, int(length));
 }
+
+
+// Stubs for Fabric array descriptors nested in structs. Struct adjoints copy
+// array descriptors rather than accumulating their members.
+template <typename T> CUDA_CALLABLE inline void atomic_add(fabricarray_t<T>*, fabricarray_t<T>) { }
+
+template <typename T> CUDA_CALLABLE inline void atomic_add(indexedfabricarray_t<T>*, indexedfabricarray_t<T>) { }
 
 }  // namespace wp

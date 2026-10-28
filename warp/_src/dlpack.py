@@ -17,8 +17,6 @@ from warp._src.thirdparty.dlpack import (
     _c_str_dltensor,
 )
 
-_wp_module_name_ = "warp.dlpack"
-
 _c_str_used_dltensor = b"used_dltensor"
 
 PyMem_RawMalloc = ctypes.pythonapi.PyMem_RawMalloc
@@ -155,6 +153,8 @@ def dtype_from_dlpack(dl_dtype):
 
     if dl_dtype == (DLDataTypeCode.kDLUInt, 1):
         raise RuntimeError("Warp does not support bit boolean types")
+    elif dl_dtype == (DLDataTypeCode.kDLBool, 8):
+        return warp._src.types.bool
     elif dl_dtype == (DLDataTypeCode.kDLInt, 8):
         return warp._src.types.int8
     elif dl_dtype == (DLDataTypeCode.kDLInt, 16):
@@ -188,7 +188,10 @@ def dtype_from_dlpack(dl_dtype):
 
 
 def device_from_dlpack(dl_device):
-    assert warp._src.context.runtime is not None, "Warp not initialized, call wp.init() before use"
+    if warp._src.context.runtime is None:
+        raise RuntimeError(
+            "DLPack device conversion requires an initialized Warp runtime, got runtime=None. Call wp.init() first"
+        )
 
     if dl_device.device_type.value == DLDeviceType.kDLCPU or dl_device.device_type.value == DLDeviceType.kDLCUDAHost:
         return warp._src.context.runtime.cpu_device
@@ -259,7 +262,10 @@ def to_dlpack(wp_array: warp.array):
     shape_size = target_ndim * 8
     mem_size = managed_tensor_size + padding + 2 * shape_size
     mem_ptr = PyMem_RawMalloc(mem_size)
-    assert mem_ptr, "Failed to allocate memory for DLManagedTensor"
+    if not mem_ptr:
+        raise MemoryError(
+            f"DLManagedTensor allocation requires {mem_size} bytes, got a null pointer from PyMem_RawMalloc()"
+        )
 
     # set managed tensor attributes
     managed_tensor = DLManagedTensor.from_address(mem_ptr)
@@ -312,7 +318,9 @@ def dtype_is_compatible(dl_dtype, wp_dtype):
     if dl_dtype.bits % 8 != 0:
         raise RuntimeError("Data types with less than 8 bits are not supported")
 
-    if dl_dtype.type_code.value == DLDataTypeCode.kDLFloat:
+    if dl_dtype.type_code.value == DLDataTypeCode.kDLBool:
+        return dl_dtype.bits == 8 and wp_dtype in (warp.bool, warp.int8, warp.uint8)
+    elif dl_dtype.type_code.value == DLDataTypeCode.kDLFloat:
         if dl_dtype.bits == 16:
             return wp_dtype == warp.float16
         elif dl_dtype.bits == 32:
@@ -336,6 +344,14 @@ def dtype_is_compatible(dl_dtype, wp_dtype):
         raise RuntimeError("Complex data types are not supported")
     else:
         raise RuntimeError(f"Unsupported DLPack dtype {(str(dl_dtype.type_code), dl_dtype.bits)}")
+
+
+def _dtype_name(dl_dtype: DLDataType) -> str:
+    """Format a DLPack dtype as a readable ``<type_code><bits>[xlanes]`` string for error messages."""
+    name = f"{dl_dtype.type_code}{dl_dtype.bits}"
+    if dl_dtype.lanes > 1:
+        name += f"x{dl_dtype.lanes}"
+    return name
 
 
 def _unpack_array(dlt: DLTensor, dtype=None):
@@ -364,7 +380,9 @@ def _unpack_array(dlt: DLTensor, dtype=None):
         # handle vector/matrix types
 
         if not dtype_is_compatible(dlt.dtype, dtype._wp_scalar_type_):
-            raise RuntimeError(f"Incompatible data types: {dlt.dtype} and {dtype}")
+            raise RuntimeError(
+                f"Incompatible data types: DLPack {_dtype_name(dlt.dtype)} and Warp {warp._src.types.type_repr(dtype)}"
+            )
 
         dtype_shape = dtype._shape_
         dtype_dims = len(dtype._shape_)
@@ -388,7 +406,9 @@ def _unpack_array(dlt: DLTensor, dtype=None):
 
     elif not dtype_is_compatible(dlt.dtype, dtype):
         # incompatible dtype requested
-        raise RuntimeError(f"Incompatible data types: {dlt.dtype} and {dtype}")
+        raise RuntimeError(
+            f"Incompatible data types: DLPack {_dtype_name(dlt.dtype)} and Warp {warp._src.types.type_repr(dtype)}"
+        )
 
     a = warp._src.types.array(
         ptr=dlt.data, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
@@ -418,7 +438,8 @@ def _from_dlpack(capsule, dtype=None, hint=None) -> warp.array | warp.Texture:
         A new Warp array or texture that uses the same underlying memory as the input capsule.
     """
 
-    assert PyCapsule_IsValid(capsule, _c_str_dltensor), "Invalid capsule"
+    if not PyCapsule_IsValid(capsule, _c_str_dltensor):
+        raise TypeError(f"Expected a valid DLPack capsule, got {type(capsule).__name__}")
     mem_ptr = PyCapsule_GetPointer(capsule, _c_str_dltensor)
     managed_tensor = DLManagedTensor.from_address(mem_ptr)
 
@@ -475,7 +496,7 @@ def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
             # Note that we pass 1 for the null stream, per DLPack spec.
             cuda_stream = warp.get_cuda_device().stream.cuda_stream or 1
         else:
-            raise TypeError("Unsupported source device")
+            raise TypeError(f"Unsupported source device for DLPack: device_type={device_type}, device_id={device_id}")
 
         capsule = source.__dlpack__(stream=cuda_stream)
 

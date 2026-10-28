@@ -1,16 +1,60 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import io
+import re
 import unittest
+import warnings
+from unittest import mock
 
 import numpy as np
 
 import warp as wp
+import warp._src.context as warp_context
+from warp._src.context import _smem_shortfall_clause
 from warp.tests.unittest_utils import *
+
+# Nearly every kernel in this file is declared inside its test body with module="unique", and any test-body
+# kernel added here needs that marker: without it the kernel joins this file's module and changes its kernel
+# set, forcing a rebuild of every kernel in the file on the next launch. Prefer module scope for new kernels,
+# as static_query_kernel does, so they share one module and compile together. The shared memory message tests
+# cannot, because their tile size comes from device.max_shared_memory_per_block, which is only known once a
+# test is running.
+
+CPU_SHARED_ARENA_OVERSIZE = 65537
+
+
+@wp.kernel
+def tile_shared_mem_oversize_kernel(out: wp.array[float]):
+    tile = wp.tile_zeros(shape=CPU_SHARED_ARENA_OVERSIZE, dtype=float, storage="shared")
+    out[0] = tile[0]
+
+
+def _run_oversize_cpu_shared_memory():
+    out = wp.empty(1, dtype=float, device="cpu")
+    wp.launch_tiled(
+        tile_shared_mem_oversize_kernel,
+        dim=1,
+        outputs=[out],
+        block_dim=1,
+        device="cpu",
+    )
+
+
+def test_tile_shared_mem_cpu_limit(test, device):
+    result = run_python_subprocess(
+        "import warp.tests.tile.test_tile_shared_memory as m; m._run_oversize_cpu_shared_memory()",
+        timeout=60,
+        hide_gpu=True,
+    )
+    test.assertNotEqual(result.returncode, 0, "oversized CPU tile shared-memory allocation unexpectedly succeeded")
+    test.assertIn("exceeds the 256 KiB arena", result.stderr)
 
 
 # checks that we can configure shared memory to the expected size
 def test_tile_shared_mem_size(test, device):
+    """Report the forward and backward shared-memory requirements."""
     DIM_M = 32
     DIM_N = 32
 
@@ -39,12 +83,13 @@ def test_tile_shared_mem_size(test, device):
     module_exec = compute.module.load(device, BLOCK_DIM)
     hooks = module_exec.get_kernel_hooks(compute)
 
-    assert hooks.forward_smem_bytes == expected_forward_bytes
-    assert hooks.backward_smem_bytes == expected_backward_bytes
+    test.assertEqual(hooks.forward_smem_bytes, expected_forward_bytes)
+    test.assertEqual(hooks.backward_smem_bytes, expected_backward_bytes)
 
 
 # checks that we can configure shared memory > 48kb default
-def test_tile_shared_mem_large(test, device):
+def test_tile_shared_memory_supports_64_kib_allocation(test, device):
+    """Configure and report a 64 KiB dynamic shared-memory allocation."""
     # set dimensions that require 64kb for the forward kernel
     DIM_M = 64
     DIM_N = 128
@@ -71,18 +116,328 @@ def test_tile_shared_mem_large(test, device):
     expected_forward_bytes = DIM_M * DIM_N * 4 * 2
     expected_backward_bytes = 0
 
-    assert expected_forward_bytes == 2**16
+    test.assertEqual(expected_forward_bytes, 2**16)
 
     # check shared memory for kernel on the device
     module_exec = compute.module.load(device, BLOCK_DIM)
     hooks = module_exec.get_kernel_hooks(compute)
 
-    assert hooks.forward_smem_bytes == expected_forward_bytes
-    assert hooks.backward_smem_bytes == expected_backward_bytes
+    test.assertEqual(hooks.forward_smem_bytes, expected_forward_bytes)
+    test.assertEqual(hooks.backward_smem_bytes, expected_backward_bytes)
 
 
-# checks that we can configure dynamic shared memory during graph capture
+STATIC_QUERY_DIM = 32
+STATIC_QUERY_BLOCK_DIM = 64
+
+
+@wp.kernel(enable_backward=False)
+def static_query_kernel(out: wp.array2d[float]):
+    t = wp.tile_zeros(shape=(STATIC_QUERY_DIM, STATIC_QUERY_DIM), dtype=float, storage="shared")
+    wp.tile_store(out, t)
+
+
+def test_tile_static_shared_memory_query(test, device):
+    """Check that the static shared memory query reports the per-block reservation."""
+    BLOCK_DIM = STATIC_QUERY_BLOCK_DIM
+
+    out = wp.zeros((STATIC_QUERY_DIM, STATIC_QUERY_DIM), dtype=float, device=device)
+    wp.launch_tiled(static_query_kernel, dim=[1], inputs=[out], block_dim=BLOCK_DIM, device=device)
+
+    module_exec = static_query_kernel.module.load(device, BLOCK_DIM)
+    hooks = module_exec.get_kernel_hooks(static_query_kernel)
+
+    static_bytes = warp_context.runtime.core.wp_cuda_get_kernel_static_shared_memory(device.context, hooks.forward)
+
+    # every tile kernel reserves at least one unsigned int per thread for smem_base
+    # (warp/native/tile.h); kernels pulling in tile_cholesky.h, bvh.h, tile_mesh.h, or
+    # tile_radix_sort.h reserve more on top of that
+    test.assertGreaterEqual(static_bytes, 4 * BLOCK_DIM)
+    test.assertLess(static_bytes, device.max_shared_memory_per_block)
+
+    # a null kernel handle reports failure rather than a plausible-looking zero
+    test.assertEqual(warp_context.runtime.core.wp_cuda_get_kernel_static_shared_memory(device.context, None), -1)
+
+
+def test_tile_shared_mem_overflow_message(test, device):
+    """Check that the over-budget warning names a maximum the kernel can actually reach."""
+    BLOCK_DIM = 64
+
+    # A request of the full device maximum cannot fit, because every tile kernel also
+    # reserves static shared memory. Sizing from the device keeps this true on every
+    # architecture, where the maximum ranges from 101,376 to 232,448 bytes.
+    TILE_N = device.max_shared_memory_per_block // 4
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def compute(out: wp.array[float]):
+        t = wp.tile_zeros(shape=TILE_N, dtype=float, storage="shared")
+        wp.tile_store(out, t)
+
+    out = wp.zeros(TILE_N, dtype=float, device=device)
+
+    # Warp's default logger routes warnings through its own showwarning, so capture
+    # stderr rather than warnings.catch_warnings(record=True), which never sees them.
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+        warnings.simplefilter("always")
+        module_exec = compute.module.load(device, BLOCK_DIM)
+        hooks = module_exec.get_kernel_hooks(compute)
+
+    messages = [line for line in stderr.getvalue().splitlines() if "shared memory" in line]
+    test.assertEqual(len(messages), 1, f"expected one shared memory warning, got {messages}")
+    warning = messages[0]
+
+    test.assertIn("(forward)", warning)
+    test.assertIn(f"block_dim={BLOCK_DIM}", warning)
+    test.assertIn(f"requests {hooks.forward_smem_bytes} bytes", warning)
+
+    # the reported maximum must be the budget the kernel can reach, not the device limit
+    available = int(re.search(r"only (\d+) bytes are available", warning).group(1))
+    static = int(re.search(r"minus (\d+) bytes of static", warning).group(1))
+    test.assertGreater(static, 0)
+    test.assertEqual(available, device.max_shared_memory_per_block - static)
+    test.assertLess(available, hooks.forward_smem_bytes)
+
+    test.assertIsNotNone(hooks.forward_smem_shortfall)
+    # Verify that the stored value is the clause fragment, not the entire warning line.
+    # A regression storing the full warning would pass this test gate and produce doubled messages.
+    test.assertTrue(hooks.forward_smem_shortfall.startswith("but only "))
+    test.assertNotIn("Failed to configure", hooks.forward_smem_shortfall)
+    test.assertIsNone(hooks.backward_smem_shortfall)
+
+    # every launch reports the shortfall, not just the first: the warning above fires once
+    # because get_kernel_hooks caches, so the error is the only diagnostic from launch two on
+    for attempt in range(2):
+        with suppress_native_error_output(), test.assertRaises(RuntimeError) as raised:
+            wp.launch_tiled(compute, dim=[1], inputs=[out], block_dim=BLOCK_DIM, device=device)
+
+        message = str(raised.exception)
+        test.assertIn("forward kernel requests", message, f"attempt {attempt}")
+        test.assertIn("dynamic shared memory", message, f"attempt {attempt}")
+        test.assertIn(f"block_dim={BLOCK_DIM}", message, f"attempt {attempt}")
+        test.assertIn("tile-shared-memory-budget", message, f"attempt {attempt}")
+        test.assertNotIn("invalid argument", message, f"attempt {attempt}")
+
+
+def test_tile_shared_mem_backward_overflow_message(test, device):
+    """Check that a forward kernel that fits is not blamed for a backward kernel that does not."""
+    BLOCK_DIM = 64
+
+    # The backward kernel needs twice the owning-tile bytes (Adjoint.get_total_required_shared_backward),
+    # so 60% of the device maximum fits going forward and overflows coming back.
+    TILE_N = int(device.max_shared_memory_per_block * 0.6) // 4
+
+    @wp.kernel(module="unique")
+    def compute(inp: wp.array[float], out: wp.array[float]):
+        t = wp.tile_load(inp, shape=TILE_N, storage="shared")
+        wp.tile_store(out, t)
+
+    inp = wp.ones(TILE_N, dtype=float, requires_grad=True, device=device)
+    out = wp.zeros(TILE_N, dtype=float, requires_grad=True, device=device)
+
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+        warnings.simplefilter("always")
+        module_exec = compute.module.load(device, BLOCK_DIM)
+        hooks = module_exec.get_kernel_hooks(compute)
+
+    # the premise of this test: forward fits, backward is exactly twice as large
+    test.assertEqual(hooks.backward_smem_bytes, 2 * hooks.forward_smem_bytes)
+    test.assertIsNone(hooks.forward_smem_shortfall)
+    test.assertIsNotNone(hooks.backward_smem_shortfall)
+    # Verify that the stored value is the clause fragment, not the entire warning line.
+    # A regression storing the full warning would pass this test gate and produce doubled messages.
+    test.assertTrue(hooks.backward_smem_shortfall.startswith("but only "))
+    test.assertNotIn("Failed to configure", hooks.backward_smem_shortfall)
+
+    messages = [line for line in stderr.getvalue().splitlines() if "shared memory" in line]
+    test.assertEqual(len(messages), 1, f"expected one shared memory warning, got {messages}")
+    test.assertIn("(backward)", messages[0])
+
+    # the forward kernel still runs
+    wp.launch_tiled(compute, dim=[1], inputs=[inp], outputs=[out], block_dim=BLOCK_DIM, device=device)
+    assert_np_equal(out.numpy(), np.ones(TILE_N, dtype=np.float32))
+
+    # only the backward kernel fails, and it says why
+    with wp.Tape() as tape:
+        wp.launch_tiled(compute, dim=[1], inputs=[inp], outputs=[out], block_dim=BLOCK_DIM, device=device)
+
+    out.grad = wp.ones(TILE_N, dtype=float, device=device)
+    with suppress_native_error_output(), test.assertRaises(RuntimeError) as raised:
+        tape.backward()
+
+    message = str(raised.exception)
+    test.assertIn("backward kernel requests", message)
+    test.assertIn("dynamic shared memory", message)
+    test.assertNotIn("invalid argument", message)
+
+
+def test_tile_shared_mem_unknown_static_message(test, device):
+    """Check that an unreadable static size leaves the warning generic instead of naming a wrong budget."""
+    BLOCK_DIM = 64
+
+    # same over-budget request as test_tile_shared_mem_overflow_message, so the configure
+    # call genuinely fails; only the static shared memory query is faulted
+    TILE_N = device.max_shared_memory_per_block // 4
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def compute(out: wp.array[float]):
+        t = wp.tile_zeros(shape=TILE_N, dtype=float, storage="shared")
+        wp.tile_store(out, t)
+
+    out = wp.zeros(TILE_N, dtype=float, device=device)
+
+    # this kernel is unique to this test, so its hooks are resolved for the first time inside
+    # the patch; a cached ModuleExec would skip the configure path and assert nothing
+    with (
+        mock.patch.object(
+            warp_context.runtime.core, "wp_cuda_get_kernel_static_shared_memory", return_value=-1
+        ) as static_query,
+        warnings.catch_warnings(),
+        contextlib.redirect_stderr(io.StringIO()) as stderr,
+    ):
+        warnings.simplefilter("always")
+        module_exec = compute.module.load(device, BLOCK_DIM)
+        hooks = module_exec.get_kernel_hooks(compute)
+
+    # the premise of this test: the configure failed and the static size came back unknown
+    test.assertEqual(static_query.call_count, 1)
+
+    messages = [line for line in stderr.getvalue().splitlines() if "shared memory" in line]
+    test.assertEqual(len(messages), 1, f"expected one shared memory warning, got {messages}")
+    warning = messages[0]
+
+    test.assertIn(f"Failed to configure {hooks.forward_smem_bytes} bytes", warning)
+    test.assertIn("(forward)", warning)
+
+    # with no static size there is no budget to report, so the warning must not name one
+    test.assertNotIn("bytes are available", warning)
+    test.assertNotIn("block_dim=", warning)
+
+    # and nothing is retained for the launch failure to blame on shared memory
+    test.assertIsNone(hooks.forward_smem_shortfall)
+    test.assertIsNone(hooks.backward_smem_shortfall)
+
+
+def test_tile_shared_mem_launch_error_without_shortfall(test, device):
+    """Check that a launch failure with no recorded shortfall keeps the generic CUDA error."""
+    BLOCK_DIM = 64
+
+    # same over-budget request as test_tile_shared_mem_overflow_message, so the configure
+    # genuinely fails and every launch fails with it; faulting only the static shared memory
+    # query leaves no shortfall clause, which is also what an unrelated driver failure looks like
+    TILE_N = device.max_shared_memory_per_block // 4
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def compute(out: wp.array[float]):
+        t = wp.tile_zeros(shape=TILE_N, dtype=float, storage="shared")
+        wp.tile_store(out, t)
+
+    out = wp.zeros(TILE_N, dtype=float, device=device)
+
+    # this kernel is unique to this test, so its hooks are resolved for the first time inside
+    # the patch; a cached ModuleExec would skip the configure path and assert nothing
+    with (
+        mock.patch.object(
+            warp_context.runtime.core, "wp_cuda_get_kernel_static_shared_memory", return_value=-1
+        ) as static_query,
+        warnings.catch_warnings(),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        warnings.simplefilter("always")
+        module_exec = compute.module.load(device, BLOCK_DIM)
+        hooks = module_exec.get_kernel_hooks(compute)
+
+    # the premise of this test: the configure failed and left nothing to blame on shared memory
+    test.assertEqual(static_query.call_count, 1)
+    test.assertIsNone(hooks.forward_smem_shortfall)
+
+    # the launch fails, and the driver's own error is reported unembellished
+    with suppress_native_error_output(), test.assertRaises(RuntimeError) as raised:
+        wp.launch_tiled(compute, dim=[1], inputs=[out], block_dim=BLOCK_DIM, device=device)
+
+    message = str(raised.exception)
+    test.assertIn("Error launching kernel", message)
+    test.assertIn("invalid argument", message)
+    test.assertNotIn("dynamic shared memory", message)
+    test.assertNotIn("bytes are available", message)
+    test.assertNotIn("tile-shared-memory-budget", message)
+
+
+def test_tile_shared_mem_occupancy_query_message(test, device):
+    """Check that a failed occupancy query explains an over-budget kernel too."""
+    TILE_N = device.max_shared_memory_per_block // 4
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def compute(out: wp.array[float]):
+        t = wp.tile_zeros(shape=TILE_N, dtype=float, storage="shared")
+        wp.tile_store(out, t)
+
+    # get_suggested_block_size loads at the module's default block_dim, so resolve the hooks the
+    # same way here and swallow the load-time warning
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+        warnings.simplefilter("always")
+        hooks = compute.module.load(device).get_kernel_hooks(compute)
+
+    test.assertIsNotNone(hooks.forward_smem_shortfall)
+
+    # cuOccupancyMaxPotentialBlockSize reports success with a block size of zero on some drivers
+    # rather than failing, so fault the query itself to reach the failure branch
+    with (
+        mock.patch.object(warp_context.runtime.core, "wp_cuda_get_suggested_block_size", return_value=False),
+        test.assertRaises(RuntimeError) as raised,
+    ):
+        wp.get_suggested_block_size(compute, device=device)
+
+    message = str(raised.exception)
+    test.assertIn("CUDA occupancy query failed", message)
+    test.assertIn(f"forward kernel requests {hooks.forward_smem_bytes} bytes", message)
+    test.assertIn(hooks.forward_smem_shortfall, message)
+    test.assertIn("tile-shared-memory-budget", message)
+
+
+def test_tile_shared_mem_deterministic_launch_message(test, device):
+    """Check that deterministic mode's separate launch path explains an over-budget kernel too."""
+    BLOCK_DIM = 64
+
+    TILE_N = device.max_shared_memory_per_block // 4
+
+    # The scatter atomic is what routes this launch through launch_deterministic, which owns a
+    # launch site of its own. Setting the mode per module keeps it off warp.config.
+    @wp.kernel(
+        enable_backward=False,
+        module="unique",
+        module_options={"deterministic": wp.DeterministicMode.RUN_TO_RUN},
+    )
+    def compute(out: wp.array[float], dest: wp.array[int], acc: wp.array[float]):
+        t = wp.tile_zeros(shape=TILE_N, dtype=float, storage="shared")
+        wp.tile_store(out, t)
+        wp.atomic_add(acc, dest[0], 1.0)
+
+    out = wp.zeros(TILE_N, dtype=float, device=device)
+    dest = wp.zeros(1, dtype=int, device=device)
+    acc = wp.zeros(1, dtype=float, device=device)
+
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+        warnings.simplefilter("always")
+        hooks = compute.module.load(device, BLOCK_DIM).get_kernel_hooks(compute)
+
+    # the premise of this test: the request is over budget, and launch() dispatches on exactly
+    # these two conditions, so meeting them is what proves the deterministic path is taken
+    test.assertIsNotNone(hooks.forward_smem_shortfall)
+    test.assertIsNotNone(hooks.det_launch_meta)
+    test.assertTrue(hooks.det_launch_meta.needs_deterministic)
+
+    with suppress_native_error_output(), test.assertRaises(RuntimeError) as raised:
+        wp.launch_tiled(compute, dim=[1], inputs=[out, dest, acc], block_dim=BLOCK_DIM, device=device)
+
+    message = str(raised.exception)
+    test.assertIn("forward kernel requests", message)
+    test.assertIn(hooks.forward_smem_shortfall, message)
+    test.assertIn("tile-shared-memory-budget", message)
+    test.assertNotIn("invalid argument", message)
+
+
+# checks shared tile state during graph replay and CUDA dynamic shared memory configuration
 def test_tile_shared_mem_graph(test, device):
+    """Preserve block dimensions and shared-memory requirements during graph replay."""
     DIM_M = 32
     DIM_N = 32
 
@@ -93,6 +448,10 @@ def test_tile_shared_mem_graph(test, device):
         a = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared")
         b = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared") * 2.0
 
+        # Every lane contributes to the same shared element, so replaying the
+        # graph correctly requires preserving the captured block dimension and
+        # synchronizing the lanes around the shared tile operation.
+        wp.tile_scatter_add(a, 0, 0, 1.0, True)
         c = a + b
         wp.tile_store(out, c)
 
@@ -107,22 +466,26 @@ def test_tile_shared_mem_graph(test, device):
     wp.capture_launch(capture.graph)
 
     # check output
-    assert_np_equal(out.numpy(), np.ones((DIM_M, DIM_N)) * 3.0)
+    expected = np.ones((DIM_M, DIM_N), dtype=np.float32) * 3.0
+    expected[0, 0] += BLOCK_DIM
+    assert_np_equal(out.numpy(), expected)
 
-    # check required shared memory
-    expected_forward_bytes = DIM_M * DIM_N * 4 * 2
-    expected_backward_bytes = expected_forward_bytes * 2
+    if wp.get_device(device).is_cuda:
+        # check required dynamic shared memory
+        expected_forward_bytes = DIM_M * DIM_N * 4 * 2
+        expected_backward_bytes = expected_forward_bytes * 2
 
-    # check shared memory for kernel on the device
-    module_exec = compute.module.load(device, BLOCK_DIM)
-    hooks = module_exec.get_kernel_hooks(compute)
+        # check shared memory for kernel on the device
+        module_exec = compute.module.load(device, BLOCK_DIM)
+        hooks = module_exec.get_kernel_hooks(compute)
 
-    assert hooks.forward_smem_bytes == expected_forward_bytes
-    assert hooks.backward_smem_bytes == expected_backward_bytes
+        test.assertEqual(hooks.forward_smem_bytes, expected_forward_bytes)
+        test.assertEqual(hooks.backward_smem_bytes, expected_backward_bytes)
 
 
 # checks that stack allocations work for user functions
-def test_tile_shared_mem_func(test, device):
+def test_tile_function_allocations_use_peak_shared_memory(test, device):
+    """Report the peak shared-memory allocation across tile function calls."""
     DIM_M = 64
     DIM_N = 64
 
@@ -163,8 +526,8 @@ def test_tile_shared_mem_func(test, device):
     # ensure that total required dynamic shared is the larger of the two tiles
     expected_required_shared = 64 * 64 * 4 * 2
 
-    assert hooks.forward_smem_bytes == expected_required_shared
-    assert hooks.backward_smem_bytes == expected_required_shared * 2
+    test.assertEqual(hooks.forward_smem_bytes, expected_required_shared)
+    test.assertEqual(hooks.backward_smem_bytes, expected_required_shared * 2)
 
 
 def round_up(a, b):
@@ -173,6 +536,7 @@ def round_up(a, b):
 
 # checks that using non-16B aligned sizes work
 def test_tile_shared_non_aligned(test, device):
+    """Allocate non-16-byte-aligned shared tiles without corrupting the stack."""
     # Tile size = 4 (float) * 1 * 3 = 12B % 16 != 0
     DIM_M = 1
     DIM_N = 3
@@ -208,8 +572,8 @@ def test_tile_shared_non_aligned(test, device):
     # ensure that total required dynamic shared is the larger of the two tiles
     expected_required_shared = 3 * round_up(DIM_M * DIM_N * 4, 16)
 
-    assert hooks.forward_smem_bytes == expected_required_shared
-    assert hooks.backward_smem_bytes == expected_required_shared * 2
+    test.assertEqual(hooks.forward_smem_bytes, expected_required_shared)
+    test.assertEqual(hooks.backward_smem_bytes, expected_required_shared * 2)
 
 
 def test_tile_shared_vec_accumulation(test, device):
@@ -273,7 +637,8 @@ def test_tile_shared_vec_accumulation(test, device):
     assert_np_equal(vecs.grad.numpy(), true_grads)
 
 
-def test_tile_shared_simple_reduction_add(test, device):
+def test_tile_shared_manual_reduction_add(test, device):
+    """Reduce a shared tile manually with in-place addition."""
     BLOCK_DIM = 256
 
     @wp.kernel(module="unique")
@@ -300,7 +665,8 @@ def test_tile_shared_simple_reduction_add(test, device):
     assert_np_equal(np.sum(y.numpy()), np.sum(x_np))
 
 
-def test_tile_shared_simple_reduction_sub(test, device):
+def test_tile_shared_manual_reduction_sub(test, device):
+    """Reduce a shared tile manually with in-place subtraction."""
     BLOCK_DIM = 256
 
     @wp.kernel(module="unique")
@@ -327,8 +693,8 @@ def test_tile_shared_simple_reduction_sub(test, device):
     assert_np_equal(np.sum(y.numpy()), 0.0)
 
 
-def test_tile_scatter_add_basic(test, device):
-    """Each thread adds its index + 1 to a distinct slot; verify values."""
+def test_tile_scatter_add_distinct_indices(test, device):
+    """Write distinct per-thread values with ``tile_scatter_add()``."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -345,7 +711,7 @@ def test_tile_scatter_add_basic(test, device):
 
 
 def test_tile_scatter_add_conflicting(test, device):
-    """All threads add 1.0 to the same index; verify the sum equals block_dim."""
+    """Sum conflicting per-thread scatter additions at one index."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -364,7 +730,7 @@ def test_tile_scatter_add_conflicting(test, device):
 
 
 def test_tile_scatter_add_partial(test, device):
-    """Only even-indexed threads add; odd slots stay zero."""
+    """Verify that only even-indexed threads add; odd slots stay zero."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -386,7 +752,7 @@ def test_tile_scatter_add_partial(test, device):
 
 
 def test_tile_scatter_add_2d(test, device):
-    """Scatter-add with a 2D shared tile."""
+    """Test scatter-add with a 2D shared tile."""
     ROWS = 8
     COLS = 8
     BLOCK_DIM = ROWS * COLS
@@ -407,8 +773,8 @@ def test_tile_scatter_add_2d(test, device):
     assert_np_equal(out.numpy(), expected)
 
 
-def test_tile_scatter_add_grad_basic(test, device):
-    """Gradient flows through tile_scatter_add: output = input * 2 via shared tile."""
+def test_tile_scatter_add_grad_distinct_indices(test, device):
+    """Propagate gradients through distinct per-thread ``tile_scatter_add()`` writes."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -433,7 +799,7 @@ def test_tile_scatter_add_grad_basic(test, device):
 
 
 def test_tile_scatter_add_grad_partial(test, device):
-    """has_value gates the adjoint: only participating threads receive gradients."""
+    """Verify that has_value gates the adjoint: only participating threads receive gradients."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -459,7 +825,7 @@ def test_tile_scatter_add_grad_partial(test, device):
 
 
 def test_tile_scatter_add_grad_conflicting(test, device):
-    """Gradient fans out correctly when multiple threads scatter-add to the same index."""
+    """Verify that gradient fans out correctly when multiple threads scatter-add to the same index."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -491,7 +857,7 @@ def test_tile_scatter_add_grad_conflicting(test, device):
 
 
 def test_tile_scatter_add_non_atomic_1d(test, device):
-    """Non-atomic scatter-add with unique indices per thread (1D)."""
+    """Test non-atomic scatter-add with unique indices per thread (1D)."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -508,7 +874,7 @@ def test_tile_scatter_add_non_atomic_1d(test, device):
 
 
 def test_tile_scatter_add_non_atomic_2d(test, device):
-    """Non-atomic scatter-add with unique (row, col) per thread (2D)."""
+    """Test non-atomic scatter-add with unique (row, col) per thread (2D)."""
     ROWS = 4
     COLS = 16
     TILE_SIZE = ROWS * COLS
@@ -530,7 +896,7 @@ def test_tile_scatter_add_non_atomic_2d(test, device):
 
 
 def test_tile_scatter_add_non_atomic_grad(test, device):
-    """Gradient flows correctly through non-atomic tile_scatter_add."""
+    """Verify that gradient flows correctly through non-atomic tile_scatter_add."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -555,7 +921,7 @@ def test_tile_scatter_add_non_atomic_grad(test, device):
 
 
 def test_tile_shared_coalesced_mat33(test, device):
-    """Shared tile load/store of mat33 exercises the coalesced byte-copy path (sizeof(mat33) = 36 > 16)."""
+    """Verify that shared tile load/store of mat33 exercises the coalesced byte-copy path (sizeof(mat33) = 36 > 16)."""
     TILE_SIZE = 8
     BLOCK_DIM = 64
 
@@ -578,7 +944,7 @@ def test_tile_shared_coalesced_mat33(test, device):
 
 
 def test_tile_shared_coalesced_mat44(test, device):
-    """Shared tile load/store of mat44 exercises the coalesced byte-copy path (sizeof(mat44) = 64 > 16)."""
+    """Verify that shared tile load/store of mat44 exercises the coalesced byte-copy path (sizeof(mat44) = 64 > 16)."""
     TILE_SIZE = 4
     BLOCK_DIM = 64
 
@@ -652,8 +1018,8 @@ def test_tile_register_from_shared_reassign(test, device):
     np.testing.assert_allclose(overwritten.grad.numpy(), np.zeros(TILE_SIZE, dtype=np.float32))
 
 
-def test_tile_scatter_masked_basic(test, device):
-    """Each thread writes its index; verify all values are visible after the call."""
+def test_tile_scatter_masked_distinct_indices(test, device):
+    """Write distinct per-thread values with ``tile_scatter_masked()``."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -670,7 +1036,7 @@ def test_tile_scatter_masked_basic(test, device):
 
 
 def test_tile_scatter_masked_partial(test, device):
-    """Only even-indexed threads write; odd slots stay zero."""
+    """Verify that only even-indexed threads write; odd slots stay zero."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -692,7 +1058,7 @@ def test_tile_scatter_masked_partial(test, device):
 
 
 def test_tile_scatter_masked_cross_thread(test, device):
-    """Each thread reads a neighbor's slot, verifying the sync barrier works."""
+    """Verify that each thread reads a neighbor's slot, verifying the sync barrier works."""
     TILE_SIZE = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -711,7 +1077,7 @@ def test_tile_scatter_masked_cross_thread(test, device):
 
 
 def test_tile_scatter_masked_2d(test, device):
-    """tile_scatter_masked works with a 2-D shared tile."""
+    """Verify that tile_scatter_masked works with a 2-D shared tile."""
     ROWS = 8
     COLS = 8
     BLOCK_DIM = ROWS * COLS
@@ -733,7 +1099,7 @@ def test_tile_scatter_masked_2d(test, device):
 
 
 def test_tile_scatter_masked_3d(test, device):
-    """tile_scatter_masked works with a 3-D shared tile."""
+    """Verify that tile_scatter_masked works with a 3-D shared tile."""
     D0 = 4
     D1 = 4
     D2 = 4
@@ -757,7 +1123,7 @@ def test_tile_scatter_masked_3d(test, device):
 
 
 def test_tile_scatter_masked_4d(test, device):
-    """tile_scatter_masked works with a 4-D shared tile."""
+    """Verify that tile_scatter_masked works with a 4-D shared tile."""
     D0 = 2
     D1 = 2
     D2 = 2
@@ -782,8 +1148,8 @@ def test_tile_scatter_masked_4d(test, device):
     np.testing.assert_array_equal(out.numpy(), expected)
 
 
-def test_tile_scatter_masked_grad_basic(test, device):
-    """Gradient flows through tile_scatter_masked: output = input * 2 via shared tile."""
+def test_tile_scatter_masked_grad_distinct_indices(test, device):
+    """Propagate gradients through distinct per-thread ``tile_scatter_masked()`` writes."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -808,7 +1174,7 @@ def test_tile_scatter_masked_grad_basic(test, device):
 
 
 def test_tile_scatter_masked_grad_partial(test, device):
-    """has_value gates the adjoint: only writing threads receive gradients."""
+    """Verify that has_value gates the adjoint: only writing threads receive gradients."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -834,7 +1200,7 @@ def test_tile_scatter_masked_grad_partial(test, device):
 
 
 def test_tile_scatter_masked_grad_cross_thread(test, device):
-    """Gradient flows correctly when threads read each other's slots."""
+    """Verify that gradient flows correctly when threads read each other's slots."""
     TILE_SIZE = 64
 
     @wp.kernel(module="unique")
@@ -862,6 +1228,110 @@ def test_tile_scatter_masked_grad_cross_thread(test, device):
     np.testing.assert_allclose(inp.grad.numpy(), expected_grad)
 
 
+def test_tile_custom_grad_extra_shared(test, device):
+    """Test a custom func_grad whose backward needs more shared memory than its elementwise forward."""
+    NUM_TILES = 4
+    M = 4
+    EXTRA = 8  # backward-only shared scratch is EXTRA x EXTRA, dwarfing the M x M forward tile
+
+    @wp.func
+    def scale2x(x: wp.array2d[float], y: wp.array2d[float], i: int):
+        # forward: y = 2x elementwise -> tiny shared footprint
+        wp.tile_store(y, wp.tile_load(x, shape=(M, M), offset=(i * M, 0)) * float(2.0), offset=(i * M, 0))
+
+    @wp.func_grad(scale2x)
+    def adj_scale2x(x: wp.array2d[float], y: wp.array2d[float], i: int):
+        # backward is dL/dx = 2*dL/dy, but routed through a large shared scratch tile (the
+        # trigger); *0.0 keeps the value at 2 while the scratch still feeds the scatter.
+        g = wp.tile_load(wp.adjoint[y], shape=(M, M), offset=(i * M, 0))
+        scratch = wp.tile_ones(shape=(EXTRA, EXTRA), dtype=float, storage="shared")
+        pad = wp.tile_broadcast(wp.tile_sum(scratch), shape=(M, M))
+        wp.tile_atomic_add(wp.adjoint[x], g * float(2.0) + pad * float(0.0), offset=(i * M, 0))
+
+    @wp.kernel(module="unique")
+    def run(x: wp.array2d[float], y: wp.array2d[float]):
+        scale2x(x, y, wp.tid())
+
+    x = wp.array(np.ones((NUM_TILES * M, M), dtype=np.float32), requires_grad=True, device=device)
+    y = wp.zeros_like(x)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(run, dim=(NUM_TILES,), inputs=[x], outputs=[y], block_dim=64, device=device)
+
+    tape.backward(grads={y: wp.ones_like(y)})
+
+    # backward must not have corrupted memory (or crashed with CUDA 700): dL/dx == 2 everywhere
+    assert_np_equal(x.grad.numpy(), np.full((NUM_TILES * M, M), 2.0, dtype=np.float32))
+
+    # the reservation must be split: the custom grad frame sizes the backward kernel only
+    hooks = next(iter(run.module.execs.values())).get_kernel_hooks(run)
+    scratch_bytes = EXTRA * EXTRA * 4
+    # the forward tile working set is register-only; the backward-only scratch must not leak in
+    test.assertEqual(hooks.forward_smem_bytes, 0)
+    # the backward reservation covers the scratch, added once (x1) rather than doubled
+    test.assertGreaterEqual(hooks.backward_smem_bytes, scratch_bytes)
+    test.assertLess(hooks.backward_smem_bytes, 2 * scratch_bytes)
+
+
+def test_tile_custom_grad_shared_forward(test, device):
+    """Test a custom func_grad on a function whose forward itself owns a shared tile.
+
+    The forward frame's auto-generated adjoint is replaced by the custom grad, so in the
+    backward it only ever runs as a replay (no gradient buffers): the reservation must be
+    the larger of the replay and custom grad frames, not their doubled sum.
+    """
+    NUM_TILES = 4
+    M = 4
+    EXTRA = 8
+
+    @wp.func
+    def scale2x(x: wp.array2d[float], y: wp.array2d[float], i: int):
+        # forward stages through an owning shared tile
+        t = wp.tile_load(x, shape=(M, M), offset=(i * M, 0), storage="shared")
+        wp.tile_store(y, t * float(2.0), offset=(i * M, 0))
+
+    @wp.func_grad(scale2x)
+    def adj_scale2x(x: wp.array2d[float], y: wp.array2d[float], i: int):
+        g = wp.tile_load(wp.adjoint[y], shape=(M, M), offset=(i * M, 0))
+        scratch = wp.tile_ones(shape=(EXTRA, EXTRA), dtype=float, storage="shared")
+        pad = wp.tile_broadcast(wp.tile_sum(scratch), shape=(M, M))
+        wp.tile_atomic_add(wp.adjoint[x], g * float(2.0) + pad * float(0.0), offset=(i * M, 0))
+
+    @wp.kernel(module="unique")
+    def run(x: wp.array2d[float], y: wp.array2d[float]):
+        scale2x(x, y, wp.tid())
+
+    x = wp.array(np.ones((NUM_TILES * M, M), dtype=np.float32), requires_grad=True, device=device)
+    y = wp.zeros_like(x)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(run, dim=(NUM_TILES,), inputs=[x], outputs=[y], block_dim=64, device=device)
+
+    tape.backward(grads={y: wp.ones_like(y)})
+
+    assert_np_equal(x.grad.numpy(), np.full((NUM_TILES * M, M), 2.0, dtype=np.float32))
+
+    hooks = next(iter(run.module.execs.values())).get_kernel_hooks(run)
+    forward_tile_bytes = M * M * 4
+    scratch_bytes = EXTRA * EXTRA * 4
+    test.assertEqual(hooks.forward_smem_bytes, forward_tile_bytes)
+    # the custom grad frame dominates the replayed forward frame; neither is doubled
+    test.assertGreaterEqual(hooks.backward_smem_bytes, scratch_bytes)
+    test.assertLess(hooks.backward_smem_bytes, 2 * hooks.forward_smem_bytes + scratch_bytes)
+
+
+class TestTileSharedMemoryMessages(unittest.TestCase):
+    """Message formatting for over-budget shared memory requests, independent of any device."""
+
+    def test_clause_none_when_request_fits(self):
+        """Return no clause when the request fits, so an unrelated driver failure stays generic."""
+        # No device test reaches this branch: it needs cuFuncSetAttribute to fail for some reason
+        # other than overflow, which cannot be provoked on real hardware. The other two branches
+        # are covered through the real path by test_tile_shared_mem_overflow_message and
+        # test_tile_shared_mem_unknown_static_message.
+        self.assertIsNone(_smem_shortfall_clause(block_dim=64, requested=101120, static=256, device_max=101376))
+
+
 devices = get_cuda_test_devices()
 
 
@@ -870,37 +1340,94 @@ class TestTileSharedMemory(unittest.TestCase):
 
 
 add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_cpu_limit",
+    test_tile_shared_mem_cpu_limit,
+    devices=get_cpu_test_devices(),
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_register_from_shared_reassign_cpu_blocks",
+    test_tile_register_from_shared_reassign,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_scatter_masked_cross_thread_cpu_blocks",
+    test_tile_scatter_masked_cross_thread,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
+)
+add_function_test(
     TestTileSharedMemory, "test_tile_shared_mem_size", test_tile_shared_mem_size, devices=devices, check_output=False
 )
 add_function_test(
-    TestTileSharedMemory, "test_tile_shared_mem_large", test_tile_shared_mem_large, devices=devices, check_output=False
+    TestTileSharedMemory,
+    "test_tile_shared_memory_supports_64_kib_allocation",
+    test_tile_shared_memory_supports_64_kib_allocation,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_static_shared_memory_query",
+    test_tile_static_shared_memory_query,
+    devices=devices,
 )
 add_function_test(TestTileSharedMemory, "test_tile_shared_mem_graph", test_tile_shared_mem_graph, devices=devices)
-add_function_test(TestTileSharedMemory, "test_tile_shared_mem_func", test_tile_shared_mem_func, devices=devices)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_graph_cpu_blocks",
+    test_tile_shared_mem_graph,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_function_allocations_use_peak_shared_memory",
+    test_tile_function_allocations_use_peak_shared_memory,
+    devices=devices,
+)
 add_function_test(TestTileSharedMemory, "test_tile_shared_non_aligned", test_tile_shared_non_aligned, devices=devices)
 add_function_test(
     TestTileSharedMemory, "test_tile_shared_vec_accumulation", test_tile_shared_vec_accumulation, devices=devices
 )
 add_function_test(
     TestTileSharedMemory,
-    "test_tile_shared_simple_reduction_add",
-    test_tile_shared_simple_reduction_add,
+    "test_tile_shared_manual_reduction_add",
+    test_tile_shared_manual_reduction_add,
     devices=devices,
 )
 add_function_test(
     TestTileSharedMemory,
-    "test_tile_shared_simple_reduction_sub",
-    test_tile_shared_simple_reduction_sub,
+    "test_tile_shared_manual_reduction_sub",
+    test_tile_shared_manual_reduction_sub,
     devices=devices,
 )
-add_function_test(TestTileSharedMemory, "test_tile_scatter_add_basic", test_tile_scatter_add_basic, devices=devices)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_scatter_add_distinct_indices",
+    test_tile_scatter_add_distinct_indices,
+    devices=devices,
+)
 add_function_test(
     TestTileSharedMemory, "test_tile_scatter_add_conflicting", test_tile_scatter_add_conflicting, devices=devices
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_scatter_add_conflicting_cpu_blocks",
+    test_tile_scatter_add_conflicting,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
 )
 add_function_test(TestTileSharedMemory, "test_tile_scatter_add_partial", test_tile_scatter_add_partial, devices=devices)
 add_function_test(TestTileSharedMemory, "test_tile_scatter_add_2d", test_tile_scatter_add_2d, devices=devices)
 add_function_test(
-    TestTileSharedMemory, "test_tile_scatter_add_grad_basic", test_tile_scatter_add_grad_basic, devices=devices
+    TestTileSharedMemory,
+    "test_tile_scatter_add_grad_distinct_indices",
+    test_tile_scatter_add_grad_distinct_indices,
+    devices=devices,
 )
 add_function_test(
     TestTileSharedMemory, "test_tile_scatter_add_grad_partial", test_tile_scatter_add_grad_partial, devices=devices
@@ -910,6 +1437,13 @@ add_function_test(
     "test_tile_scatter_add_grad_conflicting",
     test_tile_scatter_add_grad_conflicting,
     devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_scatter_add_grad_conflicting_cpu_blocks",
+    test_tile_scatter_add_grad_conflicting,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
 )
 add_function_test(
     TestTileSharedMemory,
@@ -948,7 +1482,10 @@ add_function_test(
     devices=devices,
 )
 add_function_test(
-    TestTileSharedMemory, "test_tile_scatter_masked_basic", test_tile_scatter_masked_basic, devices=devices
+    TestTileSharedMemory,
+    "test_tile_scatter_masked_distinct_indices",
+    test_tile_scatter_masked_distinct_indices,
+    devices=devices,
 )
 add_function_test(
     TestTileSharedMemory, "test_tile_scatter_masked_partial", test_tile_scatter_masked_partial, devices=devices
@@ -963,7 +1500,10 @@ add_function_test(TestTileSharedMemory, "test_tile_scatter_masked_2d", test_tile
 add_function_test(TestTileSharedMemory, "test_tile_scatter_masked_3d", test_tile_scatter_masked_3d, devices=devices)
 add_function_test(TestTileSharedMemory, "test_tile_scatter_masked_4d", test_tile_scatter_masked_4d, devices=devices)
 add_function_test(
-    TestTileSharedMemory, "test_tile_scatter_masked_grad_basic", test_tile_scatter_masked_grad_basic, devices=devices
+    TestTileSharedMemory,
+    "test_tile_scatter_masked_grad_distinct_indices",
+    test_tile_scatter_masked_grad_distinct_indices,
+    devices=devices,
 )
 add_function_test(
     TestTileSharedMemory,
@@ -977,6 +1517,55 @@ add_function_test(
     test_tile_scatter_masked_grad_cross_thread,
     devices=devices,
 )
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_custom_grad_extra_shared",
+    test_tile_custom_grad_extra_shared,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_custom_grad_shared_forward",
+    test_tile_custom_grad_shared_forward,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_overflow_message",
+    test_tile_shared_mem_overflow_message,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_backward_overflow_message",
+    test_tile_shared_mem_backward_overflow_message,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_unknown_static_message",
+    test_tile_shared_mem_unknown_static_message,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_launch_error_without_shortfall",
+    test_tile_shared_mem_launch_error_without_shortfall,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_occupancy_query_message",
+    test_tile_shared_mem_occupancy_query_message,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_mem_deterministic_launch_message",
+    test_tile_shared_mem_deterministic_launch_message,
+    devices=devices,
+)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

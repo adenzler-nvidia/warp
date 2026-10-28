@@ -14,8 +14,6 @@ import warp._src.context
 if TYPE_CHECKING:
     import torch
 
-_wp_module_name_ = "warp.torch"
-
 
 # return the warp device corresponding to a torch device
 def device_from_torch(torch_device: torch.device | str) -> warp.Device:
@@ -158,6 +156,7 @@ def dtype_is_compatible(torch_dtype, warp_dtype) -> bool:
             torch.float16: {warp.float16},
             torch.bfloat16: {warp.bfloat16},
             # allow aliasing integer tensors as signed or unsigned integer arrays
+            # wp.handle interop is intentionally deferred; APIC handle arrays use wp.array().
             torch.int64: {warp.int64, warp.uint64},
             torch.int32: {warp.int32, warp.uint32},
             torch.int16: {warp.int16, warp.uint16},
@@ -187,7 +186,7 @@ dtype_to_torch.type_map = None
 dtype_is_compatible.compatible_sets = None
 
 
-# wrap a torch tensor to a wp array, data is not copied
+# wrap a PyTorch tensor to a wp.array, data is not copied
 def from_torch(
     t: torch.Tensor,
     dtype: type | None = None,
@@ -196,14 +195,21 @@ def from_torch(
     return_ctype: bool = False,
     retain_grad: bool = False,
 ) -> warp.array | warp._src.types.array_t:
-    """Convert a Torch tensor to a Warp array without copying the data.
+    """Convert a PyTorch tensor to a Warp array without copying the data.
+
+    The resulting Warp array aliases the PyTorch tensor's storage, so mutations
+    through either view are visible from the other.
+    Scalar Warp dtypes preserve the PyTorch tensor's shape and strides. Vector
+    and matrix Warp dtypes consume trailing component dimensions, and those
+    trailing dimensions must be contiguous.
 
     Args:
-        t: The torch tensor to wrap.
-        dtype: The target data type of the resulting Warp array. Defaults to the tensor value type mapped to a Warp array value type.
+        t: The PyTorch tensor to wrap.
+        dtype: The target data type of the resulting Warp array. Defaults to the
+          tensor value type mapped to a Warp array value type.
         requires_grad: Whether the resulting array should wrap the tensor's gradient,
           if it exists (the grad tensor will be allocated otherwise). Defaults to the tensor's ``requires_grad`` value.
-        grad: Optional gradient array to attach to the result. Can be a Warp array or Torch tensor.
+        grad: Optional gradient array to attach to the result. Can be a Warp array or PyTorch tensor.
           If not provided and ``requires_grad`` is True, the tensor's gradient will be wrapped or allocated.
         return_ctype: Whether to return a low-level array descriptor instead of a ``wp.array`` object (faster).
           The descriptor can be passed to Warp kernels.
@@ -232,12 +238,14 @@ def from_torch(
         # ensure inner shape matches
         if dtype_dims > len(shape) or dtype_shape != shape[-dtype_dims:]:
             raise RuntimeError(
-                f"Could not convert Torch tensor with shape {shape} to Warp array with dtype={dtype}, ensure that source inner shape is {dtype_shape}"
+                f"Could not convert PyTorch tensor with shape {shape} to Warp array with dtype={dtype}, "
+                f"ensure that source inner shape is {dtype_shape}"
             )
         # ensure inner strides are contiguous
         if strides[-1] != ctype_size or (dtype_dims > 1 and strides[-2] != ctype_size * dtype_shape[-1]):
             raise RuntimeError(
-                f"Could not convert Torch tensor with shape {shape} to Warp array with dtype={dtype}, because the source inner strides are not contiguous"
+                f"Could not convert PyTorch tensor with shape {shape} to Warp array with dtype={dtype}, "
+                "because the source inner strides are not contiguous"
             )
         # trim shape and strides
         shape = tuple(shape[:-dtype_dims]) or (1,)
@@ -298,11 +306,22 @@ def from_torch(
         return array_ctype
 
     else:
+        ptr = t.data_ptr()
+        capacity = 0
+        if ptr:
+            # A view's data pointer includes its storage offset. Warp capacity
+            # is measured from ptr, so exclude the preceding storage bytes.
+            storage = t.untyped_storage()
+            storage_base_ptr = storage.data_ptr()
+            storage_nbytes = storage.nbytes()
+            capacity = storage_nbytes - (ptr - storage_base_ptr)
+
         a = warp.array(
-            ptr=t.data_ptr(),
+            ptr=ptr,
             dtype=dtype,
             shape=shape,
             strides=strides,
+            capacity=capacity,
             device=device_from_torch(t.device),
             copy=False,
             grad=grad,
@@ -312,12 +331,21 @@ def from_torch(
 
         # save a reference to the source tensor, otherwise it may get deallocated
         a._tensor = t
+        if ptr:
+            # APIC uses allocation-wide bounds to recognize independently
+            # converted views of the same PyTorch storage as one memory region.
+            a._storage_base_ptr = storage_base_ptr
+            a._storage_nbytes = storage_nbytes
 
         return a
 
 
 def to_torch(a: warp.array, requires_grad: bool | None = None):
-    """Convert a Warp array to a Torch tensor without copying the data.
+    """Convert a Warp array to a PyTorch tensor without copying the data.
+
+    The returned PyTorch tensor aliases the Warp array's storage. Clone the
+    tensor if PyTorch must retain those values after Warp may modify or zero the
+    underlying array.
 
     Args:
         a: The Warp array to convert.
@@ -326,7 +354,7 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
           ``requires_grad`` value.
 
     Returns:
-        torch.Tensor: The converted tensor.
+        torch.Tensor: The converted PyTorch tensor.
     """
     import torch  # noqa: PLC0415
 
@@ -377,7 +405,13 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
 
 
 def stream_from_torch(stream_or_device=None):
-    """Convert from a Torch CUDA stream to a Warp CUDA stream."""
+    """Convert from a Torch CUDA stream to a Warp CUDA stream.
+
+    Streams created using ``torch.cuda.Stream()`` are non-blocking and the returned
+    ``warp.Stream`` inherits that behavior.
+    When using those streams to run Warp operations, ensure that Warp-owned resources are not garbage-collected while work on the non-blocking stream is still pending.
+    See :ref:`nonblocking_streams` for details and mitigation strategies.
+    """
     import torch  # noqa: PLC0415
 
     if isinstance(stream_or_device, torch.cuda.Stream):
@@ -397,7 +431,13 @@ def stream_from_torch(stream_or_device=None):
 
 
 def stream_to_torch(stream_or_device=None):
-    """Convert from a Warp CUDA stream to a Torch CUDA stream."""
+    """Convert from a Warp CUDA stream to a Torch CUDA stream.
+
+    Streams created using ``warp.Stream()`` are blocking and the returned PyTorch ``ExternalStream`` inherits that behavior.
+    This means PyTorch operations on the returned stream will implicitly synchronize
+    with the CUDA default stream, matching the default Warp behavior.
+    See :ref:`nonblocking_streams` for background on blocking vs. non-blocking streams.
+    """
     import torch  # noqa: PLC0415
 
     if isinstance(stream_or_device, warp.Stream):

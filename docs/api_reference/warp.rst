@@ -11,6 +11,7 @@ Submodules
 
 These modules are automatically available when you ``import warp``.
 
+- :mod:`warp.build_experimental`
 - :mod:`warp.config`
 - :mod:`warp.types`
 - :mod:`warp.utils`
@@ -22,6 +23,7 @@ These modules must be explicitly imported (e.g., ``import warp.autograd``).
 
 - :mod:`warp.autograd`
 - :mod:`warp.fem`
+- :mod:`warp.geometry`
 - :mod:`warp.optim`
 - :mod:`warp.render`
 - :mod:`warp.sparse`
@@ -37,6 +39,7 @@ Type Annotations
    Float
    Int
    Scalar
+   ref
 
 Data Types
 ----------
@@ -224,6 +227,7 @@ Spatial Acceleration
    HashGrid
    HashGridQuery
    Mesh
+   MeshQuery
    MeshQueryAABB
    MeshQueryAABBTiled
    MeshQueryPoint
@@ -255,6 +259,7 @@ Runtime
 
    clear_kernel_cache
    clear_lto_cache
+   get_cpu_kernel_cache_key
    init
    is_cpu_available
    is_cubql_available
@@ -274,6 +279,8 @@ Kernel Programming
    WarpCodegenKeyError
    WarpCodegenTypeError
    WarpCodegenValueError
+   WarpDeterminismError
+   address_of
    func
    func_grad
    func_native
@@ -296,6 +303,8 @@ Kernel Execution
    Kernel
    Launch
    Module
+   ModuleBuildOptions
+   get_cuda_kernel_properties
    get_suggested_block_size
    launch
    launch_tiled
@@ -385,10 +394,13 @@ CUDA Memory Management
    :toctree: _generated
 
    Allocator
+   CudaManagedAllocator
+   MemoryKind
    ScopedAllocator
    ScopedMempool
    ScopedMempoolAccess
    ScopedPeerAccess
+   get_cuda_max_cluster_dim
    get_device_allocator
    get_mempool_release_threshold
    get_mempool_used_mem_current
@@ -422,6 +434,7 @@ Graph Management
    capture_if
    capture_launch
    capture_load
+   capture_load_from_bytes
    capture_save
    capture_while
    is_conditional_graph_supported
@@ -464,6 +477,17 @@ Timing Flags
    TIMING_KERNEL_BUILTIN
    TIMING_MEMCPY
    TIMING_MEMSET
+
+CUDA Profiler Control
+^^^^^^^^^^^^^^^^^^^^^
+
+.. autosummary::
+   :nosignatures:
+   :toctree: _generated
+
+   ScopedCudaProfiler
+   cuda_profiler_start
+   cuda_profiler_stop
 
 Logging
 -------
@@ -596,6 +620,15 @@ Constants
    pi
    tau
 
+Configuration Modes
+-------------------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: _generated
+
+   DeterministicMode
+
 Misc
 ----
 
@@ -603,5 +636,4 @@ Misc
    :nosignatures:
    :toctree: _generated
 
-   MarchingCubes
    RegisteredGLBuffer

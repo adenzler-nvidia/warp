@@ -21,6 +21,13 @@ option(WARP_ENABLE_CUDA "Build Warp with CUDA support" ${_warp_enable_cuda_defau
 if(APPLE AND WARP_ENABLE_CUDA)
     message(FATAL_ERROR "CUDA builds are not supported on macOS")
 endif()
+if(WIN32
+   AND WARP_ENABLE_CUDA
+   AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$"
+   AND CMAKE_VERSION VERSION_LESS "4.4"
+)
+    message(FATAL_ERROR "Windows ARM64 CUDA builds require CMake 4.4 or newer")
+endif()
 
 option(WARP_BUILD_CLANG "Build warp-clang" ON)
 option(WARP_VERIFY_FP "Enable floating point verification" OFF)
@@ -201,9 +208,12 @@ endfunction()
 set(WARP_CPP_SOURCES
     warp/native/warp.cpp
     warp/native/bvh.cpp
+    warp/native/bvh_cubql.cpp
     warp/native/scan.cpp
     warp/native/apic.cpp
     warp/native/alloc_tracker.cpp
+    warp/native/cpu_block_runtime.cpp
+    warp/native/cpu_fiber.cpp
     warp/native/crt.cpp
     warp/native/error.cpp
     warp/native/cuda_util.cpp
@@ -214,10 +224,11 @@ set(WARP_CPP_SOURCES
     warp/native/sort.cpp
     warp/native/sparse.cpp
     warp/native/volume.cpp
+    warp/native/volume_builder.cpp
     warp/native/texture.cpp
     warp/native/mathdx.cpp
     warp/native/coloring.cpp
-    warp/native/fastcall.cpp
+    warp/native/deterministic.cpp
 )
 
 set(WARP_SOURCES ${WARP_CPP_SOURCES})
@@ -226,6 +237,8 @@ if(WARP_ENABLE_CUDA)
     list(
         APPEND WARP_SOURCES
         warp/native/bvh.cu
+        warp/native/deterministic.cu
+        warp/native/bvh_cubql.cu
         warp/native/mesh.cu
         warp/native/sort.cu
         warp/native/hashgrid.cu
@@ -249,7 +262,7 @@ set_target_properties(
         POSITION_INDEPENDENT_CODE ON
         MSVC_RUNTIME_LIBRARY "MultiThreaded"
 )
-target_include_directories(warp PRIVATE "${WARP_NATIVE_DIR}" ${WARP_PYTHON_INCLUDE_DIRS})
+target_include_directories(warp PRIVATE "${WARP_NATIVE_DIR}")
 target_compile_features(warp PRIVATE cxx_std_17)
 
 if(WARP_ENABLE_CUDA)
@@ -270,6 +283,7 @@ endif()
 # builds that need the full CUDA compatibility policy.
 set(WARP_ENABLE_CUDA_COMPATIBILITY_VALUE 0)
 
+target_compile_definitions(warp PRIVATE WP_BUILD_DLL)
 target_compile_definitions(
     warp
     PRIVATE
@@ -284,12 +298,11 @@ target_compile_definitions(
         "$<$<BOOL:${WARP_FAST_MATH}>:WP_FAST_MATH>"
         "$<$<PLATFORM_ID:Linux,Darwin>:_GLIBCXX_USE_CXX11_ABI=0>"
 )
-set_source_files_properties(warp/native/fastcall.cpp PROPERTIES COMPILE_DEFINITIONS Py_LIMITED_API=0x030a0000)
-
 if(WARP_ENABLE_CUDA)
     target_compile_options(
         warp
         PRIVATE
+            "$<$<AND:$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>"
             "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
             "$<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=221>"
             # Intentional: -t0 lets nvcc use all CPUs; use -t1 to constrain threading.
@@ -330,6 +343,9 @@ if(WARP_ENABLE_CUDA)
         warp_require_cuda_target(CUDA::cudart_static)
         warp_require_cuda_target(CUDA::nvrtc_static)
         target_link_libraries(warp PRIVATE CUDA::cudart_static CUDA::nvrtc_static)
+        if(WIN32)
+            target_link_libraries(warp PRIVATE ntdll)
+        endif()
         warp_link_nvptxcompiler(warp)
         if(TARGET CUDA::nvrtc_builtins_static)
             target_link_libraries(warp PRIVATE CUDA::nvrtc_builtins_static)
@@ -360,10 +376,9 @@ if(WARP_ENABLE_CUDA)
 endif()
 
 if(WIN32)
-    target_link_libraries(warp PRIVATE ws2_32 user32 delayimp "${WARP_PYTHON3_LIBRARY}")
-    target_link_options(warp PRIVATE /DELAYLOAD:python3.dll)
+    target_link_libraries(warp PRIVATE ws2_32 user32)
 elseif(APPLE)
-    target_link_options(warp PRIVATE "LINKER:-undefined,dynamic_lookup" "LINKER:-rpath,@loader_path")
+    target_link_options(warp PRIVATE "LINKER:-rpath,@loader_path")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     warp_add_linux_link_options(warp)
 endif()
@@ -391,6 +406,7 @@ if(WARP_BUILD_CLANG)
         warp-clang
         PRIVATE "$<$<AND:$<PLATFORM_ID:Linux>,$<COMPILE_LANG_AND_ID:CXX,GNU>>:-fabi-version=13>"
     )
+    target_compile_definitions(warp-clang PRIVATE WP_BUILD_DLL)
     target_compile_definitions(
         warp-clang
         PRIVATE
@@ -413,10 +429,7 @@ if(WARP_BUILD_CLANG)
                 Version
                 Ws2_32
                 ntdll
-                delayimp
-                "${WARP_PYTHON3_LIBRARY}"
         )
-        target_link_options(warp-clang PRIVATE /DELAYLOAD:python3.dll)
     elseif(APPLE)
         # Repeat LLVM static archives to resolve circular dependencies on macOS.
         target_link_libraries(warp-clang PRIVATE ${WARP_LLVM_LIBRARIES} ${WARP_LLVM_LIBRARIES} pthread dl)

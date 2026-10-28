@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import ctypes
 import ctypes.util
+import functools
+import gc
 import importlib.util
 import io
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 
 
 def _normalize_direct_test_sys_path():
@@ -42,6 +47,40 @@ import warp as wp  # noqa: E402
 pxr = importlib.util.find_spec("pxr")
 USD_AVAILABLE = pxr is not None
 
+
+@contextlib.contextmanager
+def suppress_native_error_output():
+    """Suppress native ``stderr`` output while preserving the recorded diagnostic.
+
+    Native output originates in C, so :func:`contextlib.redirect_stderr` cannot
+    intercept it. The diagnostic remains available through
+    :meth:`warp._src.context.Runtime.get_error_string`.
+    """
+    core = wp._src.context.runtime.core
+    saved_error_output_enabled = core.wp_is_error_output_enabled()
+    try:
+        core.wp_set_error_output_enabled(False)
+        yield
+    finally:
+        core.wp_set_error_output_enabled(saved_error_output_enabled)
+
+
+def make_isolated_kernel(func, **kwargs):
+    """Build a :class:`warp.Kernel` in a module of its own.
+
+    A kernel that fails to build fails its whole module, so a test that builds a
+    deliberately broken kernel has to keep it out of the test file's module.
+    ``@wp.kernel(module="unique")`` covers the decorator form; this covers the
+    kernels tests construct directly, and the cases where ``module="unique"``
+    would surface the failure too early (it hashes, and so builds, the kernel at
+    decoration time). The module name is keyed on the definition site rather than
+    the qualified name alone, so a test that rebinds the same name to several
+    broken kernels still gets one module each.
+    """
+    key = f"{func.__module__}.{func.__qualname__}:{func.__code__.co_firstlineno}"
+    return wp.Kernel(func=func, module=wp.get_module(key), **kwargs)
+
+
 # default test mode (see get_test_devices())
 #   "basic" - only run on CPU and first GPU device
 #   "unique" - run on CPU and all unique GPU arches
@@ -64,7 +103,7 @@ except OSError:
 
 
 def get_selected_cuda_test_devices(mode: str | None = None):
-    """Returns a list of CUDA devices according the selected ``mode`` behavior.
+    """Return CUDA devices according to the selected ``mode`` behavior.
 
     If ``mode`` is ``None``, the ``global test_mode`` value will be used and
     this list will be a subset of the devices returned from ``get_test_devices()``.
@@ -105,8 +144,15 @@ def get_selected_cuda_test_devices(mode: str | None = None):
     return selected_cuda_devices
 
 
+def get_cpu_test_devices():
+    """Return a list containing the CPU test device when available."""
+    if wp.is_cpu_available():
+        return [wp.get_device("cpu")]
+    return []
+
+
 def get_test_devices(mode: str | None = None):
-    """Returns a list of devices based on the mode selected.
+    """Return devices based on the selected mode.
 
     Args:
         mode: The testing mode to specify which devices to include. If not provided or ``None``, the
@@ -124,14 +170,12 @@ def get_test_devices(mode: str | None = None):
 
     if mode == "basic":
         # only run on CPU and first GPU device
-        if wp.is_cpu_available():
-            devices.append(wp.get_device("cpu"))
+        devices.extend(get_cpu_test_devices())
         if wp.is_cuda_available():
             devices.append(wp.get_device("cuda:0"))
     elif mode == "unique" or mode == "unique_or_2x":
         # run on CPU and a subset of GPUs
-        if wp.is_cpu_available():
-            devices.append(wp.get_device("cpu"))
+        devices.extend(get_cpu_test_devices())
         devices.extend(get_selected_cuda_test_devices(mode))
     elif mode == "all":
         # run on all devices
@@ -177,15 +221,18 @@ def get_cuda_device_pair_with_mempool_access_support(devices=None):
     return None
 
 
-def get_test_devices_with_mempool(mode: str | None = None):
-    """Like :func:`get_test_devices`, but drops CUDA devices without memory pool support.
+def get_test_devices_with_graph_capture_allocation(mode: str | None = None):
+    """Like :func:`get_test_devices`, but drops devices that cannot allocate during graph capture.
 
-    Allocations performed inside a CUDA graph capture must use ``cudaMallocAsync``,
-    which itself requires mempool support on the device. Use this getter to gate
-    tests that allocate during capture so they skip cleanly on devices reporting
-    ``is_mempool_supported = False``. CPU devices pass through unchanged.
+    Use this getter to gate tests that allocate inside a graph capture so they skip
+    cleanly on devices without the capability. CUDA requires memory-pool support
+    (``cudaMallocAsync`` is the only capture-safe allocator); CPU/APIC capture
+    allocates through the host allocator (kept valid by APIC region retention) and is
+    always supported. See ``warp._src.context._is_graph_capture_allocation_supported``.
     """
-    return [d for d in get_test_devices(mode) if not d.is_cuda or d.is_mempool_supported]
+    from warp._src.context import _is_graph_capture_allocation_supported  # noqa: PLC0415
+
+    return [d for d in get_test_devices(mode) if _is_graph_capture_allocation_supported(d)]
 
 
 def is_cuda_graph_module_load_supported(device) -> bool:
@@ -204,16 +251,16 @@ def get_test_devices_with_cuda_graph_module_load(mode: str | None = None):
     return [d for d in get_test_devices(mode) if is_cuda_graph_module_load_supported(d)]
 
 
-def get_test_devices_with_mempool_and_cuda_graph_module_load(mode: str | None = None):
-    """Like :func:`get_test_devices_with_mempool`, but also gates CUDA graph module loading."""
-    return [d for d in get_test_devices_with_mempool(mode) if is_cuda_graph_module_load_supported(d)]
+def get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load(mode: str | None = None):
+    """Like :func:`get_test_devices_with_graph_capture_allocation`, but also gates CUDA graph module loading."""
+    return [d for d in get_test_devices_with_graph_capture_allocation(mode) if is_cuda_graph_module_load_supported(d)]
 
 
 def get_cuda_test_devices_with_mempool(mode=None):
     """Like :func:`get_cuda_test_devices`, but drops CUDA devices without memory pool support.
 
-    See :func:`get_test_devices_with_mempool` for context on why mempool support
-    is required for in-capture allocation.
+    See :func:`get_test_devices_with_graph_capture_allocation` for context on why mempool
+    support is required for in-capture allocation on CUDA.
     """
     return [d for d in get_cuda_test_devices(mode) if d.is_mempool_supported]
 
@@ -221,8 +268,8 @@ def get_cuda_test_devices_with_mempool(mode=None):
 def get_selected_cuda_test_devices_with_mempool(mode: str | None = None):
     """Like :func:`get_selected_cuda_test_devices`, but drops CUDA devices without memory pool support.
 
-    See :func:`get_test_devices_with_mempool` for context on why mempool support
-    is required for in-capture allocation.
+    See :func:`get_test_devices_with_graph_capture_allocation` for context on why mempool
+    support is required for in-capture allocation on CUDA.
     """
     return [d for d in get_selected_cuda_test_devices(mode) if d.is_mempool_supported]
 
@@ -294,6 +341,36 @@ class StdOutCapture(StreamCapture):
         super().__init__("stdout")
 
 
+# ID of the first test in this process to see each end-of-test synchronization error, keyed by error text
+_first_test_ids_by_sync_error = {}
+
+
+def synchronize_after_test(test, test_failed=False):
+    """Flush device output and report CUDA errors from work a test left outstanding.
+
+    The error is raised only if ``test_failed`` is ``False``, so it never replaces the
+    test's own outcome. A CUDA fault leaves the context unusable, so every later
+    synchronization in the process fails with the same error. Those repeats name the
+    first test that saw the error, and a different error is reported as a new one.
+    """
+    # Skip while an interrupt propagates so Ctrl-C does not wait on a stuck kernel
+    propagating = sys.exc_info()[1]
+    if propagating is not None and not isinstance(propagating, Exception):
+        return
+
+    try:
+        wp.synchronize()
+    except Exception as error:
+        first_test_id = _first_test_ids_by_sync_error.get(str(error))
+        if first_test_id is None:
+            _first_test_ids_by_sync_error[str(error)] = test.id()
+            if not test_failed:
+                raise
+            print(f"CUDA synchronization after test '{test.id()}' failed: {error}", file=sys.stderr)
+        elif not test_failed:
+            raise RuntimeError(f"{error} (first failed after test '{first_test_id}')") from None
+
+
 class CheckOutput:
     def __init__(self, test):
         self.test = test
@@ -305,13 +382,14 @@ class CheckOutput:
         self.capture.begin()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # ensure any stdout output is flushed
-        wp.synchronize()
+        try:
+            synchronize_after_test(self.test, test_failed=exc_type is not None)
+        finally:
+            s = self.capture.end()
+            if s != "":
+                print(s.rstrip())
 
-        s = self.capture.end()
         if s != "":
-            print(s.rstrip())
-
             # fail if test produces unexpected output (e.g.: from wp.expect_eq() builtins)
             # we allow strings starting of the form "Module xxx load on device xxx"
             # for lazy loaded modules
@@ -319,7 +397,7 @@ class CheckOutput:
                 [line for line in s.splitlines() if not (line.startswith("Module") and "load on device" in line)]
             )
 
-            if filtered_s.strip():
+            if exc_type is None and filtered_s.strip():
                 self.test.fail(f"Unexpected output:\n'{s.rstrip()}'")
 
 
@@ -336,19 +414,151 @@ def assert_np_equal(result: np.ndarray, expect: np.ndarray, tol=0.0):
         np.testing.assert_array_equal(result, expect)
 
 
-# if check_output is True any output to stdout will be treated as an error
-def create_test_func(func, device, check_output, **kwargs):
-    # pass args to func
-    def test_func(self):
-        if check_output:
-            with CheckOutput(self):
-                func(self, device, **kwargs)
-        else:
-            func(self, device, **kwargs)
+def run_python_subprocess(
+    source: str,
+    *args: str,
+    timeout: float = 60,
+    hide_gpu: bool = False,
+    env_updates: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run Python source in a child interpreter with test-safe process settings.
 
-    # Copy the __unittest_expecting_failure__ attribute from func to test_func
-    if hasattr(func, "__unittest_expecting_failure__"):
-        test_func.__unittest_expecting_failure__ = func.__unittest_expecting_failure__
+    Use this helper when the child process's exit status or output is part of
+    the test assertion. Use ``run_test_in_subprocess()`` instead when a test
+    simply needs an isolated interpreter and is expected to pass.
+
+    Crash dump collection is suppressed before ``source`` imports Warp: POSIX
+    core dumps are disabled, while Windows Error Reporting is configured not to
+    collect expected child-process failures. Set ``hide_gpu`` for CPU-only
+    children so they do not enumerate CUDA devices or create CUDA contexts.
+
+    Args:
+        source: Python source passed to the child interpreter with ``-c``.
+        *args: Arguments exposed to ``source`` through ``sys.argv[1:]``.
+        timeout: Maximum number of seconds to wait for the child.
+        hide_gpu: Whether to hide GPUs from the child by setting
+            ``CUDA_VISIBLE_DEVICES`` to an empty string.
+        env_updates: Environment variables to add or replace in the inherited
+            child environment.
+
+    Returns:
+        The completed child process with captured text output.
+
+    Raises:
+        subprocess.TimeoutExpired: If the child exceeds ``timeout``. Any
+            partial captured output is written to the parent process first.
+    """
+    env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
+    if hide_gpu:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+
+    if sys.platform == "win32":
+        source = (
+            "import ctypes as _ctypes;"
+            "_SEM_FAILCRITICALERRORS=0x0001;"
+            "_SEM_NOGPFAULTERRORBOX=0x0002;"
+            "_ctypes.windll.kernel32.SetErrorMode(_SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX);\n"
+            f"{source}"
+        )
+    elif os.name == "posix":
+        source = f"import resource as _resource; _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0));\n{source}"
+
+    try:
+        return subprocess.run(
+            [sys.executable, "-u", "-c", source, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as error:
+        for stream_name, output in (("stdout", error.stdout), ("stderr", error.stderr)):
+            if not output:
+                continue
+            if isinstance(output, bytes):
+                output_text = output.decode(errors="replace")
+            else:
+                output_text = output
+            print(
+                f"Subprocess {stream_name} before timeout:\n{output_text}",
+                file=sys.stderr,
+                end="" if output_text.endswith("\n") else "\n",
+            )
+        raise
+
+
+def run_test_in_subprocess(
+    test: unittest.TestCase,
+    *,
+    timeout: float = 600,
+    hide_gpu: bool = False,
+    env_updates: Mapping[str, str] | None = None,
+) -> bool:
+    """Run an expected-to-pass test in an isolated child interpreter.
+
+    Call this at the start of a test and return from the test when it returns
+    ``True``. Use ``run_python_subprocess()`` instead when the child is expected
+    to fail or when its output is part of the assertion.
+
+    Args:
+        test: The current test case.
+        timeout: Maximum number of seconds to wait for the child.
+        hide_gpu: Whether to hide GPUs from the child by setting
+            ``CUDA_VISIBLE_DEVICES`` to an empty string.
+        env_updates: Environment variables to add or replace in the inherited
+            child environment.
+
+    Returns:
+        ``True`` in the parent after the child passes and ``False`` in the child
+        so the caller can execute the test body there.
+    """
+
+    test_id = test.id()
+    isolation_env = "WARP_ISOLATED_TEST_ID"
+    if os.environ.get(isolation_env) == test_id:
+        return False
+
+    child_env_updates = dict(env_updates or {})
+    child_env_updates[isolation_env] = test_id
+    result = run_python_subprocess(
+        "import unittest as _unittest; _unittest.main(module=None)",
+        test_id,
+        timeout=timeout,
+        hide_gpu=hide_gpu,
+        env_updates=child_env_updates,
+    )
+    if result.returncode != 0:
+        test.fail(
+            f"Isolated test process exited with code {result.returncode}.\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    return True
+
+
+# if check_output is True any output to stdout will be treated as an error
+def create_test_func(func, device, check_output, device_check=None, enable_cpu_blocks=False, **kwargs):
+    # pass args to func
+    @functools.wraps(func)
+    def test_func(self):
+        previous_enable_cpu_blocks = wp.config.enable_cpu_blocks
+        if enable_cpu_blocks:
+            wp.config.enable_cpu_blocks = True
+        try:
+            if device_check is not None:
+                device_check(self, device)
+
+            if check_output:
+                with CheckOutput(self):
+                    func(self, device, **kwargs)
+            else:
+                func(self, device, **kwargs)
+        finally:
+            wp.config.enable_cpu_blocks = previous_enable_cpu_blocks
 
     return test_func
 
@@ -359,7 +569,7 @@ def skip_test_func(self):
 
 
 def sanitize_identifier(s):
-    """replace all non-identifier characters with '_'"""
+    """Replace all non-identifier characters with underscores."""
 
     s = str(s)
     if s.isidentifier():
@@ -368,9 +578,9 @@ def sanitize_identifier(s):
         return re.sub(r"\W|^(?=\d)", "_", s)
 
 
-def add_function_test(cls, name, func, devices=None, check_output=True, **kwargs):
+def add_function_test(cls, name, func, devices=None, check_output=True, device_check=None, **kwargs):
     if devices is None:
-        setattr(cls, name, create_test_func(func, None, check_output, **kwargs))
+        setattr(cls, name, create_test_func(func, None, check_output, device_check=device_check, **kwargs))
     elif isinstance(devices, list):
         if not devices:
             # No devices to run this test
@@ -380,21 +590,25 @@ def add_function_test(cls, name, func, devices=None, check_output=True, **kwargs
                 setattr(
                     cls,
                     name + "_" + sanitize_identifier(device),
-                    create_test_func(func, device, check_output, **kwargs),
+                    create_test_func(func, device, check_output, device_check=device_check, **kwargs),
                 )
     else:
         setattr(
             cls,
             name + "_" + sanitize_identifier(devices),
-            create_test_func(func, devices, check_output, **kwargs),
+            create_test_func(func, devices, check_output, device_check=device_check, **kwargs),
         )
 
 
-def add_kernel_test(cls, kernel, dim, name=None, expect=None, inputs=None, devices=None):
+def add_kernel_test(cls, kernel, dim, name=None, expect=None, inputs=None, devices=None, inputs_factory=None):
+    if inputs is not None and inputs_factory is not None:
+        raise ValueError("Only one of `inputs` and `inputs_factory` may be provided.")
+
     def test_func(self, device):
         args = []
-        if inputs:
-            args.extend(inputs)
+        test_inputs = inputs_factory(device) if inputs_factory is not None else inputs
+        if test_inputs:
+            args.extend(test_inputs)
 
         if expect:
             # allocate outputs to match results
@@ -403,8 +617,11 @@ def add_kernel_test(cls, kernel, dim, name=None, expect=None, inputs=None, devic
 
             args.append(output)
 
-        # force load so that we don't generate any log output during launch
-        kernel.module.load(device)
+        # Force-load the same module variant that wp.launch() will use so that
+        # we don't generate any log output during launch. CPU launches always
+        # use a block dimension of 1, regardless of the launch default.
+        load_block_dim = 1 if wp.get_device(device).is_cpu else None
+        kernel.module.load(device, block_dim=load_block_dim)
 
         with CheckOutput(self):
             wp.launch(kernel, dim=dim, inputs=args, device=device)
@@ -445,7 +662,7 @@ def write_junit_results(
     tests_skipped: int,
     test_duration: float,
 ):
-    """Write a JUnit XML from our report data
+    """Write a JUnit XML from our report data.
 
     The report file is needed for GitLab to add test reports in merge requests.
     """
@@ -473,7 +690,7 @@ def write_junit_results(
             failure = ET.SubElement(test_case, "failure", message=str(test_data[4]))
             failure.text = str(test_data[5])  # Stacktrace
         elif test_status == "ERROR":
-            error = ET.SubElement(test_case, "error")
+            error = ET.SubElement(test_case, "error", message=str(test_data[4]))
             error.text = str(test_data[5])  # Stacktrace
         elif test_status == "SKIP":
             skip = ET.SubElement(test_case, "skipped")
@@ -502,11 +719,12 @@ class ParallelJunitTestResult(unittest.TextTestResult):
         super(unittest.TextTestResult, self).startTest(test)
 
     def stopTest(self, test):
+        # addSuccess() already reported CUDA errors from passing tests. For any other
+        # outcome, keep it and only note the error so later failures can name this test.
+        synchronize_after_test(test, test_failed=True)
         super().stopTest(test)
         # Force garbage collection of CPU-side allocations to reduce peak
         # host RSS in parallel test runs.
-        import gc  # noqa: PLC0415
-
         gc.collect()
 
     def _add_helper(self, test, dots_message, show_all_message):
@@ -521,6 +739,13 @@ class ParallelJunitTestResult(unittest.TextTestResult):
         self.test_record.append((test.__class__.__name__, test._testMethodName, duration, code, message, details))
 
     def addSuccess(self, test):
+        # Runs after tearDown() and cleanups, so a CUDA error from work the test left
+        # outstanding fails the test that caused it
+        try:
+            synchronize_after_test(test)
+        except Exception:
+            self.addError(test, sys.exc_info())
+            return
         super(unittest.TextTestResult, self).addSuccess(test)
         self._add_helper(test, ".", "ok")
         self._record_test(test, "OK")

@@ -206,9 +206,12 @@ def test_mesh_query_ray_grad(test, device):
     mesh_indices = wp.array(np.array(tri_indices), dtype=int, device=device)
 
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -380,7 +383,7 @@ def mesh_query_ray_brutal(
 
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
 def test_mesh_query_ray_count_intersections(test, device):
-    """Stress test for mesh_query_ray_count_intersections with various ray configurations"""
+    """Stress-test ``mesh_query_ray_count_intersections`` with varied rays."""
     from pxr import Usd, UsdGeom  # noqa: PLC0415
 
     # Load a complex mesh (torus is good for multiple intersections)
@@ -398,9 +401,12 @@ def test_mesh_query_ray_count_intersections(test, device):
     indices = wp.array(indices_np, dtype=int, device=device)
 
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -671,9 +677,12 @@ def raycast_kernel(
 
 def test_mesh_query_ray_edge(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -714,7 +723,7 @@ def test_mesh_query_ray_edge(test, device):
 
 
 def test_mesh_query_ray_parallel_slab_boundaries(test, device):
-    """Regression for the parallel-slab false negative in BVH ray traversal.
+    """Test the parallel-slab false negative in BVH ray traversal.
 
     When dir[i] == 0 the ray is parallel to that slab axis.  The previous
     safe_ray_rcp_dir trick replaced zero dir components with ~FLT_MIN, which
@@ -722,10 +731,11 @@ def test_mesh_query_ray_parallel_slab_boundaries(test, device):
     face (start[i] == upper[i]): the slab computed lmax = 0 and rejected any
     intersection at t > 0 through the remaining axes.
 
-    Five cases exercise intersect_ray_aabb_robust on the Warp BVH backends via
-    mesh_query_ray_count_intersections, which tests every node's AABB including
-    the root regardless of tree depth (cuBQL has its own parallel-slab handling
-    and is not tested here):
+    Five cases exercise parallel-slab handling on the Warp BVH backends via
+    mesh_query_ray_count_intersections, mesh_query_ray, and mesh_query_ray_anyhit.
+    The count-intersections query tests every node's AABB including the root
+    regardless of tree depth (cuBQL has its own parallel-slab handling and is not
+    tested here):
 
       1. start.x == upper.x  — the specific regression introduced by this branch
       2. start.x == lower.x  — near-face boundary on the opposite side
@@ -802,6 +812,34 @@ def test_mesh_query_ray_parallel_slab_boundaries(test, device):
                 1,
                 f"[{constructor}] {label}: expected at least one intersection, got {counts_np[i]}",
             )
+
+        max_t = 10.0
+        faces = wp.empty(5, dtype=int, device=device)
+        hits = wp.empty(5, dtype=int, device=device)
+        wp.launch(
+            mesh_query_ray_with_results,
+            dim=5,
+            inputs=[mesh.id, starts_wp, dirs_wp, max_t],
+            outputs=[faces, hits],
+            device=device,
+        )
+
+        hits_np = hits.numpy()
+        for i, label in enumerate(labels):
+            test.assertEqual(hits_np[i], 1, f"[{constructor}] {label}: expected closest-hit query to hit")
+
+        anyhit = wp.empty(5, dtype=int, device=device)
+        wp.launch(
+            mesh_query_ray_anyhit_kernel,
+            dim=5,
+            inputs=[mesh.id, starts_wp, dirs_wp, max_t],
+            outputs=[anyhit],
+            device=device,
+        )
+
+        anyhit_np = anyhit.numpy()
+        for i, label in enumerate(labels):
+            test.assertEqual(anyhit_np[i], 1, f"[{constructor}] {label}: expected any-hit query to hit")
 
 
 devices = get_test_devices()

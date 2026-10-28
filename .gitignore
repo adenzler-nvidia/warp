@@ -27,6 +27,7 @@ warp_lang.egg-info
 CLAUDE.local.md
 .claude/settings.local.json
 .claude/worktrees/
+/.worktrees/
 /docs/superpowers/
 
 # Development and testing
@@ -50,6 +51,9 @@ outputs/
 # Coverage and caching
 .coverage
 .cache
+
+# skillevaluator results
+/skills/**/evals/results/
 
 # Benchmarking (ASV)
 asv/env

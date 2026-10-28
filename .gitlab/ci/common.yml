@@ -105,7 +105,9 @@ default:
   move-windows-binaries-to-platform-dir:
     - mkdir -p warp/bin/windows-x86_64
     - mv warp/bin/warp.dll warp/bin/windows-x86_64/
+    - mv warp/bin/warp.lib warp/bin/windows-x86_64/
     - mv warp/bin/warp-clang.dll warp/bin/windows-x86_64/
+    - mv warp/bin/warp-clang.lib warp/bin/windows-x86_64/
   
   move-macos-binaries-to-platform-dir:
     - mkdir -p warp/bin/macos-aarch64
@@ -154,16 +156,18 @@ default:
       - warp/native/exports.h
       - warp/native/version.h
       - warp/bin/**/*.dll
+      - warp/bin/**/*.lib
       - warp/bin/**/*.so
       - warp/bin/**/*.dylib
       - VERSION.md
       - warp/config.py
     expire_in: 1 week
 
-# All MacOS jobs use this definition
+# All macOS jobs use this definition. warp-mac-01 is an M4 EC2 Mac registered
+# as a project runner on omniverse/warp; the shared Omniverse Mac pool is gone.
 .macos_warp_tags:
   tags:
-    - pkg/xcode/13 # Avoid AWS-MAC-0
+    - warp-macos-arm64
 
 # Basic rules to avoid triggering a test job unless certain files have changed to save CI resources
 .basic_test_changes_rules:
@@ -207,6 +211,6 @@ default:
     # Cache directories - must be explicitly passed to ensure consistent paths
     PM_PACKAGES_ROOT: "$PARENT_PROJECT_DIR/packman-repo"
     PIP_CACHE_DIR: "$PARENT_PROJECT_DIR/.cache/pip"
-    WARP_CACHE_ROOT: "$PARENT_PROJECT_DIR/.cache/warp" # Used by the parallel test runner
+    WARP_CACHE_PATH: "$PARENT_PROJECT_DIR/.cache/warp" # Used by the parallel test runner
   trigger:
     strategy: depend

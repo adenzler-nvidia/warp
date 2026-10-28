@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "numpy",
 # ]
@@ -28,6 +28,7 @@ import time
 import build_llvm
 import warp._src.build_dll as build_dll
 import warp.config as config
+from warp._src.build_architecture import machine_architecture
 from warp._src.generated_files import generate_exports_header_file, generate_version_header
 
 
@@ -120,6 +121,32 @@ def find_cuda_sdk() -> str | None:
     return None
 
 
+def resolve_libmathdx_path(libmathdx_path: str) -> str:
+    """Return the directory that holds libmathdx's ``include`` and ``lib`` subdirectories.
+
+    libmathdx 0.4.0 and newer ship archives that wrap the payload in a single top-level
+    directory (e.g. ``libmathdx-linux-x86_64``), one level above the layout Warp compiles
+    and links against. Descend into that wrapper when the given path does not already
+    hold the expected layout.
+
+    Args:
+        libmathdx_path: Path to a libmathdx installation.
+
+    Returns:
+        The resolved path, or ``libmathdx_path`` unchanged when no nested directory
+        matches, leaving :func:`validate_libmathdx_path` to report the problem.
+    """
+    if os.path.isdir(os.path.join(libmathdx_path, "include")):
+        return libmathdx_path
+
+    for nested in sorted(glob.glob(os.path.join(libmathdx_path, "libmathdx-*"))):
+        if os.path.isdir(os.path.join(nested, "include")):
+            print(f"Using nested libmathdx directory '{nested}'")
+            return nested
+
+    return libmathdx_path
+
+
 def validate_libmathdx_path(libmathdx_path: str) -> bool:
     """Validate that libmathdx path exists and has required directory structure.
 
@@ -168,15 +195,17 @@ def find_libmathdx(cuda_toolkit_major_version: int, base_path: str) -> str | Non
         "pull",
         "--verbose",
         "--platform",
-        f"{platform.system()}-{build_dll.machine_architecture()}".lower(),
+        f"{platform.system()}-{machine_architecture()}".lower(),
         "--include-tag",
         f"cu{cuda_toolkit_major_version}",
         os.path.join(base_path, "deps", "libmathdx-deps.packman.xml"),
     ]
 
     # Reuse the current interpreter so packman skips downloading its bundled Python,
-    # whose manylinux_2_35 build can't run on older-glibc CI images.
-    packman_env = {**os.environ, "PM_PYTHON_EXT": sys.executable}
+    # whose manylinux_2_35 build can't run on older-glibc CI images. Use it only as a
+    # default: a pre-set PM_PYTHON_EXT wins, since cross-compilation (e.g. aarch64) needs
+    # the build-platform Python instead of sys.executable's crossenv wrapper.
+    packman_env = {"PM_PYTHON_EXT": sys.executable, **os.environ}
 
     retry_delays = [10, 30, 60]
     max_attempts = 1 + len(retry_delays)
@@ -403,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Warn if building on Intel Mac (cross-compiling for ARM64)
-    if platform.system() == "Darwin" and platform.machine() == "x86_64":
+    if platform.system() == "Darwin" and machine_architecture() == "x86_64":
         print("=" * 80)
         print("WARNING: Building Warp on Intel-based macOS")
         print("=" * 80)
@@ -453,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Validate libmathdx path (from any source: CLI, environment, or Packman)
     if args.libmathdx_path:
+        args.libmathdx_path = resolve_libmathdx_path(args.libmathdx_path)
         if not validate_libmathdx_path(args.libmathdx_path):
             return 1
 
@@ -488,19 +518,34 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             print(f"Building Warp version {build_version}")
 
-        # Generate warp/native/export.h
-        generate_exports_header_file(base_path)
+        # Generate warp/native/exports.h
+        exports_path = os.path.join(base_path, "warp", "native", "exports.h")
+        exports_changed = generate_exports_header_file(base_path)
+        if args.verbose:
+            if exports_changed:
+                print(f"Generated {exports_path}")
+            else:
+                print(f"{exports_path} is up to date")
 
         # Generate warp/native/version.h
-        generate_version_header(base_path, build_version)
+        version_header_path = os.path.join(base_path, "warp", "native", "version.h")
+        version_header_changed = generate_version_header(base_path, build_version)
+        if args.verbose:
+            if version_header_changed:
+                print(f"Generated {version_header_path} with version {build_version}")
+            else:
+                print(f"{version_header_path} is up to date (version {build_version})")
 
         # build warp.dll
         cpp_sources = [
             "native/warp.cpp",
             "native/bvh.cpp",
+            "native/bvh_cubql.cpp",
             "native/scan.cpp",
             "native/apic.cpp",
             "native/alloc_tracker.cpp",
+            "native/cpu_block_runtime.cpp",
+            "native/cpu_fiber.cpp",
             "native/crt.cpp",
             "native/error.cpp",
             "native/cuda_util.cpp",
@@ -511,10 +556,11 @@ def main(argv: list[str] | None = None) -> int:
             "native/sort.cpp",
             "native/sparse.cpp",
             "native/volume.cpp",
+            "native/volume_builder.cpp",
             "native/texture.cpp",
             "native/mathdx.cpp",
             "native/coloring.cpp",
-            "native/fastcall.cpp",
+            "native/deterministic.cpp",
         ]
         warp_cpp_paths = [os.path.join(build_path, cpp) for cpp in cpp_sources]
 
@@ -525,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             cuda_sources = [
                 "native/bvh.cu",
+                "native/deterministic.cu",
+                "native/bvh_cubql.cu",
                 "native/mesh.cu",
                 "native/sort.cu",
                 "native/hashgrid.cu",
@@ -595,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         is_gitlab_ci_windows = os.getenv("GITLAB_CI") is not None and platform.system() == "Windows"
-        is_intel_mac = platform.system() == "Darwin" and platform.machine() == "x86_64"
+        is_intel_mac = platform.system() == "Darwin" and machine_architecture() == "x86_64"
 
         if is_gitlab_ci_windows or is_intel_mac:
             if is_gitlab_ci_windows:
@@ -612,7 +660,7 @@ def main(argv: list[str] | None = None) -> int:
                 compiler = "clang++" if args.clang_build_toolchain else args.host_compiler
                 # GCC ships libasan.so; Clang ships libclang_rt.asan-<arch>.so.
                 runtime_name = (
-                    f"libclang_rt.asan-{platform.machine()}.so"
+                    f"libclang_rt.asan-{machine_architecture()}.so"
                     if "clang" in os.path.basename(compiler)
                     else "libasan.so"
                 )

@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# ruff: noqa: PLC0415
-
 import unittest
+from functools import cache
 
 import warp as wp
 from warp.tests.unittest_utils import *
@@ -74,8 +73,14 @@ def copy2d_mat22_kernel(dst: wp.array2d[wp.mat22], src: wp.array2d[wp.mat22]):
     dst[i, j] = src[i, j]
 
 
+def _import_paddle():
+    import paddle  # noqa: PLC0415
+
+    return paddle
+
+
 def test_dtype_from_paddle(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     def test_conversions(paddle_type, warp_type):
         test.assertEqual(wp.dtype_from_paddle(paddle_type), warp_type)
@@ -92,7 +97,7 @@ def test_dtype_from_paddle(test, device):
 
 
 def test_dtype_to_paddle(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     def test_conversions(warp_type, paddle_type):
         test.assertEqual(wp.dtype_to_paddle(warp_type), paddle_type)
@@ -118,11 +123,15 @@ def test_device_conversion(test, device):
 
 
 def test_paddle_zerocopy(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     a = wp.zeros(10, dtype=wp.float32, device=device)
     t = wp.to_paddle(a)
     assert a.ptr == t.data_ptr()
+
+    a = wp.zeros(10, dtype=wp.float32, device=device, requires_grad=True)
+    t = wp.to_paddle(a)
+    test.assertEqual(a.grad.ptr, t.grad.data_ptr())
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -132,7 +141,7 @@ def test_paddle_zerocopy(test, device):
 
 
 def test_from_paddle(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -226,7 +235,7 @@ def test_from_paddle(test, device):
 
 
 def test_array_ctype_from_paddle(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -381,7 +390,7 @@ def test_array_ctype_from_paddle(test, device):
 
 
 def test_to_paddle(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     def wrap_scalar_array(warp_dtype, expected_paddle_dtype):
         a = wp.zeros(10, dtype=warp_dtype, device=device)
@@ -429,7 +438,7 @@ def test_to_paddle(test, device):
 
 
 def test_from_paddle_slices(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -504,7 +513,7 @@ def test_from_paddle_slices(test, device):
 
 
 def test_from_paddle_zero_strides(test, device):
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -542,8 +551,8 @@ def test_from_paddle_zero_strides(test, device):
 
 
 def test_paddle_retain_grad_from_paddle(test, device):
-    """Test that retain_grad can be set when converting from Paddle via from_paddle"""
-    import paddle
+    """Test that ``retain_grad`` can be set after conversion from Paddle."""
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
     t = paddle.zeros([10], dtype="float32").to(device=paddle_device)
@@ -557,9 +566,9 @@ def test_paddle_retain_grad_from_paddle(test, device):
 
 
 def test_paddle_autograd(test, device):
-    """Test paddle autograd with a custom Warp op"""
+    """Test Paddle autograd with a custom Warp operation."""
 
-    import paddle
+    paddle = _import_paddle()
 
     # custom autograd op
     class TestFunc(paddle.autograd.PyLayer):
@@ -630,9 +639,9 @@ def test_paddle_autograd(test, device):
 
 
 def test_warp_graph_warp_stream(test, device):
-    """Capture Warp graph on Warp stream"""
+    """Capture a Warp graph on a Warp stream."""
 
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -664,11 +673,11 @@ def test_warp_graph_warp_stream(test, device):
 
 
 def test_warp_graph_paddle_stream(test, device):
-    """Capture Warp graph on Paddle stream"""
+    """Capture a Warp graph on a Paddle stream."""
 
     wp.load_module(device=device)
 
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
 
@@ -704,9 +713,9 @@ def test_warp_graph_paddle_stream(test, device):
 
 
 def test_direct(test, device):
-    """Pass Paddle tensors to Warp kernels directly"""
+    """Pass Paddle tensors directly to Warp kernels."""
 
-    import paddle
+    paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
     n = 12
@@ -730,81 +739,125 @@ class TestPaddle(unittest.TestCase):
     pass
 
 
-test_devices = get_test_devices()
-
 try:
     import paddle
+except Exception as error:
+    print(f"Skipping Paddle tests due to exception: {error}")
+else:
+    paddle_candidate_devices = get_test_devices()
+    paddle_cuda_candidate_devices = [device for device in paddle_candidate_devices if device.is_cuda]
 
-    # check which Warp devices work with Paddle
-    # CUDA devices may fail if Paddle was not compiled with CUDA support
-    paddle_compatible_devices = []
-    paddle_compatible_cuda_devices = []
-
-    for d in test_devices:
+    @cache
+    def _paddle_device_error(device_alias):
+        device = wp.get_device(device_alias)
         try:
-            t = paddle.arange(10).to(device=wp.device_to_paddle(d))
-            t += 1
-            paddle_compatible_devices.append(d)
-            if d.is_cuda:
-                paddle_compatible_cuda_devices.append(d)
-        except Exception as e:
-            print(f"Skipping Paddle tests on device '{d}' due to exception: {e}")
+            tensor = paddle.arange(10).to(device=wp.device_to_paddle(device))
+            tensor += 1
+        except Exception as error:
+            return f"{type(error).__name__}: {error}"
+        return None
+
+    def _check_paddle_device(test, device):
+        device = wp.get_device(device)
+        error = _paddle_device_error(device.alias)
+        if error is not None:
+            test.skipTest(f"Paddle is unavailable on Warp device '{device}': {error}")
 
     add_function_test(TestPaddle, "test_dtype_from_paddle", test_dtype_from_paddle, devices=None)
     add_function_test(TestPaddle, "test_dtype_to_paddle", test_dtype_to_paddle, devices=None)
 
-    if paddle_compatible_devices:
+    if paddle_candidate_devices:
         add_function_test(
-            TestPaddle, "test_device_conversion", test_device_conversion, devices=paddle_compatible_devices
+            TestPaddle,
+            "test_device_conversion",
+            test_device_conversion,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
         )
-        add_function_test(TestPaddle, "test_from_paddle", test_from_paddle, devices=paddle_compatible_devices)
         add_function_test(
-            TestPaddle, "test_from_paddle_slices", test_from_paddle_slices, devices=paddle_compatible_devices
+            TestPaddle,
+            "test_from_paddle",
+            test_from_paddle,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
         )
         add_function_test(
-            TestPaddle, "test_array_ctype_from_paddle", test_array_ctype_from_paddle, devices=paddle_compatible_devices
+            TestPaddle,
+            "test_from_paddle_slices",
+            test_from_paddle_slices,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
+        )
+        add_function_test(
+            TestPaddle,
+            "test_array_ctype_from_paddle",
+            test_array_ctype_from_paddle,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
         )
         add_function_test(
             TestPaddle,
             "test_from_paddle_zero_strides",
             test_from_paddle_zero_strides,
-            devices=paddle_compatible_devices,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
         )
-        add_function_test(TestPaddle, "test_to_paddle", test_to_paddle, devices=paddle_compatible_devices)
-        add_function_test(TestPaddle, "test_paddle_zerocopy", test_paddle_zerocopy, devices=paddle_compatible_devices)
-        add_function_test(TestPaddle, "test_paddle_autograd", test_paddle_autograd, devices=paddle_compatible_devices)
+        add_function_test(
+            TestPaddle,
+            "test_to_paddle",
+            test_to_paddle,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
+        )
+        add_function_test(
+            TestPaddle,
+            "test_paddle_zerocopy",
+            test_paddle_zerocopy,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
+        )
+        add_function_test(
+            TestPaddle,
+            "test_paddle_autograd",
+            test_paddle_autograd,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
+        )
         add_function_test(
             TestPaddle,
             "test_paddle_retain_grad_from_paddle",
             test_paddle_retain_grad_from_paddle,
-            devices=paddle_compatible_devices,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
         )
-        add_function_test(TestPaddle, "test_direct", test_direct, devices=paddle_compatible_devices)
+        add_function_test(
+            TestPaddle,
+            "test_direct",
+            test_direct,
+            devices=paddle_candidate_devices,
+            device_check=_check_paddle_device,
+        )
 
     # NOTE: Graph not supported now
-    # if paddle_compatible_cuda_devices:
+    # if paddle_cuda_candidate_devices:
     #     add_function_test(
     #         TestPaddle,
     #         "test_warp_graph_warp_stream",
     #         test_warp_graph_warp_stream,
-    #         devices=paddle_compatible_cuda_devices,
+    #         devices=paddle_cuda_candidate_devices,
     #     )
     #     add_function_test(
     #         TestPaddle,
     #         "test_warp_graph_paddle_stream",
     #         test_warp_graph_paddle_stream,
-    #         devices=paddle_compatible_cuda_devices,
+    #         devices=paddle_cuda_candidate_devices,
     #     )
 
     # multi-GPU not supported yet.
-    # if len(paddle_compatible_cuda_devices) > 1:
+    # if len(paddle_cuda_candidate_devices) > 1:
     #     add_function_test(TestPaddle, "test_paddle_mgpu_from_paddle", test_paddle_mgpu_from_paddle)
     #     add_function_test(TestPaddle, "test_paddle_mgpu_to_paddle", test_paddle_mgpu_to_paddle)
     #     add_function_test(TestPaddle, "test_paddle_mgpu_interop", test_paddle_mgpu_interop)
-
-except Exception as e:
-    print(f"Skipping Paddle tests due to exception: {e}")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// clang-format off
 /*
  * APIC Wave Simulation Example (CPU)
  *
  * This program demonstrates how to:
- * 1. Load a pre-captured graph (.wrp file) using Warp's APIC API
+ * 1. Load a saved APIC graph representation (.wrp file)
  * 2. Execute the graph on the CPU with dynamic input parameters
  * 3. Visualize the results using GLFW/OpenGL
  *
@@ -20,24 +21,25 @@
  * See README.md for build instructions.
  */
 
-// clang-format off
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
 
 #include "apic.h"  // APIC graph loading and execution
+#include "cpu_block_runtime.h"
 #include "warp.h"  // Warp C API
+#include "warp_clang.h"  // CPU module loading
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dirent.h>
-#include <dlfcn.h>
 #endif
 // clang-format on
 
@@ -243,39 +245,6 @@ void update_vertices(float* vertices, const float* heights, int width, int heigh
 // CPU module loading via warp-clang
 // ---------------------------------------------------------------------------
 
-// Function pointers loaded from warp-clang shared library
-typedef int (*wp_load_obj_fn)(const char* object_file, const char* module_name, bool use_legacy_linker);
-typedef uint64_t (*wp_lookup_fn)(const char* dll_name, const char* function_name);
-
-static wp_load_obj_fn g_wp_load_obj = nullptr;
-static wp_lookup_fn g_wp_lookup = nullptr;
-
-bool load_warp_clang()
-{
-#ifdef _WIN32
-    HMODULE lib = LoadLibraryA("warp-clang.dll");
-    if (!lib) {
-        fprintf(stderr, "Failed to load warp-clang.dll\n");
-        return false;
-    }
-    g_wp_load_obj = (wp_load_obj_fn)GetProcAddress(lib, "wp_load_obj");
-    g_wp_lookup = (wp_lookup_fn)GetProcAddress(lib, "wp_lookup");
-#else
-    const char* lib_name = "warp-clang.so";
-#ifdef __APPLE__
-    lib_name = "libwarp-clang.dylib";
-#endif
-    void* lib = dlopen(lib_name, RTLD_NOW);
-    if (!lib) {
-        fprintf(stderr, "Failed to load %s: %s\n", lib_name, dlerror());
-        return false;
-    }
-    g_wp_load_obj = (wp_load_obj_fn)dlsym(lib, "wp_load_obj");
-    g_wp_lookup = (wp_lookup_fn)dlsym(lib, "wp_lookup");
-#endif
-    return g_wp_load_obj && g_wp_lookup;
-}
-
 bool load_cpu_modules(APICGraph* graph, const char* modules_dir)
 {
     // Load all .o files from the modules directory and resolve kernel functions
@@ -284,7 +253,7 @@ bool load_cpu_modules(APICGraph* graph, const char* modules_dir)
         return true;
 
     // Scan directory for .o files and load each one
-    std::vector<std::string> handles;
+    std::unordered_map<std::string, std::string> handles_by_filename;
 
 #ifdef _WIN32
     std::string pattern = std::string(modules_dir) + "\\*.o";
@@ -300,12 +269,12 @@ bool load_cpu_modules(APICGraph* graph, const char* modules_dir)
         std::string stem = filename.substr(0, filename.size() - 2);  // Remove .o
         std::string handle = "wp_apic_" + stem;
 
-        if (g_wp_load_obj(path.c_str(), handle.c_str(), false) != 0) {
+        if (wp_load_obj(path.c_str(), handle.c_str(), false) != 0) {
             fprintf(stderr, "Failed to load CPU module: %s\n", path.c_str());
             FindClose(hFind);
             return false;
         }
-        handles.push_back(handle);
+        handles_by_filename[filename] = handle;
         printf("  Loaded: %s\n", filename.c_str());
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
@@ -324,12 +293,12 @@ bool load_cpu_modules(APICGraph* graph, const char* modules_dir)
         std::string stem = filename.substr(0, filename.size() - 2);
         std::string handle = "wp_apic_" + stem;
 
-        if (g_wp_load_obj(path.c_str(), handle.c_str(), false) != 0) {
+        if (wp_load_obj(path.c_str(), handle.c_str(), false) != 0) {
             fprintf(stderr, "Failed to load CPU module: %s\n", path.c_str());
             closedir(dir);
             return false;
         }
-        handles.push_back(handle);
+        handles_by_filename[filename] = handle;
         printf("  Loaded: %s\n", filename.c_str());
     }
     closedir(dir);
@@ -340,25 +309,38 @@ bool load_cpu_modules(APICGraph* graph, const char* modules_dir)
         const char* key = wp_apic_get_kernel_key(graph, i);
         if (!key)
             continue;
-        const char* fwd_name = wp_apic_get_kernel_forward_name(graph, key);
-        const char* bwd_name = wp_apic_get_kernel_backward_name(graph, key);
+        const char* module_hash = wp_apic_get_kernel_module_hash(graph, i);
+        const char* module_binary_filename = wp_apic_get_kernel_module_binary_filename(graph, i);
+        const char* fwd_name = wp_apic_get_kernel_forward_name(graph, i);
+        const char* bwd_name = wp_apic_get_kernel_backward_name(graph, i);
         if (!fwd_name)
             continue;
 
+        std::vector<std::string> candidate_handles;
+        if (module_binary_filename) {
+            auto it = handles_by_filename.find(module_binary_filename);
+            if (it != handles_by_filename.end())
+                candidate_handles.push_back(it->second);
+        }
+        if (candidate_handles.empty()) {
+            for (const auto& kv : handles_by_filename)
+                candidate_handles.push_back(kv.second);
+        }
+
         void* fwd_fn = nullptr;
         void* bwd_fn = nullptr;
-        for (const auto& h : handles) {
-            uint64_t fn = g_wp_lookup(h.c_str(), fwd_name);
+        for (const auto& h : candidate_handles) {
+            uint64_t fn = wp_lookup(h.c_str(), fwd_name);
             if (fn) {
                 fwd_fn = reinterpret_cast<void*>(fn);
                 if (bwd_name)
-                    bwd_fn = reinterpret_cast<void*>(g_wp_lookup(h.c_str(), bwd_name));
+                    bwd_fn = reinterpret_cast<void*>(wp_lookup(h.c_str(), bwd_name));
                 break;
             }
         }
 
         if (fwd_fn)
-            wp_apic_register_loaded_cpu_kernel(graph, key, fwd_fn, bwd_fn);
+            wp_apic_register_loaded_cpu_kernel(graph, key, module_hash, fwd_fn, bwd_fn);
         else
             fprintf(stderr, "Warning: kernel '%s' not found in loaded modules\n", key);
     }
@@ -383,12 +365,22 @@ int main(int argc, char** argv)
 
     // Initialize Warp runtime
     printf("Initializing Warp runtime...\n");
-    wp_init(nullptr);
+    if (wp_init(WP_VERSION_STRING) != 0) {
+        fprintf(stderr, "Failed to initialize Warp: %s\n", wp_get_error_string());
+        return 1;
+    }
 
-    // Load warp-clang for CPU JIT
-    printf("Loading warp-clang...\n");
-    if (!load_warp_clang()) {
-        fprintf(stderr, "warp-clang is required for CPU graph execution\n");
+    const char* warp_clang_version = wp_warp_clang_version();
+    if (warp_clang_version == nullptr || strcmp(warp_clang_version, WP_VERSION_STRING) != 0) {
+        fprintf(
+            stderr, "warp-clang version mismatch: expected %s, got %s\n", WP_VERSION_STRING,
+            warp_clang_version == nullptr ? "<null>" : warp_clang_version
+        );
+        return 1;
+    }
+
+    if (!wp_llvm_set_cpu_block_runtime(wp_cpu_block_runtime_get_api())) {
+        fprintf(stderr, "Failed to bind the Warp CPU block runtime\n");
         return 1;
     }
 

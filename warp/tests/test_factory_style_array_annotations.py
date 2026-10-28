@@ -25,6 +25,16 @@ class FactoryStyleArrayStruct:
     values: wp.array(dtype=float)
 
 
+@wp.struct
+class FactoryStyleIndexedArrayStruct:
+    values: wp.indexedarray(dtype=float)
+
+
+@wp.struct
+class FactoryStyleElementStruct:
+    value: wp.float32
+
+
 @wp.func
 def factory_style_read_func(values: wp.array(dtype=Any), index: int):
     return values[index]
@@ -92,6 +102,10 @@ def factory_style_indexedarray_kernel(values: wp.indexedarray(dtype=float), out:
 
 wp.overload(factory_style_generic_scale_kernel, [wp.array(dtype=wp.float32), wp.float32])
 wp.overload(factory_style_generic_scale_kernel, [wp.array(dtype=wp.int32), wp.int32])
+wp.overload(
+    factory_style_generic_scale_kernel,
+    {"values": wp.array(dtype=wp.float64), "scale": wp.float64},
+)
 wp.overload(factory_style_vec3_component_sum_kernel, [wp.array(dtype=wp.vec3h), wp.array(dtype=wp.float16)])
 wp.overload(factory_style_vec3_component_sum_kernel, [wp.array(dtype=wp.vec3f), wp.array(dtype=wp.float32)])
 wp.overload(factory_style_vec3_component_sum_kernel, [wp.array(dtype=wp.vec3d), wp.array(dtype=wp.float64)])
@@ -141,12 +155,15 @@ def test_factory_style_matrix_array2d_annotations(test, device):
 
 def test_factory_style_generic_overload_annotations(test, device):
     float_values = wp.array([1.0, 2.0, 3.0], dtype=wp.float32, device=device)
+    double_values = wp.array([1.0, 2.0, 3.0], dtype=wp.float64, device=device)
     int_values = wp.array([1, 2, 3], dtype=wp.int32, device=device)
 
     wp.launch(factory_style_generic_scale_kernel, dim=3, inputs=[float_values, wp.float32(2.0)], device=device)
+    wp.launch(factory_style_generic_scale_kernel, dim=3, inputs=[double_values, wp.float64(4.0)], device=device)
     wp.launch(factory_style_generic_scale_kernel, dim=3, inputs=[int_values, wp.int32(3)], device=device)
 
     np.testing.assert_allclose(float_values.numpy(), [2.0, 4.0, 6.0])
+    np.testing.assert_allclose(double_values.numpy(), [4.0, 8.0, 12.0])
     np.testing.assert_array_equal(int_values.numpy(), [3, 6, 9])
 
 
@@ -225,6 +242,23 @@ def test_factory_style_string_annotation_scope(test, device):
     test.assertAlmostEqual(float(out.numpy()[0]), 4.56, places=5)
 
 
+def test_factory_style_func_return_annotation_error(test, device):
+    @wp.func
+    def factory_style_func() -> wp.array(ndim=2, dtype=int):
+        return wp.zeros(shape=(2, 3), dtype=int)
+
+    @wp.kernel(module="unique")
+    def kernel():
+        factory_style_func()
+
+    with test.assertRaisesRegex(
+        wp.WarpCodegenError,
+        r"The function `factory_style_func` returns a fixed-size array whereas it has its return type annotated as "
+        r"`Array\[int32\]`\.$",
+    ):
+        wp.launch(kernel, 1, device=device)
+
+
 class TestFactoryStyleArrayAnnotations(unittest.TestCase):
     """Tests for backward-compatible factory-style array annotations."""
 
@@ -232,6 +266,22 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
         arr = wp.array(dtype=wp.float64, ndim=2)
         self.assertEqual(arr.dtype, wp.float64)
         self.assertEqual(arr.ndim, 2)
+
+        factory_style_1d = wp.array(dtype=int, ndim=1)
+        subscript_style_1d = wp.array[int]
+        self.assertEqual(factory_style_1d.dtype, subscript_style_1d.dtype)
+        self.assertEqual(factory_style_1d.ndim, subscript_style_1d.ndim)
+        self.assertEqual(array_type_id(factory_style_1d), ARRAY_TYPE_REGULAR)
+        self.assertEqual(array_type_id(subscript_style_1d), ARRAY_TYPE_REGULAR)
+        self.assertEqual(get_type_code(factory_style_1d), get_type_code(subscript_style_1d))
+
+        factory_style_bool = wp.array(dtype=wp.bool)
+        subscript_style_bool = wp.array[wp.bool]
+        self.assertEqual(factory_style_bool.dtype, subscript_style_bool.dtype)
+        self.assertEqual(factory_style_bool.ndim, subscript_style_bool.ndim)
+        self.assertEqual(array_type_id(factory_style_bool), ARRAY_TYPE_REGULAR)
+        self.assertEqual(array_type_id(subscript_style_bool), ARRAY_TYPE_REGULAR)
+        self.assertEqual(get_type_code(factory_style_bool), get_type_code(subscript_style_bool))
 
         self.assertEqual(wp.array1d(dtype=float).ndim, 1)
         self.assertEqual(wp.array2d(dtype=float).ndim, 2)
@@ -247,6 +297,7 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
         self.assertIs(generic_4d.dtype, Any)
         self.assertEqual(generic_4d.ndim, 4)
         self.assertEqual(array_type_id(generic_4d), ARRAY_TYPE_REGULAR)
+        self.assertEqual(array_type_id(wp.array4d[Any]), ARRAY_TYPE_REGULAR)
         self.assertEqual(get_type_code(generic_4d), get_type_code(wp.array4d[Any]))
 
         default_generic = wp.array()
@@ -265,6 +316,7 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
                 self.assertEqual(factory_style.dtype, subscript_style.dtype)
                 self.assertEqual(factory_style.ndim, subscript_style.ndim)
                 self.assertEqual(array_type_id(factory_style), ARRAY_TYPE_REGULAR)
+                self.assertEqual(array_type_id(subscript_style), ARRAY_TYPE_REGULAR)
                 self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
 
     def test_factory_style_geometry_array_metadata(self):
@@ -283,15 +335,18 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
                 self.assertEqual(factory_style.dtype, subscript_style.dtype)
                 self.assertEqual(factory_style.ndim, subscript_style.ndim)
                 self.assertEqual(array_type_id(factory_style), ARRAY_TYPE_REGULAR)
+                self.assertEqual(array_type_id(subscript_style), ARRAY_TYPE_REGULAR)
                 self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
 
-    def test_factory_style_vector_quaternion_transform_array_metadata(self):
+    def test_factory_style_vector_matrix_quaternion_transform_array_metadata(self):
         custom_vec = wp.types.vector(length=5, dtype=wp.float64)
+        custom_mat = wp.types.matrix(shape=(5, 5), dtype=wp.float64)
         custom_quat = wp.types.quaternion(dtype=wp.float64)
         custom_transform = wp.types.transformation(dtype=wp.float64)
 
         annotations = (
             (wp.array(dtype=custom_vec), wp.array[custom_vec]),
+            (wp.array(dtype=custom_mat), wp.array[custom_mat]),
             (wp.array(dtype=wp.quat), wp.array[wp.quat]),
             (wp.array(dtype=custom_quat), wp.array[custom_quat]),
             (wp.array(dtype=wp.transform), wp.array[wp.transform]),
@@ -303,17 +358,41 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
                 self.assertEqual(factory_style.dtype, subscript_style.dtype)
                 self.assertEqual(factory_style.ndim, subscript_style.ndim)
                 self.assertEqual(array_type_id(factory_style), ARRAY_TYPE_REGULAR)
+                self.assertEqual(array_type_id(subscript_style), ARRAY_TYPE_REGULAR)
                 self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
 
     def test_factory_style_noncontiguous_array_metadata(self):
         annotations = (
+            (wp.indexedarray1d(dtype=wp.float64), wp.indexedarray[wp.float64], ARRAY_TYPE_INDEXED),
+            (
+                wp.indexedarray(dtype=wp.float64, ndim=1),
+                wp.indexedarray[wp.float64],
+                ARRAY_TYPE_INDEXED,
+            ),
+            (
+                wp.indexedarray2d(dtype=wp.float64),
+                wp.indexedarray[wp.float64, Literal[2]],
+                ARRAY_TYPE_INDEXED,
+            ),
             (wp.indexedarray(dtype=wp.float64, ndim=3), wp.indexedarray[wp.float64, Literal[3]], ARRAY_TYPE_INDEXED),
-            (wp.fabricarray(dtype=wp.float32, ndim=2), wp.fabricarray[wp.float32, 2], ARRAY_TYPE_FABRIC),
+            (
+                wp.indexedarray3d(dtype=wp.float64),
+                wp.indexedarray[wp.float64, Literal[3]],
+                ARRAY_TYPE_INDEXED,
+            ),
+            (
+                wp.indexedarray4d(dtype=wp.float64),
+                wp.indexedarray[wp.float64, Literal[4]],
+                ARRAY_TYPE_INDEXED,
+            ),
+            (wp.fabricarray(dtype=wp.float32, ndim=2), wp.fabricarray[wp.float32, Literal[2]], ARRAY_TYPE_FABRIC),
+            (wp.fabricarray(dtype=Any), wp.fabricarray[Any], ARRAY_TYPE_FABRIC),
             (
                 wp.indexedfabricarray(dtype=wp.float64, ndim=2),
-                wp.indexedfabricarray[wp.float64, 2],
+                wp.indexedfabricarray[wp.float64, Literal[2]],
                 ARRAY_TYPE_FABRIC_INDEXED,
             ),
+            (wp.indexedfabricarray(dtype=Any), wp.indexedfabricarray[Any], ARRAY_TYPE_FABRIC_INDEXED),
         )
 
         for factory_style, subscript_style, expected_array_type in annotations:
@@ -321,7 +400,28 @@ class TestFactoryStyleArrayAnnotations(unittest.TestCase):
                 self.assertEqual(factory_style.dtype, subscript_style.dtype)
                 self.assertEqual(factory_style.ndim, subscript_style.ndim)
                 self.assertEqual(array_type_id(factory_style), expected_array_type)
+                self.assertEqual(array_type_id(subscript_style), expected_array_type)
                 self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
+
+    def test_factory_style_indexedarray_struct_metadata(self):
+        factory_style = FactoryStyleIndexedArrayStruct.vars["values"].type
+        subscript_style = wp.indexedarray[float]
+
+        self.assertEqual(factory_style.dtype, subscript_style.dtype)
+        self.assertEqual(factory_style.ndim, subscript_style.ndim)
+        self.assertEqual(array_type_id(factory_style), ARRAY_TYPE_INDEXED)
+        self.assertEqual(array_type_id(subscript_style), ARRAY_TYPE_INDEXED)
+        self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
+
+    def test_factory_style_struct_element_metadata(self):
+        factory_style = wp.array(dtype=FactoryStyleElementStruct)
+        subscript_style = wp.array[FactoryStyleElementStruct]
+
+        self.assertEqual(factory_style.dtype, subscript_style.dtype)
+        self.assertEqual(factory_style.ndim, subscript_style.ndim)
+        self.assertEqual(array_type_id(factory_style), ARRAY_TYPE_REGULAR)
+        self.assertEqual(array_type_id(subscript_style), ARRAY_TYPE_REGULAR)
+        self.assertEqual(get_type_code(factory_style), get_type_code(subscript_style))
 
 
 devices = get_test_devices()
@@ -384,6 +484,12 @@ add_function_test(
     TestFactoryStyleArrayAnnotations,
     "test_factory_style_string_annotation_scope",
     test_factory_style_string_annotation_scope,
+    devices=devices,
+)
+add_function_test(
+    TestFactoryStyleArrayAnnotations,
+    "test_factory_style_func_return_annotation_error",
+    test_factory_style_func_return_annotation_error,
     devices=devices,
 )
 

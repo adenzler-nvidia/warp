@@ -22,8 +22,6 @@ from warp.types import is_array, type_is_int
 
 from .quadrature import Quadrature
 
-_wp_module_name_ = "warp.fem.quadrature.pic_quadrature"
-
 
 class PicQuadrature(Quadrature):
     """Particle-based quadrature formula, using a global set of points unevenly spread out over geometry elements.
@@ -113,7 +111,7 @@ class PicQuadrature(Quadrature):
     def name(self):
         """Unique name of the quadrature rule."""
         index_scope = "domain" if self._use_domain_element_indices else "geometry"
-        return f"{self.__class__.__name__}_{index_scope}"
+        return f"{self.__class__.__name__}_{self.domain.name}_{index_scope}"
 
     @Quadrature.domain.setter
     def domain(self, domain: GeometryDomain):
@@ -345,9 +343,7 @@ class PicQuadrature(Quadrature):
         has_env_indices = env_indices is not None
         env_index_dtype = env_indices.dtype if has_env_indices else int
 
-        @dynamic_kernel(
-            suffix=f"{self.domain.name}{self._use_domain_element_indices}{has_env_indices}{env_index_dtype.__name__}"
-        )
+        @dynamic_kernel(suffix=f"{self.name}_{has_env_indices}_{env_index_dtype.__name__}")
         def bin_particles(
             cell_arg_value: self.domain.ElementArg,
             domain_index_arg_value: self.domain.ElementIndexArg,
@@ -414,7 +410,7 @@ class PicQuadrature(Quadrature):
         scalar = self._scalar_type
         CoordsType = self._coords_type
 
-        @dynamic_kernel(suffix=f"{self.domain.name}{self._use_domain_element_indices}")
+        @dynamic_kernel(suffix=self.name)
         def finalize_cell_particle_data(
             cell_arg_value: self.domain.ElementArg,
             domain_index_arg_value: self.domain.ElementIndexArg,

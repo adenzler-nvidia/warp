@@ -6,6 +6,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import threading
@@ -13,11 +14,9 @@ import time
 from pathlib import Path
 
 import warp.config
-from warp._src.logger import LOG_DEBUG
+from warp._src.logger import LOG_DEBUG, log_warning
 from warp._src.thirdparty import appdirs
 from warp._src.types import *
-
-_wp_module_name_ = "warp.build"
 
 # From nvJitLink.h
 nvJitLink_input_type = {"cubin": 1, "ptx": 2, "ltoir": 3, "fatbin": 4, "object": 5, "library": 6}
@@ -28,6 +27,37 @@ warp_home = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 # 64-bit key space, moving the birthday-bound 50% collision point to about
 # 5.1 billion unique symbols while keeping filenames compact.
 LTO_CACHE_KEY_LENGTH = 16
+
+# Remember the cache directory produced by the most recent initialization so
+# Warp can feed it back into this function without treating arbitrary
+# version-named base directories as already resolved.
+_resolved_kernel_cache_dir: str | None = None
+
+
+def _get_extra_include_dirs(extra_include_dirs) -> list[str]:
+    include_dirs: list[str] = []
+    invalid_dirs: list[str] = []
+
+    for entry in extra_include_dirs:
+        path = os.fspath(entry)
+        if not os.path.isabs(path):
+            invalid_dirs.append(f"{path!r} (not absolute)")
+            continue
+
+        normalized_path = os.path.realpath(path)
+        if not os.path.isdir(normalized_path):
+            invalid_dirs.append(f"{path!r} (not a directory)")
+            continue
+
+        include_dirs.append(normalized_path)
+
+    if invalid_dirs:
+        raise ValueError("extra_include_dirs entries must be absolute existing directories: " + ", ".join(invalid_dirs))
+    return include_dirs
+
+
+def _get_extra_include_dir_bytes(extra_include_dirs) -> list[bytes]:
+    return [path.encode("utf-8") for path in _get_extra_include_dirs(extra_include_dirs)]
 
 
 # builds cuda source to PTX or CUBIN using NVRTC (output type determined by output_path extension)
@@ -50,16 +80,24 @@ def build_cuda(
     llvm_cuda=False,
     use_precompiled_headers=True,
     name_expressions=None,
+    extra_include_dirs=(),
 ) -> None:
     with open(cu_path, "rb") as src_file:
         src = src_file.read()
     cu_path_bytes = cu_path.encode("utf-8")
     program_name_bytes = os.path.basename(cu_path).encode("utf-8")
     inc_path = os.path.join(warp_home, "native").encode("utf-8")
+    extra_cuda_include_dirs = _get_extra_include_dir_bytes(extra_include_dirs)
+    num_cuda_include_dirs = len(extra_cuda_include_dirs)
+    cuda_include_dirs = (
+        (ctypes.c_char_p * num_cuda_include_dirs)(*extra_cuda_include_dirs) if num_cuda_include_dirs else None
+    )
     output_path = output_path.encode("utf-8")
 
     if llvm_cuda:
-        err = warp._src.context.runtime.llvm.wp_compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
+        err = warp._src.context.runtime.llvm.wp_compile_cuda(
+            src, cu_path_bytes, inc_path, num_cuda_include_dirs, cuda_include_dirs, output_path, False
+        )
     else:
         if ltoirs is None:
             ltoirs = []
@@ -94,11 +132,11 @@ def build_cuda(
             arch,
             arch_suffix_bytes,
             inc_path,
-            0,
-            None,
+            num_cuda_include_dirs,
+            cuda_include_dirs,
             config == "debug",
             optimization_level,
-            warp.config.verbose or warp.config.log_level <= LOG_DEBUG,
+            warp.config.log_level <= LOG_DEBUG,
             verify_fp,
             fast_math,
             fuse_fp,
@@ -140,6 +178,7 @@ def build_cpu(
     pch_dir=None,
     block_dim=256,
     enable_tiles_in_stack_memory=True,
+    extra_include_dirs=(),
 ):
     with open(cpp_path, "rb") as cpp:
         src = cpp.read()
@@ -148,6 +187,10 @@ def build_cpu(
     obj_path = obj_path.encode("utf-8")
 
     flags_list = extra_flags.split()
+    if flags_list and flags_list[-1] == "-mllvm":
+        raise ValueError("-mllvm requires one LLVM option argument")
+    for include_dir in _get_extra_include_dirs(extra_include_dirs):
+        flags_list.extend(("-I", include_dir))
     flags_array = (ctypes.c_char_p * (len(flags_list) + 1))(*[f.encode("utf-8") for f in flags_list], None)
 
     pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
@@ -172,6 +215,22 @@ def build_cpu(
         raise Exception(f"CPU kernel build failed with error code {err}")
 
 
+def _add_long_path_prefix(path):
+    """Add the Windows long-path prefix to an absolute path, accounting for UNC shares.
+
+    Prefixed paths bypass the legacy 260-character MAX_PATH limit without requiring
+    system-wide long-path support. Relative paths and paths that already carry the
+    prefix are returned unchanged.
+    """
+    if not ntpath.isabs(path) or path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        # UNC path  \\server\share\…  →  \\?\UNC\server\share\…
+        return "\\\\?\\UNC\\" + path.removeprefix("\\\\")
+    # Drive-letter path  C:\…  →  \\?\C:\…
+    return "\\\\?\\" + path
+
+
 def init_kernel_cache(path=None):
     """Initialize kernel cache directory.
 
@@ -181,28 +240,37 @@ def init_kernel_cache(path=None):
     To change the default cache location, set warp.config.kernel_cache_dir before calling warp.init().
     """
 
+    global _resolved_kernel_cache_dir
+
     if path is not None:
         base_dir = os.path.realpath(path)
-        cache_root_dir = os.path.join(base_dir, warp.config.version)
     elif "WARP_CACHE_PATH" in os.environ:
         base_dir = os.path.realpath(os.environ.get("WARP_CACHE_PATH"))
-        cache_root_dir = os.path.join(base_dir, warp.config.version)
     else:
         base_dir = None
         cache_root_dir = appdirs.user_cache_dir(appname="warp", appauthor="NVIDIA", version=warp.config.version)
 
-        if os.name == "nt" and os.path.isabs(cache_root_dir) and not cache_root_dir.startswith("\\\\?\\"):
-            # Add Windows long-path prefix, accounting for UNC shares.
-            if cache_root_dir.startswith("\\\\"):
-                # UNC path  \\server\share\…  →  \\?\UNC\server\share\…
-                cache_root_dir = "\\\\?\\UNC\\" + cache_root_dir.removeprefix("\\\\")
-            else:
-                # Drive-letter path  C:\…  →  \\?\C:\…
-                cache_root_dir = "\\\\?\\" + cache_root_dir
+    if base_dir is not None:
+        # The remembered path carries the Windows long-path prefix, so compare against the
+        # prefixed spelling. os.path.realpath() keeps a prefix that is already there but never
+        # adds one, so an unprefixed path naming the same directory would otherwise miss.
+        resolved_candidate = _add_long_path_prefix(base_dir) if os.name == "nt" else base_dir
+
+        if resolved_candidate == _resolved_kernel_cache_dir:
+            cache_root_dir = resolved_candidate
+            base_dir = os.path.dirname(base_dir)
+        else:
+            cache_root_dir = os.path.join(base_dir, warp.config.version)
+
+    if os.name == "nt":
+        # Module paths under the cache can exceed MAX_PATH on systems without
+        # long-path support enabled, so custom locations need the prefix too.
+        cache_root_dir = _add_long_path_prefix(cache_root_dir)
 
     warp.config.kernel_cache_dir = cache_root_dir
 
     os.makedirs(warp.config.kernel_cache_dir, exist_ok=True)
+    _resolved_kernel_cache_dir = cache_root_dir
 
     # Warn about stale kernel artifacts in the unversioned base directory.
     # Prior to Warp 1.13, custom cache paths were used without a version
@@ -232,9 +300,6 @@ def clear_kernel_cache() -> None:
 
     warp._src.context.init()
 
-    is_initialized = warp._src.context.runtime is not None
-    assert is_initialized, "The kernel cache directory is not configured; wp.init() has not been called yet or failed."
-
     for m in warp._src.context.user_modules.values():
         m.unload()
 
@@ -254,13 +319,13 @@ def clear_lto_cache() -> None:
 
     warp._src.context.init()
 
-    is_initialized = warp._src.context.runtime is not None
-    assert is_initialized, "The kernel cache directory is not configured; wp.init() has not been called yet or failed."
-
     lto_path = os.path.join(warp.config.kernel_cache_dir, "lto")
     if os.path.isdir(lto_path):
         # Remove the lto directory and its contents
         shutil.rmtree(lto_path, ignore_errors=True)
+
+    # aligned GEMM variants rejected by cuBLASDx may be retried once the cache is rebuilt
+    _gemm_lto_alignment_unsupported.clear()
 
 
 def safe_rename(src, dst, attempts=5, delay=0.1):
@@ -450,8 +515,119 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
         return (result, outputs[".lto"], *[outputs[ext] for ext in extra_files.keys()])
 
 
-def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, arch, num_threads, builder):
-    arch = 120 if arch > 121 else arch
+# cuBLASDx GEMM LTO symbols whose aligned variant failed to compile in this process; the
+# unaligned variant is used for them and the aligned compile is not retried until the process
+# restarts or the LTO cache is cleared.
+_gemm_lto_alignment_unsupported: set[str] = set()
+
+# Warp compiles one module variant per block_dim and launches with exactly that many threads,
+# so cuBLASDx may specialize its GEMMs on the block size instead of reading it at runtime.
+_GEMM_ENABLE_STATIC_BLOCK_DIM = True
+
+
+def _get_mathdx_arch(arch: int) -> int:
+    # libmathdx 0.4.1 does not support sm_107, so generate compatible sm_103 LTO.
+    # Remove this fallback when the bundled libmathdx supports sm_107.
+    if arch == 107:
+        return 103
+    return 120 if arch > 121 else arch
+
+
+def _gemm_operand_alignments(
+    dense_lds: tuple[int, int, int],
+    native_lds: tuple[int, int, int],
+    elem_bytes: tuple[int, int, int],
+    aligned_bases: tuple[bool, bool, bool],
+) -> tuple[int, int, int]:
+    """Choose the cuBLASDx ``Alignment<A, B, C>`` operator values for a GEMM.
+
+    An operand is declared 16-byte aligned when its base pointer is known to be 16-byte
+    aligned and its dense leading dimension spans a multiple of 16 bytes, which lets cuBLASDx
+    vectorize its shared-memory accesses for that operand.
+
+    Args:
+        dense_lds: Dense leading dimensions of A, B, and C in elements.
+        native_lds: Leading dimensions passed to the LeadingDimension operator, or all zeros
+            when the GEMM is dense and the operator is left unset.
+        elem_bytes: Element size of A, B, and C in bytes.
+        aligned_bases: Whether the base pointer of A, B, and C is known to be 16-byte aligned.
+
+    Returns:
+        Alignment in bytes for A, B, and C. Operands that do not qualify keep their element size,
+        which is the cuBLASDx default, and a 16-bit C is capped at 8 bytes to sidestep a cuBLASDx
+        layout bug. All zeros means the operator is left unset, which is the case when no operand
+        qualifies or when ``native_lds`` is set.
+    """
+    if native_lds != (0, 0, 0):
+        return (0, 0, 0)
+    aligned = [
+        16 if (base and (ld * eb) % 16 == 0) else eb
+        for ld, eb, base in zip(dense_lds, elem_bytes, aligned_bases, strict=True)
+    ]
+    # cuBLASDx (through libmathdx 0.4.1) fails to compile some 16-bit GEMM layouts when C is
+    # declared 16-byte aligned (it pairs an 8-byte LDSM load with a 16-byte STSM store on sm_90 and
+    # newer); 8 bytes compiles everywhere tested. Remove once the cuBLASDx fix ships.
+    if elem_bytes[2] == 2 and aligned[2] == 16:
+        aligned[2] = 8
+    if all(al == eb for al, eb in zip(aligned, elem_bytes, strict=True)):
+        return (0, 0, 0)
+    return (aligned[0], aligned[1], aligned[2])
+
+
+def build_lto_dot(
+    M,
+    N,
+    K,
+    adtype,
+    bdtype,
+    cdtype,
+    alayout,
+    blayout,
+    clayout,
+    arch,
+    num_threads,
+    builder,
+    lda=None,
+    ldb=None,
+    ldc=None,
+    aligned_bases=(False, False, False),
+    precision=None,
+):
+    """Compile (or fetch from the LTO cache) a cuBLASDx GEMM ``C = alpha * A @ B + beta * C``.
+
+    The operand alignment declared to cuBLASDx is chosen by :func:`_gemm_operand_alignments`.
+    If cuBLASDx rejects the aligned variant, the GEMM is rebuilt without the alignment operator
+    and a warning is logged; the returned symbol reflects the variant that compiled.
+
+    Args:
+        M: Rows of A and C.
+        N: Columns of B and C.
+        K: Columns of A and rows of B.
+        adtype: Element type of A.
+        bdtype: Element type of B.
+        cdtype: Element type of C.
+        alayout: ``"rowmajor"`` or ``"colmajor"`` arrangement of A.
+        blayout: Arrangement of B.
+        clayout: Arrangement of C.
+        arch: Target compute capability as an integer (for example ``120``).
+        num_threads: Threads per block the kernel is compiled and launched with.
+        builder: Module builder that records the LTO and its declaration.
+        lda: Leading dimension of A in elements, or ``None`` when dense.
+        ldb: Leading dimension of B in elements, or ``None`` when dense.
+        ldc: Leading dimension of C in elements, or ``None`` when dense.
+        aligned_bases: Whether the base pointer of A, B, and C is known to be 16-byte aligned.
+        precision: ``"tf32"`` for TF32 input precision with ``float32`` accumulation, or
+            ``None`` to compute in the operand precision. Storage remains ``float32`` and
+            Tensor Core use depends on the GEMM configuration. The precision codes in the
+            LTO symbol keep the variants apart.
+
+    Returns:
+        ``(lto_symbol, lto_code_data)`` for the variant that compiled.
+
+    Raises:
+        RuntimeError: If neither the aligned nor the unaligned variant compiles.
+    """
+    arch = _get_mathdx_arch(arch)
 
     # Maps Python/Warp types to C++ types and enums
     def cublasdx_type_map(dtype):
@@ -481,6 +657,15 @@ def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, ar
     (a_dtype, a_prec, a_type) = cublasdx_type_map(adtype)
     (b_dtype, b_prec, b_type) = cublasdx_type_map(bdtype)
     (c_dtype, c_prec, c_type) = cublasdx_type_map(cdtype)
+
+    if precision == "tf32":
+        # Request TF32 input precision without changing float32 storage.
+        # C keeps F32 so accumulation stays in float32.
+        # The tile_matmul dispatch has already rejected non-float32 operands.
+        a_prec = 4  # COMMONDX_PRECISION_TF32
+        b_prec = 4
+    elif precision is not None:
+        raise ValueError(f"build_lto_dot() precision must be None or 'tf32', got {precision!r}")
     a_arrangement = cublasdx_arrangement_map(alayout)
     b_arrangement = cublasdx_arrangement_map(blayout)
     c_arrangement = cublasdx_arrangement_map(clayout)
@@ -490,54 +675,128 @@ def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, ar
 
     element_type = a_type
 
+    # A leading dimension is the element stride between rows of a row-major operand,
+    # or between columns of a col-major one. None means dense.
+    def dense_ld(layout, rows, cols):
+        return cols if layout == "rowmajor" else rows
+
+    dense_lds = (dense_ld(alayout, M, K), dense_ld(blayout, K, N), dense_ld(clayout, M, N))
+    if lda is None:
+        lda = dense_lds[0]
+    if ldb is None:
+        ldb = dense_lds[1]
+    if ldc is None:
+        ldc = dense_lds[2]
+
+    # Pass zeros for dense strides, leaving the LeadingDimension operator unset.
+    # cuBLASDx validates an explicit LeadingDimension more strictly than the default;
+    # see the fallback in the tile_matmul dispatch.
+    native_lds = (0, 0, 0) if (lda, ldb, ldc) == dense_lds else (lda, ldb, ldc)
+
     lto_symbol = f"dot_{M}_{N}_{K}_{arch}_{num_threads}_{a_arrangement}_{b_arrangement}_{c_arrangement}_{a_prec}_{b_prec}_{c_prec}_{element_type}"
+    # explicit leading dimensions are part of the LTO identity
+    if (lda, ldb, ldc) != dense_lds:
+        lto_symbol += f"_{lda}_{ldb}_{ldc}"
 
-    def compile_lto_dot(temp_paths):
-        result = warp._src.context.runtime.core.wp_cuda_compile_dot(
-            temp_paths[".lto"].encode("utf-8"),
-            lto_symbol.encode("utf-8"),
-            0,
-            None,
-            None,
-            arch,
-            M,
-            N,
-            K,
-            a_prec,
-            b_prec,
-            c_prec,
-            element_type,
-            a_arrangement,
-            b_arrangement,
-            c_arrangement,
-            num_threads,
-        )
+    alignments = _gemm_operand_alignments(
+        dense_lds,
+        native_lds,
+        tuple(type_size_in_bytes(t) for t in (adtype, bdtype, cdtype)),
+        tuple(builtins.bool(b) for b in aligned_bases),
+    )
 
-        if result:
-            with open(temp_paths[".lto"], "rb") as f:
-                lto_code_data = f.read()
-            return True, {".lto": lto_code_data}
-        return False, {}
+    def operator_symbol(al):
+        """Return the LTO symbol with the cuBLASDx operator settings appended, so they are part of the cache identity."""
+        return f"{lto_symbol}_al{al[0]}_{al[1]}_{al[2]}_sb{int(_GEMM_ENABLE_STATIC_BLOCK_DIM)}"
 
-    # Early out if already cached in module
-    if lto_symbol in builder.ltoirs:
-        lto_code_data = builder.ltoirs[lto_symbol]
-    else:
-        (result, lto_code_data) = _build_lto_base(lto_symbol, compile_lto_dot, builder, {})
+    def make_compile_func(symbol, al, suppress_errors):
+        """Return the compile callback for one variant.
 
-        if not result:
-            raise RuntimeError(
-                f"Failed to compile LTO '{lto_symbol}'. "
-                "Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+        Args:
+            symbol: LTO symbol to generate.
+            al: Alignment in bytes to declare for A, B, and C.
+            suppress_errors: Whether a rejected configuration is expected and must not be
+                printed as a native error.
+        """
+
+        def compile_lto_dot(temp_paths):
+            """Compile the GEMM LTO into ``temp_paths[".lto"]`` and return ``(success, {".lto": bytes})``."""
+            result = warp._src.context.runtime.core.wp_cuda_compile_dot(
+                temp_paths[".lto"].encode("utf-8"),
+                symbol.encode("utf-8"),
+                0,
+                None,
+                None,
+                arch,
+                M,
+                N,
+                K,
+                a_prec,
+                b_prec,
+                c_prec,
+                element_type,
+                a_arrangement,
+                b_arrangement,
+                c_arrangement,
+                num_threads,
+                native_lds[0],
+                native_lds[1],
+                native_lds[2],
+                al[0],
+                al[1],
+                al[2],
+                int(_GEMM_ENABLE_STATIC_BLOCK_DIM),
+                int(suppress_errors),
             )
 
-        # Update builder
-        builder.ltoirs[lto_symbol] = lto_code_data
-        builder.ltoirs_decl[lto_symbol] = (
-            f"void {lto_symbol}({c_dtype}*, {a_dtype}*, {b_dtype}*, {c_dtype}*, {c_dtype}*);"
-        )
+            if result:
+                with open(temp_paths[".lto"], "rb") as f:
+                    lto_code_data = f.read()
+                return True, {".lto": lto_code_data}
+            return False, {}
 
-    return lto_symbol, lto_code_data
+        return compile_lto_dot
+
+    # cuBLASDx rejects some layouts when an operand is declared 16-byte aligned (for example fp16
+    # GEMMs with N=16 on sm_90 and newer), so fall back to the unaligned variant if the aligned
+    # compile fails
+    attempts = [alignments] if alignments == (0, 0, 0) else [alignments, (0, 0, 0)]
+    rejected_symbol = None
+    for al in attempts:
+        symbol = operator_symbol(al)
+        if symbol in builder.ltoirs:
+            if rejected_symbol is not None:
+                # the fallback was already built for another GEMM in this module; remember the
+                # rejection so later GEMMs with the same shape skip the failing compile
+                _gemm_lto_alignment_unsupported.add(rejected_symbol)
+            return symbol, builder.ltoirs[symbol]
+        if symbol in _gemm_lto_alignment_unsupported:
+            continue
+
+        # a rejected aligned variant is expected and handled below, so its compile does not report errors
+        has_fallback = al != (0, 0, 0)
+        (result, lto_code_data) = _build_lto_base(symbol, make_compile_func(symbol, al, has_fallback), builder, {})
+        if result:
+            if rejected_symbol is not None:
+                # remember the rejection only once the fallback is known to work, so a transient
+                # failure does not disable the aligned variant for the rest of the process
+                _gemm_lto_alignment_unsupported.add(rejected_symbol)
+            builder.ltoirs[symbol] = lto_code_data
+            builder.ltoirs_decl[symbol] = f"void {symbol}({c_dtype}*, {a_dtype}*, {b_dtype}*, {c_dtype}*, {c_dtype}*);"
+            return symbol, lto_code_data
+
+        if has_fallback:
+            rejected_symbol = symbol
+            log_warning(
+                f"cuBLASDx rejected the 16-byte-aligned GEMM for tile_matmul ({adtype.__name__} {M}x{N}x{K}, "
+                f"{num_threads} threads, sm_{arch}); retrying without explicit alignment. Results are unaffected "
+                "but performance may be reduced. Please report this warning in a Warp GitHub issue."
+            )
+
+    raise RuntimeError(
+        f"Failed to compile LTO '{symbol}'. "
+        "Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+    )
 
 
 def build_lto_solver(
@@ -558,7 +817,7 @@ def build_lto_solver(
     builder,
     smem_estimate_bytes=None,
 ):
-    arch = 120 if arch > 121 else arch
+    arch = _get_mathdx_arch(arch)
 
     def cusolverdx_arrangement_map(layout):
         if layout == "colmajor":
@@ -625,7 +884,8 @@ def build_lto_solver(
                     source = "estimated limit" if max_smem_is_estimate else "device-reported limit"
                     hint = (
                         f"Estimated shared memory requirement is {smem_estimate_bytes}B, "
-                        f"but the {source} is {max_smem_bytes}B. "
+                        f"but the {source} is {max_smem_bytes}B, and a kernel's usable budget is lower "
+                        "still because Warp reserves static shared memory per block. "
                         "The tile size(s) may be too large for this device."
                     )
 
@@ -653,7 +913,7 @@ def build_lto_solver(
 
 
 def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
-    arch = 120 if arch > 121 else arch
+    arch = _get_mathdx_arch(arch)
 
     lto_symbol = f"fft_{size}_{ept}_{arch}_{direction}_{precision}"
     dtype_ctype = "wp::vec2f" if precision == 5 else "wp::vec2d"
@@ -686,7 +946,7 @@ def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
             meta[lto_symbol] = shared_memory_bytes
 
             with open(temp_paths[".meta"], "w") as meta_file:
-                json.dump(meta, meta_file)
+                json.dump(meta, meta_file, sort_keys=True)
 
             return True, {".lto": lto_code_data, ".meta": shared_memory_bytes}
 

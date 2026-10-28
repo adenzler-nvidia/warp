@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "api.h"
+
 // This file declares a subset of the C runtime (CRT) functions and macros for
 // use by compute kernel modules. There are three environments in which this
 // file gets included:
@@ -14,18 +16,6 @@
 //   the compiler library instead (clang.dll).
 // - Warp runtime (!WP_NO_CRT). When building warp.dll it's fine to include the
 //   standard C library headers, and it avoids mismatched redefinitions.
-
-#ifndef WP_API
-#if !defined(__CUDA_ARCH__)
-#if defined(_WIN32)
-#define WP_API __declspec(dllexport)
-#else
-#define WP_API __attribute__ ((visibility ("default")))
-#endif
-#else
-#define WP_API
-#endif
-#endif  // WP_API
 
 #if !defined(__CUDA_ARCH__)
 
@@ -47,6 +37,7 @@ extern "C" WP_API int _wp_isinf(double);
 
 #include <assert.h>
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -259,6 +250,10 @@ float log10f(float);
 double log10(double);
 float expf(float);
 double exp(double);
+float exp2f(float);
+double exp2(double);
+float ldexpf(float, int);
+double ldexp(double, int);
 float sqrtf(float);
 double sqrt(double);
 float cbrtf(float);
@@ -321,6 +316,7 @@ void* memcpy(void*, const void*, size_t);
 
 // stdlib.h
 void* malloc(size_t);
+void* calloc(size_t, size_t);
 void free(void*);
 
 }  // extern "C"

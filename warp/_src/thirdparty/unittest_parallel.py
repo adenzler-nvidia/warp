@@ -25,6 +25,7 @@ import warp.tests.unittest_utils
 from warp._src.thirdparty import appdirs
 from warp.tests.unittest_utils import (  # NVIDIA modification
     ParallelJunitTestResult,
+    synchronize_after_test,
     write_junit_results,
 )
 
@@ -38,9 +39,44 @@ except ImportError:
 
 # The following variables are NVIDIA Modifications
 START_DIRECTORY = os.path.join(os.path.dirname(__file__), "..")  # The directory to start test discovery
-_SUITE_TIMEOUT = (
-    3600  # Timeout in seconds: total wall-clock limit for parallel execution, per-suite limit during isolated fallback
-)
+_DEFAULT_TIMEOUT = 3600  # Default for --timeout, in seconds
+_WARP_CACHE_PATH_ENV = "WARP_CACHE_PATH"
+
+
+def _get_warp_cache_base_path():
+    cache_path = os.environ.get(_WARP_CACHE_PATH_ENV)
+    if cache_path is None:
+        return None
+    cache_path = cache_path.strip()
+    return cache_path or None
+
+
+def _kill_process_pool(executor):
+    """Kill all executor workers without waiting for running futures.
+
+    Python 3.14 added :meth:`~concurrent.futures.ProcessPoolExecutor.kill_workers`.
+    Mirror its implementation for older supported Python versions.
+    """
+    kill_workers = getattr(executor, "kill_workers", None)
+    if kill_workers is not None:
+        kill_workers()
+        return
+
+    processes = executor._processes.copy() if executor._processes else {}
+    executor.shutdown(wait=False, cancel_futures=True)
+    for process in processes.values():
+        try:
+            if not process.is_alive():
+                continue
+        except ValueError:
+            # The process has already exited and closed.
+            continue
+
+        try:
+            process.kill()
+        except ProcessLookupError:
+            # The process exited between the liveness check and kill.
+            continue
 
 
 def main(argv=None):
@@ -55,7 +91,7 @@ def main(argv=None):
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""Example usage:
         python -m warp.tests -s autodetect -p 'test_a*.py'
-        python -m warp.tests -s kit
+        python -m warp.tests -s debug
         python -m warp.tests -k 'mgpu' -k 'cuda'
         """,
     )
@@ -93,7 +129,9 @@ def main(argv=None):
         "--suite",
         type=str,
         default="default",
-        choices=["autodetect", "default", "debug", "kit"],
+        # "autodetect" is a special mode; the named suites are derived from the
+        # registry so a choice cannot exist without a factory behind it.
+        choices=["autodetect", *warp.tests.unittest_suites.SUITE_FACTORIES],
         help="Name of the test suite to run (default is 'default').",
     )  # NVIDIA Modification
     group_parallel = parser.add_argument_group("parallelization options")
@@ -115,27 +153,36 @@ def main(argv=None):
     )  # NVIDIA Modification
     group_parallel.add_argument(
         "--level",
-        choices=["module", "class", "test"],
+        choices=["module", "class"],
         default="class",
         help="Set the test parallelism level (default is 'class')",
     )
     group_parallel.add_argument(
-        "--disable-process-pooling",
+        "--isolate-test-processes",
         action="store_true",
-        default=False,
-        help="Do not reuse processes used to run test suites",
+        help="Run each test suite in a fresh process.",
     )
-    group_parallel.add_argument(
-        "--disable-concurrent-futures",
-        action="store_true",
-        default=False,
-        help="Use multiprocessing instead of concurrent.futures.",
-    )  # NVIDIA Modification
     group_parallel.add_argument(
         "--serial-fallback",
         action="store_true",
         default=False,
         help="Run in a single-process (no spawning) mode without multiprocessing or concurrent.futures.",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
+        "--fallback-on-crash",
+        action="store_true",
+        default=False,
+        help="If parallel execution fails, re-run each test suite one-at-a-time in "
+        "isolated single-process pools. Slow; mainly to salvage partial results. "
+        "Off by default: a crash fails loudly instead.",
+    )  # NVIDIA Modification
+    group_parallel.add_argument(
+        "--timeout",
+        metavar="SECONDS",
+        type=int,
+        default=_DEFAULT_TIMEOUT,
+        help="Total wall-clock limit for parallel execution, and the per-suite limit "
+        f"with --fallback-on-crash (default is {_DEFAULT_TIMEOUT})",
     )  # NVIDIA Modification
     group_coverage = parser.add_argument_group("coverage options")
     group_coverage.add_argument("--coverage", action="store_true", help="Run tests with coverage")
@@ -157,6 +204,11 @@ def main(argv=None):
     group_warp.add_argument("--warp-debug", action="store_true", help="Set warp.config.mode to 'debug'")
     args = parser.parse_args(args=argv)
 
+    if args.isolate_test_processes and args.serial_fallback:
+        parser.error("--isolate-test-processes cannot be used with --serial-fallback")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+
     if args.coverage_branch:
         args.coverage = args.coverage_branch
 
@@ -172,12 +224,13 @@ def main(argv=None):
 
     import warp as wp  # noqa: PLC0415 NVIDIA Modification
 
-    # Clear the Warp cache (NVIDIA Modification).  Honor WARP_CACHE_ROOT
+    # Clear the Warp cache (NVIDIA Modification).  Honor WARP_CACHE_PATH
     # before the clear so concurrent worktrees pinned to the same Warp
     # version do not wipe each other's default cache.  Workers key on the
     # same env var.
-    if "WARP_CACHE_ROOT" in os.environ:
-        wp.config.kernel_cache_dir = os.environ["WARP_CACHE_ROOT"]
+    warp_cache_base_path = _get_warp_cache_base_path()
+    if warp_cache_base_path is not None:
+        wp.config.kernel_cache_dir = warp_cache_base_path
 
     wp.clear_lto_cache()
     wp.clear_kernel_cache()
@@ -205,11 +258,9 @@ def main(argv=None):
                 discover_suite = auto_discover_suite
 
         # Get the parallelizable test suites
-        if args.level == "test":
-            test_suites = list(_iter_test_cases(discover_suite))
-        elif args.level == "class":
+        if args.level == "class":
             test_suites = list(_iter_class_suites(discover_suite))
-        else:  # args.level == 'module'
+        else:  # args.level == "module"
             test_suites = list(_iter_module_suites(discover_suite))
 
         # Don't use more processes than test suites
@@ -231,123 +282,126 @@ def main(argv=None):
             # Run the tests in parallel
             start_time = time.perf_counter()
 
-            if args.disable_concurrent_futures:
-                multiprocessing_context = multiprocessing.get_context(method="spawn")
-                maxtasksperchild = 1 if args.disable_process_pooling else None
-                with multiprocessing_context.Pool(
-                    process_count,
-                    maxtasksperchild=maxtasksperchild,
+            # NVIDIA Modification: added concurrent.futures with crash handling and per-suite isolated fallback
+            results = []
+            parallel_failed = False
+            parallel_fail_reason = "unknown"
+
+            try:
+                executor_options = {}
+                if args.isolate_test_processes:
+                    executor_options["max_tasks_per_child"] = 1
+
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=process_count,
+                    mp_context=multiprocessing.get_context(method="spawn"),
                     initializer=initialize_test_process,
                     initargs=(manager.Lock(), shared_index, args, temp_dir),
-                ) as pool:
+                    **executor_options,
+                ) as executor:
                     test_manager = ParallelTestManager(manager, args, temp_dir)
-                    results = pool.map(test_manager.run_tests, test_suites)
-            else:
-                # NVIDIA Modification: added concurrent.futures with crash handling and per-suite isolated fallback
-                results = []
-                parallel_failed = False
-                parallel_fail_reason = "unknown"
-
-                try:
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=process_count,
-                        mp_context=multiprocessing.get_context(method="spawn"),
-                        initializer=initialize_test_process,
-                        initargs=(manager.Lock(), shared_index, args, temp_dir),
-                    ) as executor:
-                        test_manager = ParallelTestManager(manager, args, temp_dir)
-                        # Iterate results explicitly so we can report which suite timed out
-                        for result in executor.map(test_manager.run_tests, test_suites, timeout=_SUITE_TIMEOUT):
+                    # Iterate results explicitly so we can report which suite timed out
+                    try:
+                        for result in executor.map(test_manager.run_tests, test_suites, timeout=args.timeout):
                             results.append(result)
+                    except concurrent.futures.TimeoutError:
+                        _kill_process_pool(executor)
+                        raise
 
-                except TimeoutError:
-                    pending_index = len(results)
-                    total = len(test_suites)
-                    suite_name = _get_suite_name(test_suites[pending_index]) if pending_index < total else "unknown"
-                    print(
-                        f"Warning: Parallel execution timed out (total timeout={_SUITE_TIMEOUT}s). "
-                        f"Next pending result was suite "
-                        f"{pending_index + 1}/{total} ({suite_name}), "
-                        f"but a different suite may be the actual blocker. "
-                        f"Switching to isolated single-process fallback.",
-                        file=sys.stderr,
-                    )
-                    parallel_failed = True
-                    parallel_fail_reason = "timed out"
-                except BrokenProcessPool:
-                    # Process pool is broken - switch to isolated single-process fallback
-                    print(
-                        "Warning: Process pool broken during parallel execution. Switching to isolated single-process fallback.",
-                        file=sys.stderr,
-                    )
-                    parallel_failed = True
-                    parallel_fail_reason = "process pool broken"
-                except Exception as e:
-                    # Handle other pool-level exceptions
-                    print(
-                        f"Warning: Process pool error: {e}. Switching to isolated single-process fallback.",
-                        file=sys.stderr,
-                    )
-                    parallel_failed = True
-                    parallel_fail_reason = str(e)
+            except concurrent.futures.TimeoutError:
+                pending_index = len(results)
+                total = len(test_suites)
+                suite_name = _get_suite_name(test_suites[pending_index]) if pending_index < total else "unknown"
+                print(
+                    f"Warning: Parallel execution timed out (total timeout={args.timeout}s). "
+                    f"Next pending result was suite "
+                    f"{pending_index + 1}/{total} ({suite_name}), "
+                    f"but a different suite may be the actual blocker.",
+                    file=sys.stderr,
+                )
+                parallel_failed = True
+                parallel_fail_reason = "timed out"
+            except BrokenProcessPool:
+                print("Warning: Process pool broken during parallel execution.", file=sys.stderr)
+                parallel_failed = True
+                parallel_fail_reason = "process pool broken"
+            except Exception as e:
+                # Handle other pool-level exceptions
+                print(f"Warning: Process pool error: {e}.", file=sys.stderr)
+                parallel_failed = True
+                parallel_fail_reason = str(e)
 
-                # Fallback to isolated single-process execution if parallel failed
-                # Skip fallback in CI/CD environments to respect job timeouts
-                in_ci = os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or os.environ.get("GITLAB_CI")
-                if parallel_failed and in_ci:
-                    parser.exit(
-                        status=1,
-                        message=f"Error: Parallel execution failed ({parallel_fail_reason}) in CI/CD environment. Skipping single-process fallback due to job timeout constraints.\n",
+            # When parallel execution fails, either fail loudly with a partial
+            # report (default) or re-run each suite in an isolated single-process
+            # pool to salvage results (opt-in via --fallback-on-crash).
+            if parallel_failed and not args.fallback_on_crash:
+                # Keep the results collected before the failure, mark the remaining
+                # suites as crashed without re-running them, and fall through to the
+                # normal report (which exits non-zero because of the crash errors).
+                completed = len(results)
+                pending = test_suites[completed:]
+                print(
+                    f"Warning: Parallel execution failed ({parallel_fail_reason}). "
+                    f"{completed}/{len(test_suites)} suites completed before the failure; "
+                    f"marking the remaining {len(pending)} as crashed (some may have passed "
+                    f"but cannot be confirmed after the failure). Pass --fallback-on-crash "
+                    f"to re-run all suites in isolated single-process mode.",
+                    file=sys.stderr,
+                )
+                for suite in pending:
+                    results.append(
+                        create_crash_result(suite, reason=f"Parallel execution failed: {parallel_fail_reason}")
                     )
-                elif parallel_failed:
-                    print("Running all tests in isolated single-process mode...", file=sys.stderr)
-                    # Run all test suites in isolated single-process pools
-                    results = []
-                    for i, suite in enumerate(test_suites):
-                        try:
-                            # Create a new single-process pool for each test suite
-                            with concurrent.futures.ProcessPoolExecutor(
-                                max_workers=1,
-                                mp_context=multiprocessing.get_context(method="spawn"),
-                                initializer=initialize_test_process,
-                                initargs=(manager.Lock(), shared_index, args, temp_dir),
-                            ) as executor:
-                                test_manager = ParallelTestManager(manager, args, temp_dir)
-                                future = executor.submit(test_manager.run_tests, suite)
-                                try:
-                                    result = future.result(timeout=_SUITE_TIMEOUT)
-                                    results.append(result)
-                                except TimeoutError:
-                                    suite_name = _get_suite_name(suite)
-                                    print(
-                                        f"Warning: Isolated test suite {i + 1}/{len(test_suites)} ({suite_name}) timed out (timeout={_SUITE_TIMEOUT}s). Marking tests as crashed.",
-                                        file=sys.stderr,
-                                    )
-                                    crash_result = create_crash_result(
-                                        suite, reason=f"Process timed out (timeout={_SUITE_TIMEOUT}s)"
-                                    )
-                                    results.append(crash_result)
-                                except BrokenProcessPool:
-                                    print(
-                                        f"Warning: Process crashed or was terminated unexpectedly in isolated execution for test suite {i + 1}/{len(test_suites)}. Marking tests as crashed.",
-                                        file=sys.stderr,
-                                    )
-                                    crash_result = create_crash_result(suite)
-                                    results.append(crash_result)
-                                except Exception as e:
-                                    print(
-                                        f"Warning: Error in isolated test suite {i + 1}/{len(test_suites)}: {e}. Marking tests as crashed.",
-                                        file=sys.stderr,
-                                    )
-                                    error_result = create_crash_result(suite)
-                                    results.append(error_result)
-                        except Exception as e:
-                            print(
-                                f"Warning: Failed to create isolated process for test suite {i + 1}/{len(test_suites)}: {e}. Marking tests as crashed.",
-                                file=sys.stderr,
-                            )
-                            error_result = create_crash_result(suite)
-                            results.append(error_result)
+            elif parallel_failed:
+                print("Running all tests in isolated single-process mode...", file=sys.stderr)
+                # Run all test suites in isolated single-process pools
+                results = []
+                fallback_manager = ParallelTestManager(manager, args, temp_dir)
+                for i, suite in enumerate(test_suites):
+                    try:
+                        # Create a new single-process pool for each test suite
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=1,
+                            mp_context=multiprocessing.get_context(method="spawn"),
+                            initializer=initialize_test_process,
+                            initargs=(manager.Lock(), shared_index, args, temp_dir),
+                        ) as executor:
+                            future = executor.submit(fallback_manager.run_tests, suite)
+                            try:
+                                result = future.result(timeout=args.timeout)
+                                results.append(result)
+                            except concurrent.futures.TimeoutError:
+                                _kill_process_pool(executor)
+                                suite_name = _get_suite_name(suite)
+                                print(
+                                    f"Warning: Isolated test suite {i + 1}/{len(test_suites)} ({suite_name}) timed out (timeout={args.timeout}s). Marking tests as crashed.",
+                                    file=sys.stderr,
+                                )
+                                crash_result = create_crash_result(
+                                    suite, reason=f"Process timed out (timeout={args.timeout}s)"
+                                )
+                                results.append(crash_result)
+                            except BrokenProcessPool:
+                                print(
+                                    f"Warning: Process crashed or was terminated unexpectedly in isolated execution for test suite {i + 1}/{len(test_suites)}. Marking tests as crashed.",
+                                    file=sys.stderr,
+                                )
+                                crash_result = create_crash_result(suite)
+                                results.append(crash_result)
+                            except Exception as e:
+                                print(
+                                    f"Warning: Error in isolated test suite {i + 1}/{len(test_suites)}: {e}. Marking tests as crashed.",
+                                    file=sys.stderr,
+                                )
+                                error_result = create_crash_result(suite)
+                                results.append(error_result)
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to create isolated process for test suite {i + 1}/{len(test_suites)}: {e}. Marking tests as crashed.",
+                            file=sys.stderr,
+                        )
+                        error_result = create_crash_result(suite)
+                        results.append(error_result)
         else:
             # This entire path is an NVIDIA Modification
 
@@ -428,15 +482,18 @@ def main(argv=None):
                 test_duration,
             )
 
-        # Return an error status on failure
+        # Return an error status on failure. Clamp to 255 because process exit
+        # codes wrap modulo 256; a large crash error count that is a multiple of
+        # 256 would otherwise exit 0 and report a failed run as success. The
+        # `not is_success` guard guarantees the count is at least 1.
         if not is_success:
-            parser.exit(status=len(errors) + len(failures) + unexpected_successes)
+            parser.exit(status=min(255, len(errors) + len(failures) + unexpected_successes))
 
         # Coverage?
         if args.coverage:
             # Combine the coverage files
             cov_options = {}
-            cov_options["config_file"] = True  # Grab configuration from pyproject.toml (must install coverage[toml])
+            cov_options["config_file"] = True  # Read configuration from pyproject.toml.
             cov = coverage.Coverage(**cov_options)
             cov.combine(data_paths=[os.path.join(temp_dir, x) for x in os.listdir(temp_dir)])
 
@@ -478,7 +535,7 @@ def _coverage(args, temp_dir):
             "data_file": coverage_file.name,
             # NVIDIA Modification removed unneeded options
         }
-        cov_options["config_file"] = True  # Grab configuration from pyproject.toml (must install coverage[toml])
+        cov_options["config_file"] = True  # Read configuration from pyproject.toml.
         cov = coverage.Coverage(**cov_options)
         try:
             # Start measuring code coverage
@@ -536,6 +593,7 @@ def create_crash_result(test_suite, reason="Process crashed or was terminated un
     """
     test_count = test_suite.countTestCases()
     crash_errors = []
+    crash_test_records = []
 
     # Create error entries for each test in the suite
     # Note: We don't know which specific test caused the failure, just that the process failed
@@ -551,9 +609,10 @@ def create_crash_result(test_suite, reason="Process crashed or was terminated un
                 ]
             )
         )
+        crash_test_records.append((test.__class__.__name__, test._testMethodName, 0.0, "ERROR", error_msg, error_msg))
 
     # Return the same format as run_tests: (test_count, errors, failures, skipped, expected_failures, unexpected_successes, test_records)
-    return (test_count, crash_errors, [], 0, 0, 0, [])
+    return (test_count, crash_errors, [], 0, 0, 0, crash_test_records)
 
 
 class ParallelTestManager:
@@ -581,6 +640,7 @@ class ParallelTestManager:
         with _coverage(self.args, self.temp_dir):
             runner = unittest.TextTestRunner(
                 stream=StringIO(),
+                descriptions=False,  # NVIDIA Modification
                 resultclass=resultclass,  # NVIDIA Modification
                 verbosity=self.args.verbose,
                 failfast=self.args.failfast,
@@ -628,6 +688,9 @@ class ParallelTextTestResult(unittest.TextTestResult):
         super(unittest.TextTestResult, self).startTest(test)
 
     def stopTest(self, test):
+        # NVIDIA modification: addSuccess() already reported CUDA errors from passing tests.
+        # For any other outcome, keep it and only note the error so later failures can name this test.
+        synchronize_after_test(test, test_failed=True)
         super().stopTest(test)
         # Force garbage collection of CPU-side allocations to reduce peak
         # host RSS in parallel test runs.
@@ -643,6 +706,13 @@ class ParallelTextTestResult(unittest.TextTestResult):
         self.stream.flush()
 
     def addSuccess(self, test):
+        # NVIDIA modification: runs after tearDown() and cleanups, so a CUDA error from work
+        # the test left outstanding fails the test that caused it
+        try:
+            synchronize_after_test(test)
+        except Exception:
+            self.addError(test, sys.exc_info())
+            return
         super(unittest.TextTestResult, self).addSuccess(test)
         self._add_helper(test, ".", "ok")
 
@@ -674,7 +744,7 @@ def initialize_test_process(lock, shared_index, args, temp_dir):
     """Necessary operations to be executed at the start of every test process.
 
     Currently this function can be used to set a separate Warp cache. (NVIDIA modification)
-    If the environment variable `WARP_CACHE_ROOT` is detected, the cache will be placed in the provided path.
+    If the environment variable `WARP_CACHE_PATH` is detected, the cache will be placed in the provided path.
 
     It also ensures that Warp is initialized prior to running any tests.
     """
@@ -689,11 +759,13 @@ def initialize_test_process(lock, shared_index, args, temp_dir):
         if args.warp_debug:
             wp.config.mode = "debug"
 
+        warp_cache_base_path = _get_warp_cache_base_path()
+
         # init_kernel_cache() appends warp.config.version, so we set
         # kernel_cache_dir to a base path and let Warp add the version segment.
         if args.no_shared_cache:
-            if "WARP_CACHE_ROOT" in os.environ:
-                cache_root_dir = os.path.join(os.getenv("WARP_CACHE_ROOT"), f"worker-{worker_index:03d}")
+            if warp_cache_base_path is not None:
+                cache_root_dir = os.path.join(warp_cache_base_path, f"worker-{worker_index:03d}")
             else:
                 cache_root_dir = appdirs.user_cache_dir(
                     appname="warp", appauthor="NVIDIA", version=f"worker-{worker_index:03d}"
@@ -703,9 +775,9 @@ def initialize_test_process(lock, shared_index, args, temp_dir):
 
             wp.clear_lto_cache()
             wp.clear_kernel_cache()
-        elif "WARP_CACHE_ROOT" in os.environ:
+        elif warp_cache_base_path is not None:
             # Using a shared cache for all test processes
-            wp.config.kernel_cache_dir = os.getenv("WARP_CACHE_ROOT")
+            wp.config.kernel_cache_dir = warp_cache_base_path
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -74,7 +74,7 @@ def test_static_accessors(test, device):
 
 def test_intflag_compare(test, device):
     @wp.kernel(module="unique")
-    def compute_intflag_compare(ins: wp.array(dtype=wp.int32), outs: wp.array(dtype=wp.int32)):
+    def compute_intflag_compare(ins: wp.array[wp.int32], outs: wp.array[wp.int32]):
         tid = wp.tid()
         if ins[tid] & MyIntFlag.A:
             outs[tid] += MyIntFlag.A
@@ -111,7 +111,7 @@ MY_INTFLAG_CONST = wp.constant(wp.int32(MyIntFlag.B))
 
 
 def test_intenum_constant(test, device):
-    """wp.constant(wp.int32(IntEnum_value)) should emit the integer, not the symbolic name."""
+    """Verify that wp.constant(wp.int32(IntEnum_value)) should emit the integer, not the symbolic name."""
 
     @wp.kernel(module="unique")
     def expect_intenum_constant():
@@ -121,7 +121,7 @@ def test_intenum_constant(test, device):
 
 
 def test_intflag_constant(test, device):
-    """wp.constant(wp.int32(IntFlag_value)) should emit the integer, not the symbolic name."""
+    """Verify that wp.constant(wp.int32(IntFlag_value)) should emit the integer, not the symbolic name."""
 
     @wp.kernel(module="unique")
     def expect_intflag_constant():

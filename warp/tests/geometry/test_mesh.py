@@ -223,9 +223,12 @@ def query_ray_group_kernel(
 
 def test_mesh_query_ray(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -315,9 +318,12 @@ def query_ray_hit_kernel(
 
 def test_mesh_refit(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     # Ray aimed at the origin — hits the unit cube centered there
     origin = wp.vec3(0.0, 5.0, 0.0)
@@ -378,7 +384,7 @@ def test_mesh_refit_graph(test, device):
 
 
 def test_mesh_exceptions(test, device):
-    # points and indices must be on same device
+    """Reject mesh points and indices located on different devices."""
     with test.assertRaises(RuntimeError):
         points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device="cpu")
         indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device=device)
@@ -410,14 +416,14 @@ def test_mesh_exceptions(test, device):
         indices = indices.reshape((3, -1))
         wp.Mesh(points=points, indices=indices)
 
-    # grouped queries are not supported with cuBQL backend
+    # grouped queries are not supported with the cuBQL constructor
     with test.assertRaises(RuntimeError):
         points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device=device)
         indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device=device)
         groups = wp.zeros(FACE_COUNT, dtype=int, device=device)
         wp.Mesh(points=points, indices=indices, groups=groups, bvh_constructor="cubql")
 
-    # winding number support is not available with cuBQL backend
+    # winding number support is not available with the cuBQL constructor
     with test.assertRaises(RuntimeError):
         points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device=device)
         indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device=device)
@@ -436,7 +442,7 @@ cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 class TestMesh(unittest.TestCase):
     def test_mesh_new_del(self):
-        # test the scenario in which a mesh is created but not initialized before gc
+        """Delete a mesh that was allocated without initialization."""
         instance = wp.Mesh.__new__(wp.Mesh)
         instance.__del__()
 

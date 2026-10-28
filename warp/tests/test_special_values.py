@@ -20,7 +20,7 @@ def getkernel(func, suffix=""):
 
 
 def test_infinity_scalar(test, device, dtype, register_kernels=False):
-    def check_infinity(outputs: wp.array(dtype=dtype), bool_outputs: wp.array(dtype=wp.bool)):
+    def check_infinity(outputs: wp.array[dtype], bool_outputs: wp.array[wp.bool]):
         outputs[0] = dtype(wp.inf)
         outputs[1] = dtype(-wp.inf)
         outputs[2] = dtype(2.0 * wp.inf)
@@ -70,7 +70,7 @@ def test_infinity_scalar(test, device, dtype, register_kernels=False):
 
 
 def test_nan_scalar(test, device, dtype, register_kernels=False):
-    def check_nan(outputs: wp.array(dtype=dtype), bool_outputs: wp.array(dtype=wp.bool)):
+    def check_nan(outputs: wp.array[dtype], bool_outputs: wp.array[wp.bool]):
         outputs[0] = dtype(wp.nan)
         outputs[1] = dtype(-wp.nan)
         outputs[2] = dtype(2.0 * wp.nan)
@@ -144,7 +144,7 @@ def test_nan_scalar(test, device, dtype, register_kernels=False):
 def test_is_special_vec(test, device, dtype, register_kernels=False):
     vector_type = wp.types.vector(5, dtype)
 
-    def check_special_vec(bool_outputs: wp.array(dtype=wp.bool)):
+    def check_special_vec(bool_outputs: wp.array[wp.bool]):
         zeros_vector = vector_type()
         bool_outputs[0] = wp.isfinite(zeros_vector)
         bool_outputs[1] = wp.isinf(zeros_vector)
@@ -189,7 +189,7 @@ def test_is_special_vec(test, device, dtype, register_kernels=False):
 def test_is_special_mat(test, device, dtype, register_kernels=False):
     mat_type = wp.types.matrix((5, 5), dtype)
 
-    def check_special_mat(bool_outputs: wp.array(dtype=wp.bool)):
+    def check_special_mat(bool_outputs: wp.array[wp.bool]):
         zeros_mat = mat_type()
         bool_outputs[0] = wp.isfinite(zeros_mat)
         bool_outputs[1] = wp.isinf(zeros_mat)
@@ -251,17 +251,19 @@ def assert_float_eq(test, actual, expected, msg):
 
 
 def test_minmax_scalar(test, device, dtype, register_kernels=False):
-    # wp.min / wp.max / wp.clamp follow C fmin/fmax semantics on float types
-    # (NaN-as-missing, symmetric). NumPy's np.fmin / np.fmax match this
-    # exactly for the NaN cases.
+    """Match C ``fmin``/``fmax`` semantics for ``wp.min``, ``wp.max``, and ``wp.clamp`` on float types.
+
+    The float semantics are NaN-as-missing and symmetric. NumPy's ``np.fmin`` and ``np.fmax`` match this exactly
+    for the NaN cases.
+    """
 
     def check_minmax(
-        a: wp.array(dtype=dtype),
-        b: wp.array(dtype=dtype),
-        mn: wp.array(dtype=dtype),
-        mx: wp.array(dtype=dtype),
-        cmn: wp.array(dtype=dtype),
-        cmx: wp.array(dtype=dtype),
+        a: wp.array[dtype],
+        b: wp.array[dtype],
+        mn: wp.array[dtype],
+        mx: wp.array[dtype],
+        cmn: wp.array[dtype],
+        cmx: wp.array[dtype],
     ):
         i = wp.tid()
         mn[i] = wp.min(a[i], b[i])
@@ -311,25 +313,26 @@ def test_minmax_scalar(test, device, dtype, register_kernels=False):
 
 
 def test_minmax_vec(test, device, dtype, register_kernels=False):
-    # Element-wise vec wp.min / wp.max applies fmin/fmax per component.
-    # Vector reduction folds with fmin/fmax so any non-NaN value wins
-    # regardless of position.
+    """Apply ``fmin``/``fmax`` per component for element-wise vector ``wp.min``/``wp.max``.
+
+    Vector reduction folds with ``fmin``/``fmax`` so any non-NaN value wins regardless of position.
+    """
     vec3_t = wp.types.vector(3, dtype)
 
     def check_vec_elementwise(
-        a: wp.array(dtype=vec3_t),
-        b: wp.array(dtype=vec3_t),
-        mn: wp.array(dtype=vec3_t),
-        mx: wp.array(dtype=vec3_t),
+        a: wp.array[vec3_t],
+        b: wp.array[vec3_t],
+        mn: wp.array[vec3_t],
+        mx: wp.array[vec3_t],
     ):
         i = wp.tid()
         mn[i] = wp.min(a[i], b[i])
         mx[i] = wp.max(a[i], b[i])
 
     def check_vec_reduce(
-        a: wp.array(dtype=vec3_t),
-        red_mn: wp.array(dtype=dtype),
-        red_mx: wp.array(dtype=dtype),
+        a: wp.array[vec3_t],
+        red_mn: wp.array[dtype],
+        red_mx: wp.array[dtype],
     ):
         i = wp.tid()
         red_mn[i] = wp.min(a[i])
@@ -394,16 +397,18 @@ def test_minmax_vec(test, device, dtype, register_kernels=False):
 
 
 def test_clamp_adjoint(test, device, dtype, register_kernels=False):
-    # adj_clamp follows the chain rule of min(max(a, x), b): when an input
-    # is NaN, the gradient routes to whichever of x/a/b the forward output
-    # depended on (rather than being silently dropped). E.g. clamp(NaN, a, b)
-    # returns min(a, b), so the gradient flows to that surviving bound.
+    """Route ``adj_clamp`` gradient to whichever input the forward output depended on.
+
+    ``adj_clamp`` follows the chain rule of ``min(max(a, x), b)``: when an input is NaN, the gradient routes to
+    whichever of ``x``/``a``/``b`` the forward output depended on, rather than being silently dropped. For example,
+    ``clamp(NaN, a, b)`` returns ``min(a, b)``, so the gradient flows to that surviving bound.
+    """
 
     def kern(
-        x: wp.array(dtype=dtype),
-        a: wp.array(dtype=dtype),
-        b: wp.array(dtype=dtype),
-        out: wp.array(dtype=dtype),
+        x: wp.array[dtype],
+        a: wp.array[dtype],
+        b: wp.array[dtype],
+        out: wp.array[dtype],
     ):
         i = wp.tid()
         out[i] = wp.clamp(x[i], a[i], b[i])
@@ -445,16 +450,18 @@ def test_clamp_adjoint(test, device, dtype, register_kernels=False):
 
 
 def test_minmax_reduction_adjoint(test, device, dtype, register_kernels=False):
-    # The reduction adjoint adj_min(vec) / adj_max(vec) must route the
-    # gradient to the index the forward picked. Critically, when v[0] is NaN,
-    # the forward fmin reduction skips NaN and picks the first non-NaN
-    # extremum; the adjoint must do the same (i.e. NOT route to slot 0).
+    """Route the vector reduction adjoint gradient to the index the forward reduction picked.
+
+    The reduction adjoint ``adj_min(vec)``/``adj_max(vec)`` must route the gradient to the index the forward picked.
+    When ``v[0]`` is NaN, the forward ``fmin`` reduction skips NaN and picks the first non-NaN extremum, and the
+    adjoint must do the same (not route to slot 0).
+    """
     vec3_t = wp.types.vector(3, dtype)
 
     def reduce_kern(
-        v: wp.array(dtype=vec3_t),
-        out_min: wp.array(dtype=dtype),
-        out_max: wp.array(dtype=dtype),
+        v: wp.array[vec3_t],
+        out_min: wp.array[dtype],
+        out_max: wp.array[dtype],
     ):
         i = wp.tid()
         out_min[i] = wp.min(v[i])
@@ -505,16 +512,16 @@ def test_minmax_reduction_adjoint(test, device, dtype, register_kernels=False):
 
 
 def test_atomic_minmax_adjoint(test, device, dtype, register_kernels=False):
-    # adj_atomic_min / adj_atomic_max accumulate the gradient onto `value`
-    # whenever the forward op committed `value`'s payload to the slot --
-    # including when both operands were NaN. The standard `value == *addr`
-    # check returns false for NaN==NaN, so adj_atomic_minmax in builtin.h
-    # has an explicit both-NaN branch to catch that case.
+    """Accumulate the ``adj_atomic_min``/``adj_atomic_max`` gradient onto ``value`` whenever the forward committed it.
+
+    This includes the case where both operands were NaN. The standard ``value == *addr`` check returns false for
+    ``NaN == NaN``, so ``adj_atomic_minmax`` in ``builtin.h`` has an explicit both-NaN branch to catch that case.
+    """
 
     def kern(
-        slot: wp.array(dtype=dtype),
-        value: wp.array(dtype=dtype),
-        out: wp.array(dtype=dtype),
+        slot: wp.array[dtype],
+        value: wp.array[dtype],
+        out: wp.array[dtype],
     ):
         i = wp.tid()
         out[i] = wp.atomic_min(slot, i, value[i])
@@ -556,19 +563,20 @@ def test_atomic_minmax_adjoint(test, device, dtype, register_kernels=False):
 
 
 def test_atomic_minmax(test, device, dtype, register_kernels=False):
-    # wp.atomic_min / wp.atomic_max behave like their non-atomic counterparts:
-    # a NaN already in the array is overwritten by a finite value, and a NaN
-    # value leaves the array unchanged when the slot holds a finite number.
-    # atomic_min / atomic_max do not support float16, so this test runs on
-    # float32 / float64 only.
+    """Match non-atomic ``min``/``max`` NaN behavior in ``wp.atomic_min``/``wp.atomic_max``.
+
+    A NaN already in the array is overwritten by a finite value, and a NaN value leaves the array unchanged when the
+    slot holds a finite number. ``atomic_min``/``atomic_max`` do not support float16, so this test runs on float32 and
+    float64 only.
+    """
 
     def kern(
-        a: wp.array(dtype=dtype),
-        b: wp.array(dtype=dtype),
-        in_min: wp.array(dtype=dtype),
-        in_max: wp.array(dtype=dtype),
-        ret_min: wp.array(dtype=dtype),
-        ret_max: wp.array(dtype=dtype),
+        a: wp.array[dtype],
+        b: wp.array[dtype],
+        in_min: wp.array[dtype],
+        in_max: wp.array[dtype],
+        ret_min: wp.array[dtype],
+        ret_max: wp.array[dtype],
     ):
         i = wp.tid()
         # a[i] is the array slot, b[i] is the value passed to atomic_min/max.
@@ -618,7 +626,7 @@ def test_atomic_minmax(test, device, dtype, register_kernels=False):
 def test_is_special_quat(test, device, dtype, register_kernels=False):
     quat_type = wp.types.quaternion(dtype)
 
-    def check_special_quat(bool_outputs: wp.array(dtype=wp.bool)):
+    def check_special_quat(bool_outputs: wp.array[wp.bool]):
         zeros_quat = quat_type()
         bool_outputs[0] = wp.isfinite(zeros_quat)
         bool_outputs[1] = wp.isinf(zeros_quat)
@@ -659,16 +667,17 @@ def test_is_special_quat(test, device, dtype, register_kernels=False):
 
 
 def test_copysign(test, device, dtype, register_kernels=False):
-    # Forward: wp.copysign(x, y) returns x with the sign bit of y. Covers
-    # finite inputs, signed zeros, and NaN x (whose magnitude is preserved
-    # but whose sign is replaced by y's). NaN y is platform-dependent for the
-    # CPU JIT (no signbit access without bit twiddling on that path), so it's
-    # not exercised here.
+    """Verify ``wp.copysign(x, y)`` returns ``x`` with the sign bit of ``y``.
+
+    Covers finite inputs, signed zeros, and NaN ``x`` (whose magnitude is preserved but whose sign is replaced by
+    ``y``'s). NaN ``y`` is platform-dependent for the CPU JIT (no ``signbit`` access without bit twiddling on that
+    path), so it is not exercised here.
+    """
 
     def kern(
-        x: wp.array(dtype=dtype),
-        y: wp.array(dtype=dtype),
-        out: wp.array(dtype=dtype),
+        x: wp.array[dtype],
+        y: wp.array[dtype],
+        out: wp.array[dtype],
     ):
         i = wp.tid()
         out[i] = wp.copysign(x[i], y[i])
@@ -710,13 +719,15 @@ def test_copysign(test, device, dtype, register_kernels=False):
 
 
 def test_copysign_adjoint(test, device, dtype, register_kernels=False):
-    # adj_copysign: d/dx is +1 when signs of x and y agree, -1 otherwise. d/dy
-    # is 0 almost everywhere (result depends on y only through its sign).
+    """Compute ``adj_copysign`` as +1 for ``d/dx`` when the signs of ``x`` and ``y`` agree and -1 otherwise.
+
+    ``d/dy`` is 0 almost everywhere (the result depends on ``y`` only through its sign).
+    """
 
     def kern(
-        x: wp.array(dtype=dtype),
-        y: wp.array(dtype=dtype),
-        out: wp.array(dtype=dtype),
+        x: wp.array[dtype],
+        y: wp.array[dtype],
+        out: wp.array[dtype],
     ):
         i = wp.tid()
         out[i] = wp.copysign(x[i], y[i])

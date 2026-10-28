@@ -45,6 +45,12 @@ typedef CUresult(CUDAAPI* PFN_cuGraphicsGLRegisterImage_v3000)(
     CUgraphicsResource* pCudaResource, wp::GLuint image, wp::GLenum target, unsigned int Flags
 );
 
+// function prototypes adapted from <cudaProfilerTypedefs.h>. We declare these locally to avoid
+// including the header, which pulls in <cudaProfiler.h>; that header ships only in the separate
+// cuda_profiler_api redist component, not the cuda_cudart component used by the builder images.
+typedef CUresult(CUDAAPI* PFN_cuProfilerStart_v4000)(void);
+typedef CUresult(CUDAAPI* PFN_cuProfilerStop_v4000)(void);
+
 
 // function pointers to driver API entry points
 // these are explicitly versioned according to cudaTypedefs.h from CUDA Toolkit WP_CUDA_TOOLKIT_VERSION
@@ -107,6 +113,7 @@ static PFN_cuModuleUnload_v2000 pfn_cuModuleUnload;
 static PFN_cuModuleGetFunction_v2000 pfn_cuModuleGetFunction;
 static PFN_cuLaunchKernel_v4000 pfn_cuLaunchKernel;
 static PFN_cuOccupancyMaxPotentialBlockSize_v6050 pfn_cuOccupancyMaxPotentialBlockSize;
+static PFN_cuOccupancyMaxActiveClusters_v11070 pfn_cuOccupancyMaxActiveClusters;
 static PFN_cuMemcpyPeerAsync_v4000 pfn_cuMemcpyPeerAsync;
 static PFN_cuPointerGetAttribute_v4000 pfn_cuPointerGetAttribute;
 static PFN_cuGraphicsMapResources_v3000 pfn_cuGraphicsMapResources;
@@ -118,11 +125,16 @@ static PFN_cuGraphicsSubResourceGetMappedArray_v3000 pfn_cuGraphicsSubResourceGe
 static PFN_cuGraphicsUnregisterResource_v3000 pfn_cuGraphicsUnregisterResource;
 static PFN_cuModuleGetGlobal_v3020 pfn_cuModuleGetGlobal;
 static PFN_cuFuncSetAttribute_v9000 pfn_cuFuncSetAttribute;
+static PFN_cuFuncGetAttribute_v2020 pfn_cuFuncGetAttribute;
 static PFN_cuIpcGetEventHandle_v4010 pfn_cuIpcGetEventHandle;
 static PFN_cuIpcOpenEventHandle_v4010 pfn_cuIpcOpenEventHandle;
 static PFN_cuIpcGetMemHandle_v4010 pfn_cuIpcGetMemHandle;
 static PFN_cuIpcOpenMemHandle_v11000 pfn_cuIpcOpenMemHandle;
 static PFN_cuIpcCloseMemHandle_v4010 pfn_cuIpcCloseMemHandle;
+
+// Profiler control functions
+static PFN_cuProfilerStart_v4000 pfn_cuProfilerStart;
+static PFN_cuProfilerStop_v4000 pfn_cuProfilerStop;
 
 // Texture functions
 static PFN_cuArrayCreate_v3020 pfn_cuArrayCreate;
@@ -277,6 +289,7 @@ bool init_cuda_driver()
     get_driver_entry_point("cuModuleGetFunction", 2000, &(void*&)pfn_cuModuleGetFunction);
     get_driver_entry_point("cuLaunchKernel", 4000, &(void*&)pfn_cuLaunchKernel);
     get_driver_entry_point("cuOccupancyMaxPotentialBlockSize", 6050, &(void*&)pfn_cuOccupancyMaxPotentialBlockSize);
+    get_driver_entry_point("cuOccupancyMaxActiveClusters", 11070, &(void*&)pfn_cuOccupancyMaxActiveClusters);
     get_driver_entry_point("cuMemcpyPeerAsync", 4000, &(void*&)pfn_cuMemcpyPeerAsync);
     get_driver_entry_point("cuPointerGetAttribute", 4000, &(void*&)pfn_cuPointerGetAttribute);
     get_driver_entry_point("cuGraphicsMapResources", 3000, &(void*&)pfn_cuGraphicsMapResources);
@@ -290,11 +303,16 @@ bool init_cuda_driver()
     get_driver_entry_point("cuGraphicsUnregisterResource", 3000, &(void*&)pfn_cuGraphicsUnregisterResource);
     get_driver_entry_point("cuModuleGetGlobal", 3020, &(void*&)pfn_cuModuleGetGlobal);
     get_driver_entry_point("cuFuncSetAttribute", 9000, &(void*&)pfn_cuFuncSetAttribute);
+    get_driver_entry_point("cuFuncGetAttribute", 2020, &(void*&)pfn_cuFuncGetAttribute);
     get_driver_entry_point("cuIpcGetEventHandle", 4010, &(void*&)pfn_cuIpcGetEventHandle);
     get_driver_entry_point("cuIpcOpenEventHandle", 4010, &(void*&)pfn_cuIpcOpenEventHandle);
     get_driver_entry_point("cuIpcGetMemHandle", 4010, &(void*&)pfn_cuIpcGetMemHandle);
     get_driver_entry_point("cuIpcOpenMemHandle", 11000, &(void*&)pfn_cuIpcOpenMemHandle);
     get_driver_entry_point("cuIpcCloseMemHandle", 4010, &(void*&)pfn_cuIpcCloseMemHandle);
+
+    // Profiler control functions
+    get_driver_entry_point("cuProfilerStart", 4000, &(void*&)pfn_cuProfilerStart);
+    get_driver_entry_point("cuProfilerStop", 4000, &(void*&)pfn_cuProfilerStop);
 
     // Texture functions
     get_driver_entry_point("cuArrayCreate", 3020, &(void*&)pfn_cuArrayCreate);
@@ -686,6 +704,10 @@ CUresult cuCtxPopCurrent_f(CUcontext* ctx)
 
 CUresult cuCtxSynchronize_f() { return pfn_cuCtxSynchronize ? pfn_cuCtxSynchronize() : DRIVER_ENTRY_POINT_ERROR; }
 
+CUresult cuProfilerStart_f() { return pfn_cuProfilerStart ? pfn_cuProfilerStart() : DRIVER_ENTRY_POINT_ERROR; }
+
+CUresult cuProfilerStop_f() { return pfn_cuProfilerStop ? pfn_cuProfilerStop() : DRIVER_ENTRY_POINT_ERROR; }
+
 CUresult cuCtxGetDevice_f(CUdevice* dev)
 {
     return pfn_cuCtxGetDevice ? pfn_cuCtxGetDevice(dev) : DRIVER_ENTRY_POINT_ERROR;
@@ -946,9 +968,20 @@ CUresult cuModuleGetGlobal_f(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, co
     return pfn_cuModuleGetGlobal ? pfn_cuModuleGetGlobal(dptr, bytes, hmod, name) : DRIVER_ENTRY_POINT_ERROR;
 }
 
+CUresult cuOccupancyMaxActiveClusters_f(int* numClusters, CUfunction func, const CUlaunchConfig* config)
+{
+    return pfn_cuOccupancyMaxActiveClusters ? pfn_cuOccupancyMaxActiveClusters(numClusters, func, config)
+                                            : DRIVER_ENTRY_POINT_ERROR;
+}
+
 CUresult cuFuncSetAttribute_f(CUfunction hfunc, CUfunction_attribute attrib, int value)
 {
     return pfn_cuFuncSetAttribute ? pfn_cuFuncSetAttribute(hfunc, attrib, value) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuFuncGetAttribute_f(int* pi, CUfunction_attribute attrib, CUfunction hfunc)
+{
+    return pfn_cuFuncGetAttribute ? pfn_cuFuncGetAttribute(pi, attrib, hfunc) : DRIVER_ENTRY_POINT_ERROR;
 }
 
 CUresult cuIpcGetEventHandle_f(CUipcEventHandle* pHandle, CUevent event)

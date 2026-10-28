@@ -17,8 +17,6 @@ from warp._src.fem.types import (
     make_free_sample,
 )
 
-_wp_module_name_ = "warp.fem.operator"
-
 
 class Integrand:
     """An integrand is a device function containing arbitrary expressions over :class:`Field` and :class:`Domain` variables.
@@ -399,6 +397,9 @@ def at_node(f: Field, s: Sample, node_index_in_elt: int | None = None):
     If ``f`` is a :class:`DiscreteField`, ``node_index_in_elt`` is required and indicates the element-local index of the node to consider.
     If ``f`` is a :class:`~warp.fem.field.TestField` or :class:`~warp.fem.field.TrialField`, ``node_index_in_elt`` **must not** be provided, and will be automatically set
     to the test (resp. trial) node currently being evaluated.
+
+    If ``f`` is a :class:`DiscreteField`, the returned sample carries no test or trial degree of freedom:
+    test and trial fields evaluate to zero there.
     """
     pass
 

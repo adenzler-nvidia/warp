@@ -19,6 +19,19 @@ namespace wp {
 // The radix sort in this file is consistently slower than the bitonic sort
 #define BITONIC_SORT_THRESHOLD 2048
 
+// Bitonic shuffles use fixed 32-lane groups; cross-group exchanges use shared
+// memory, so every shuffle below has a stride of at most 16 and stays inside its
+// group. The overloads below are not full-warp collectives when WP_TILE_WARP_SIZE
+// differs from WP_TILE_BITONIC_GROUP_SIZE.
+//
+// The group size is a property of the algorithm and stays 32 everywhere: the
+// stride-16 bound above is what keeps a 32-lane group correct, so it is not
+// overridable. Only the participation mask is lane-width dependent.
+#define WP_TILE_BITONIC_GROUP_SIZE 32
+#ifndef WP_TILE_BITONIC_GROUP_MASK
+#define WP_TILE_BITONIC_GROUP_MASK 0xffffffffu
+#endif
+
 struct UintKeyToUint {
     inline CUDA_CALLABLE uint32_t convert(uint32 value) { return value; }
 
@@ -96,6 +109,187 @@ constexpr inline CUDA_CALLABLE int next_higher_pow2(int input)
 
 // Bitonic sort fast pass for small arrays
 
+// half / float16 needs a dedicated overload: the generic template below resolves to
+// __shfl_xor_sync, which has no half overload, so half's implicit conversions make
+// the call ambiguous. Shuffle the raw bits instead.
+inline CUDA_CALLABLE half warp_shuffle_xor(half val, int lane_mask)
+{
+    unsigned int bits = static_cast<unsigned int>(val.u);
+    bits = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, bits, lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+
+    half result;
+    result.u = static_cast<unsigned short>(bits);
+    return result;
+}
+
+#ifndef WP_NO_BFLOAT16
+inline CUDA_CALLABLE bfloat16 warp_shuffle_xor(bfloat16 val, int lane_mask)
+{
+    unsigned int bits = static_cast<unsigned int>(val.u);
+    bits = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, bits, lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+
+    bfloat16 result;
+    result.u = static_cast<unsigned short>(bits);
+    return result;
+}
+#endif  // WP_NO_BFLOAT16
+
+template <typename T> inline CUDA_CALLABLE T warp_shuffle_xor(T val, int lane_mask)
+{
+    // Shuffle word-by-word over the raw bytes so any trivially-copyable value type
+    // (including quaternions and transforms, which __shfl_xor_sync has no overload
+    // for) is supported. Mirrors the generic warp_shuffle_down() fallback; see the
+    // comment there for why a plain word buffer is used instead of a union over T and
+    // why the buffers are over-aligned to max(alignof(T), alignof(Word)).
+    typedef unsigned int Word;
+
+    constexpr int word_count = (sizeof(T) + sizeof(Word) - 1) / sizeof(Word);
+
+    constexpr size_t buffer_align = alignof(T) > alignof(Word) ? alignof(T) : alignof(Word);
+
+    alignas(buffer_align) Word input[word_count] = {};
+    alignas(buffer_align) Word output[word_count] = {};
+
+    *reinterpret_cast<T*>(input) = val;
+
+    WP_PRAGMA_UNROLL
+    for (int i = 0; i < word_count; ++i) {
+        output[i] = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, input[i], lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+    }
+
+    return *reinterpret_cast<T*>(output);
+}
+
+template <unsigned Length, typename T>
+inline CUDA_CALLABLE wp::vec_t<Length, T> warp_shuffle_xor(wp::vec_t<Length, T> val, int lane_mask)
+{
+    wp::vec_t<Length, T> result;
+
+    for (unsigned i = 0; i < Length; ++i)
+        result[i] = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, val[i], lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+
+    return result;
+}
+
+template <unsigned Length>
+inline CUDA_CALLABLE wp::vec_t<Length, half> warp_shuffle_xor(wp::vec_t<Length, half> val, int lane_mask)
+{
+    wp::vec_t<Length, half> result;
+
+    for (unsigned i = 0; i < Length; ++i)
+        result[i] = warp_shuffle_xor(val[i], lane_mask);
+
+    return result;
+}
+
+#ifndef WP_NO_BFLOAT16
+template <unsigned Length>
+inline CUDA_CALLABLE wp::vec_t<Length, bfloat16> warp_shuffle_xor(wp::vec_t<Length, bfloat16> val, int lane_mask)
+{
+    wp::vec_t<Length, bfloat16> result;
+
+    for (unsigned i = 0; i < Length; ++i)
+        result[i] = warp_shuffle_xor(val[i], lane_mask);
+
+    return result;
+}
+#endif  // WP_NO_BFLOAT16
+
+template <unsigned Rows, unsigned Cols, typename T>
+inline CUDA_CALLABLE wp::mat_t<Rows, Cols, T> warp_shuffle_xor(wp::mat_t<Rows, Cols, T> val, int lane_mask)
+{
+    wp::mat_t<Rows, Cols, T> result;
+
+    for (unsigned i = 0; i < Rows; ++i)
+        for (unsigned j = 0; j < Cols; ++j)
+            result.data[i][j]
+                = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, val.data[i][j], lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+
+    return result;
+}
+
+template <unsigned Rows, unsigned Cols>
+inline CUDA_CALLABLE wp::mat_t<Rows, Cols, half> warp_shuffle_xor(wp::mat_t<Rows, Cols, half> val, int lane_mask)
+{
+    wp::mat_t<Rows, Cols, half> result;
+
+    for (unsigned i = 0; i < Rows; ++i)
+        for (unsigned j = 0; j < Cols; ++j)
+            result.data[i][j] = warp_shuffle_xor(val.data[i][j], lane_mask);
+
+    return result;
+}
+
+#ifndef WP_NO_BFLOAT16
+template <unsigned Rows, unsigned Cols>
+inline CUDA_CALLABLE wp::mat_t<Rows, Cols, bfloat16>
+warp_shuffle_xor(wp::mat_t<Rows, Cols, bfloat16> val, int lane_mask)
+{
+    wp::mat_t<Rows, Cols, bfloat16> result;
+
+    for (unsigned i = 0; i < Rows; ++i)
+        for (unsigned j = 0; j < Cols; ++j)
+            result.data[i][j] = warp_shuffle_xor(val.data[i][j], lane_mask);
+
+    return result;
+}
+#endif  // WP_NO_BFLOAT16
+
+template <typename T> inline CUDA_CALLABLE T* warp_shuffle_xor(T* val, int lane_mask)
+{
+    unsigned long long ptr = reinterpret_cast<unsigned long long>(val);
+    unsigned int ptr_lo = static_cast<unsigned int>(ptr);
+    unsigned int ptr_hi = static_cast<unsigned int>(ptr >> 32);
+    ptr_lo = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, ptr_lo, lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+    ptr_hi = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, ptr_hi, lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+    ptr = (static_cast<unsigned long long>(ptr_hi) << 32) | static_cast<unsigned long long>(ptr_lo);
+    return reinterpret_cast<T*>(ptr);
+}
+
+inline CUDA_CALLABLE wp::shape_t warp_shuffle_xor(wp::shape_t val, int lane_mask)
+{
+    wp::shape_t result;
+
+    for (int i = 0; i < wp::ARRAY_MAX_DIMS; ++i)
+        result.dims[i]
+            = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, val.dims[i], lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+
+    return result;
+}
+
+template <typename T> inline CUDA_CALLABLE wp::array_t<T> warp_shuffle_xor(wp::array_t<T> val, int lane_mask)
+{
+    wp::array_t<T> result;
+
+    result.data = wp::warp_shuffle_xor(val.data, lane_mask);
+    result.grad = wp::warp_shuffle_xor(val.grad, lane_mask);
+    result.shape = wp::warp_shuffle_xor(val.shape, lane_mask);
+    for (int i = 0; i < wp::ARRAY_MAX_DIMS; ++i)
+        result.strides[i]
+            = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, val.strides[i], lane_mask, WP_TILE_BITONIC_GROUP_SIZE);
+    result.ndim = static_cast<uint16_t>(__shfl_xor_sync(
+        WP_TILE_BITONIC_GROUP_MASK, static_cast<unsigned int>(val.ndim), lane_mask, WP_TILE_BITONIC_GROUP_SIZE
+    ));
+    result.flags = static_cast<uint16_t>(__shfl_xor_sync(
+        WP_TILE_BITONIC_GROUP_MASK, static_cast<unsigned int>(val.flags), lane_mask, WP_TILE_BITONIC_GROUP_SIZE
+    ));
+
+    return result;
+}
+
+template <typename T>
+inline CUDA_CALLABLE wp::indexedarray_t<T> warp_shuffle_xor(wp::indexedarray_t<T> val, int lane_mask)
+{
+    wp::indexedarray_t<T> result;
+
+    result.arr = wp::warp_shuffle_xor(val.arr, lane_mask);
+    for (int i = 0; i < wp::ARRAY_MAX_DIMS; ++i)
+        result.indices[i] = wp::warp_shuffle_xor(val.indices[i], lane_mask);
+    result.shape = wp::warp_shuffle_xor(val.shape, lane_mask);
+
+    return result;
+}
+
 template <typename T> inline CUDA_CALLABLE T shfl_xor(unsigned int thread_id, T* sh_mem, unsigned int lane_mask)
 {
     unsigned int source_lane = thread_id ^ lane_mask;
@@ -121,7 +315,7 @@ inline CUDA_CALLABLE void bitonic_sort_single_stage_full_thread_block(
         int thread_id2 = loop_id * WP_TILE_BLOCK_DIM + thread_id;
 
         key_register[loop_id] = thread_id2 < length ? key_sh_mem[thread_id2] : max_key_value;
-        val_register[loop_id] = thread_id2 < length ? val_sh_mem[thread_id2] : static_cast<V>(0);
+        val_register[loop_id] = thread_id2 < length ? val_sh_mem[thread_id2] : V {};
     }
 
     __syncthreads();
@@ -155,24 +349,23 @@ inline CUDA_CALLABLE void bitonic_sort_single_stage_full_thread_block(
     __syncthreads();
 }
 
-// stride can be 1, 2, 4, 8, 16
 template <typename K, typename V>
 inline CUDA_CALLABLE void bitonic_sort_single_stage_full_warp(int k, unsigned int thread_id, int stride, K& key, V& val)
 {
-    auto s_key = __shfl_xor_sync(0xFFFFFFFFu, key, stride);
-    auto s_val = __shfl_xor_sync(0xFFFFFFFFu, val, stride);
+    auto s_key = __shfl_xor_sync(WP_TILE_BITONIC_GROUP_MASK, key, stride, WP_TILE_BITONIC_GROUP_SIZE);
+    auto s_val = warp_shuffle_xor(val, stride);
     auto swap = (((thread_id & stride) != 0 ? key > s_key : key < s_key)) ^ ((thread_id & k) == 0);
     key = swap ? s_key : key;
     val = swap ? s_val : val;
 }
 
 
-// Sorts 32 elements according to keys
+// Sorts one 32-lane subwarp's worth of elements according to keys
 template <typename K, typename V>
 inline CUDA_CALLABLE void bitonic_sort_single_warp(unsigned int thread_id, K& key, V& val)
 {
 #pragma unroll
-    for (int k = 2; k <= 32; k <<= 1) {
+    for (int k = 2; k <= WP_TILE_BITONIC_GROUP_SIZE; k <<= 1) {
 #pragma unroll
         for (int stride = k / 2; stride > 0; stride >>= 1) {
             bitonic_sort_single_stage_full_warp(k, thread_id, stride, key, val);
@@ -192,6 +385,8 @@ bitonic_sort_single_warp(int thread_id, K* keys_input, V* values_input, int num_
     V value;
     if (thread_id < num_elements_to_sort)
         value = values_input[thread_id];
+    else
+        value = V {};
 
     __syncwarp();
     bitonic_sort_single_warp(thread_id, key, value);
@@ -218,8 +413,7 @@ bitonic_sort_pow2_length(unsigned int thread_id, K* key_sh_mem, V* val_sh_mem, i
     for (int loop_id = 0; loop_id < num_loops; ++loop_id) {
         int thread_id2 = loop_id * WP_TILE_BLOCK_DIM + thread_id;
         key[loop_id] = thread_id2 < length ? key_sh_mem[thread_id2] : key_max_possible_value;
-        if (thread_id2 < length)
-            val[loop_id] = val_sh_mem[thread_id2];
+        val[loop_id] = thread_id2 < length ? val_sh_mem[thread_id2] : V {};
     }
 
     __syncthreads();
@@ -294,9 +488,9 @@ template <int max_num_elements, typename K, typename V, typename KeyToUint>
 inline CUDA_CALLABLE void
 bitonic_sort_thread_block_shared_mem(int thread_id, K* keys_input, V* values_input, int num_elements_to_sort)
 {
-    if constexpr (max_num_elements < 32) {
+    if constexpr (max_num_elements < WP_TILE_BITONIC_GROUP_SIZE) {
         // Fast track - single warp sort
-        if (thread_id < 32)
+        if (thread_id < WP_TILE_BITONIC_GROUP_SIZE)
             bitonic_sort_single_warp<K, V, KeyToUint>(thread_id, keys_input, values_input, num_elements_to_sort);
         __syncthreads();
     } else {
@@ -317,7 +511,7 @@ bitonic_sort_thread_block_shared_mem(int thread_id, K* keys_input, V* values_inp
             } else {
                 // Note that these values may end up in the output If enough NaN or Inf values are present in keys_input
                 keys_shared_mem[i] = key_max_possible_value;
-                values_shared_mem[i] = static_cast<V>(0);
+                values_shared_mem[i] = V {};
             }
         }
         __syncthreads();
@@ -393,9 +587,9 @@ template <int max_num_elements, typename K, typename V, typename KeyToUint>
 inline CUDA_CALLABLE void
 bitonic_sort_thread_block_direct(int thread_id, K* keys_input, V* values_input, int num_elements_to_sort)
 {
-    if constexpr (max_num_elements < 32) {
+    if constexpr (max_num_elements < WP_TILE_BITONIC_GROUP_SIZE) {
         // Fast track - single warp sort
-        if (thread_id < 32)
+        if (thread_id < WP_TILE_BITONIC_GROUP_SIZE)
             bitonic_sort_single_warp<K, V, KeyToUint>(thread_id, keys_input, values_input, num_elements_to_sort);
         __syncthreads();
     } else {
@@ -460,25 +654,84 @@ bitonic_sort_thread_block_direct(int thread_id, uint64_t* keys_input, V* values_
     );
 }
 
-// End bitonic sort
+// The bitonic sorts above shuffle keys within fixed 32-lane groups, so they need whole groups.
+constexpr bool tile_sort_block_has_whole_bitonic_groups = WP_TILE_BLOCK_DIM % WP_TILE_BITONIC_GROUP_SIZE == 0;
 
-inline CUDA_CALLABLE int warp_scan_inclusive(int lane, unsigned int ballot_mask)
+// The radix sort below reads per-warp totals from the last lane of each warp, so it needs whole warps.
+constexpr bool tile_sort_block_has_whole_warps = WP_TILE_BLOCK_DIM % WP_TILE_WARP_SIZE == 0;
+
+template <typename K, typename V>
+inline CUDA_CALLABLE void compare_and_swap_ascending(K* keys, V* values, int i, int j, int length)
 {
-    uint32_t mask = ((1u << (lane + 1)) - 1);
-    return __popc(ballot_mask & mask);
+    // Positions at or beyond length hold virtual +inf keys that never move.
+    if (j < length && keys[j] < keys[i]) {
+        // Read both pairs before writing either, so the swap stays correct when keys and values
+        // are the same tile.
+        const K key_i = keys[i];
+        const K key_j = keys[j];
+        const V value_i = values[i];
+        const V value_j = values[j];
+
+        keys[i] = key_j;
+        keys[j] = key_i;
+        values[i] = value_j;
+        values[j] = value_i;
+    }
 }
 
-inline CUDA_CALLABLE int warp_scan_inclusive(int lane, unsigned int mask, bool thread_contributes_element)
+// Sorts in place with any block dimension, using only shared memory and block barriers.
+// Every comparator moves the smaller key to the lower position, so the network sorts
+// next_higher_pow2(length) positions without padding the keys beyond length.
+template <typename K, typename V>
+inline CUDA_CALLABLE void bitonic_sort_thread_block_any_dim(int thread_id, K* keys, V* values, int length)
+{
+    const int num_pairs = next_higher_pow2(length) / 2;
+
+    __syncthreads();
+    for (int k = 2; k <= 2 * num_pairs; k <<= 1) {
+        // Merge each pair of sorted runs of length k / 2 by comparing mirrored positions.
+        const int run_length = k / 2;
+        for (int pair = thread_id; pair < num_pairs; pair += WP_TILE_BLOCK_DIM) {
+            const int offset = pair & (run_length - 1);
+            const int base = (pair - offset) * 2;
+            compare_and_swap_ascending(keys, values, base + offset, base + k - 1 - offset, length);
+        }
+        __syncthreads();
+
+        // Each half is now bitonic, so finish the merge with half cleaners.
+        for (int stride = k / 4; stride > 0; stride >>= 1) {
+            for (int pair = thread_id; pair < num_pairs; pair += WP_TILE_BLOCK_DIM) {
+                const int i = 2 * pair - (pair & (stride - 1));
+                compare_and_swap_ascending(keys, values, i, i + stride, length);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// End bitonic sort
+
+// Position of `lane` among the lanes set in `ballot_mask`, counting itself.
+inline CUDA_CALLABLE int warp_scan_inclusive(int lane, wp_tile_lane_mask_bits_t ballot_mask)
+{
+    // Lanes 0..lane inclusive: LANES_BELOW(lane) is exclusive, so add this lane.
+    wp_tile_lane_mask_bits_t mask
+        = WP_TILE_LANE_MASK_BELOW(lane) | (((wp_tile_lane_mask_bits_t)1) << (wp_tile_lane_mask_bits_t)lane);
+    return (int)WP_TILE_LANE_MASK_POPC(ballot_mask & mask);
+}
+
+inline CUDA_CALLABLE int warp_scan_inclusive(int lane, wp_tile_lane_mask_bits_t mask, bool thread_contributes_element)
 {
     return warp_scan_inclusive(lane, __ballot_sync(mask, thread_contributes_element));
 }
 
 template <typename T> inline CUDA_CALLABLE T warp_scan_inclusive(int lane, T value)
 {
-// Computes an inclusive cumulative sum
+// Computes an inclusive cumulative sum over the warp: one doubling step per
+// bit of WP_TILE_WARP_SIZE.
 #pragma unroll
-    for (int i = 1; i <= 32; i *= 2) {
-        auto n = __shfl_up_sync(0xffffffffu, value, i, 32);
+    for (int i = 1; i < WP_TILE_WARP_SIZE; i *= 2) {
+        auto n = __shfl_up_sync(WP_TILE_LANE_MASK_ALL, value, i, WP_TILE_WARP_SIZE);
 
         if (lane >= i)
             value = value + n;
@@ -501,15 +754,15 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
 
     int num_bits_to_sort = 32;  // Sort all bits because that's what the bitonic fast pass does as well
 
-    const int warp_id = thread_id / 32;
-    const int lane_id = thread_id & 31;
+    // shared_mem holds one row per tile warp, so warp_id must be derived from
+    // the same WP_TILE_WARP_SIZE the callers use to size it.
+    const int warp_id = thread_id / WP_TILE_WARP_SIZE;
+    const int lane_id = thread_id & (WP_TILE_WARP_SIZE - 1);
 
     const int bits_per_pass
         = 4;  // Higher than 5 is currently not supported - 2^5=32 is the warp size and is still just fine
     const int lowest_bits_mask = (1 << bits_per_pass) - 1;
     const int num_scan_buckets = (1 << bits_per_pass);
-
-    const int num_warp_passes = (num_scan_buckets + num_warps - 1) / num_warps;
 
     __shared__ int buckets[num_scan_buckets];
     __shared__ int buckets2[num_scan_buckets];
@@ -536,17 +789,17 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
 
             for (int b = 0; b < num_scan_buckets; b++) {
                 bool contributes = digit == b;
-                int sum_per_warp = warp_scan_inclusive(lane_id, 0xFFFFFFFF, contributes);
+                int sum_per_warp = warp_scan_inclusive(lane_id, WP_TILE_LANE_MASK_ALL, contributes);
 
-                if (lane_id == 31)
+                if (lane_id == WP_TILE_WARP_SIZE - 1)
                     shared_mem[warp_id][b] = sum_per_warp;
             }
             __syncthreads();
 
-            for (int b = warp_id; b < num_warp_passes * num_warps; b += num_warps) {
+            for (int b = warp_id; b < num_scan_buckets; b += num_warps) {
                 int f = lane_id < num_warps ? shared_mem[lane_id][b] : 0;
                 f = warp_scan_inclusive(lane_id, f);
-                if (lane_id == 31)
+                if (lane_id == WP_TILE_WARP_SIZE - 1)
                     buckets[b] += f;
             }
             __syncthreads();
@@ -570,13 +823,14 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
 #endif
 
         if (warp_id == 0) {
-            int value = lane_id < num_scan_buckets ? buckets[lane_id] : 0;
-            value = warp_scan_exclusive(lane_id, value);
+            int count = lane_id < num_scan_buckets ? buckets[lane_id] : 0;
+            int value = warp_scan_exclusive(lane_id, count);
             if (lane_id < num_scan_buckets)
                 buckets_cumulative_sum[lane_id] = value;
 
+            // The exclusive sum stops short of the last bucket, so add its count to get the total.
             if (lane_id == num_scan_buckets - 1)
-                assert(value == num_elements_to_sort);
+                assert(value + count == num_elements_to_sort);
         }
 
         __syncthreads();
@@ -617,8 +871,8 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
 
             for (int b = 0; b < num_scan_buckets; b++) {
                 bool contributes = digit == b;
-                int sum_per_warp = warp_scan_inclusive(lane_id, 0xFFFFFFFF, contributes);
-                if (lane_id == 31)
+                int sum_per_warp = warp_scan_inclusive(lane_id, WP_TILE_LANE_MASK_ALL, contributes);
+                if (lane_id == WP_TILE_WARP_SIZE - 1)
                     shared_mem[warp_id][b] = sum_per_warp;
 
                 if (contributes)
@@ -633,12 +887,12 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
 
                 int f = lane_id < num_warps ? shared_mem[lane_id][b] : 0;
                 int inclusive_scan = warp_scan_inclusive(lane_id, f);
-                if (lane_id == 31 && warp_id == 0) {
+                if (lane_id == WP_TILE_WARP_SIZE - 1 && warp_id == 0) {
                     buckets2[b] += inclusive_scan;
                 }
 
                 int warp_offset = __shfl_sync(
-                    0xFFFFFFFF, inclusive_scan - f, warp_id
+                    WP_TILE_LANE_MASK_ALL, inclusive_scan - f, warp_id
                 );  //-f because warp_offset needs to be an exclusive scan
 
                 bool contributes = digit == b;
@@ -693,14 +947,6 @@ inline CUDA_CALLABLE void radix_sort_thread_block_core(
                 values_tmp[j] = values_input[j];
             }
         }
-
-        auto tmp = keys_tmp;
-        keys_tmp = keys_input;
-        keys_input = tmp;
-
-        auto tmp2 = values_tmp;
-        values_tmp = values_input;
-        values_input = tmp2;
     }
 }
 
@@ -752,7 +998,9 @@ template <typename TileK, typename TileV> CUDA_CALLABLE_DEVICE void tile_sort(Ti
 
     // Trim away the code that won't be used - possible because the number of elements to sort is known at compile time
     if constexpr (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
-        if constexpr (is_power_of_two(num_elements_to_sort))
+        if constexpr (!tile_sort_block_has_whole_bitonic_groups)
+            bitonic_sort_thread_block_any_dim(WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort);
+        else if constexpr (is_power_of_two(num_elements_to_sort))
             bitonic_sort_thread_block_direct<num_elements_to_sort, V>(
                 WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort
             );
@@ -760,6 +1008,8 @@ template <typename TileK, typename TileV> CUDA_CALLABLE_DEVICE void tile_sort(Ti
             bitonic_sort_thread_block_shared_mem<num_elements_to_sort, V>(
                 WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort
             );
+    } else if constexpr (!tile_sort_block_has_whole_warps) {
+        bitonic_sort_thread_block_any_dim(WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort);
     } else {
         __shared__ T keys_tmp[num_elements_to_sort];
         __shared__ V values_tmp[num_elements_to_sort];
@@ -786,7 +1036,9 @@ CUDA_CALLABLE_DEVICE void tile_sort(TileK& t, TileV& t2, int start, int length)
     V* values = &t2.data(start);
 
     if (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
-        if (is_power_of_two(num_elements_to_sort))
+        if constexpr (!tile_sort_block_has_whole_bitonic_groups)
+            bitonic_sort_thread_block_any_dim(WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort);
+        else if (is_power_of_two(num_elements_to_sort))
             bitonic_sort_thread_block_direct<max_elements_to_sort, V>(
                 WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort
             );
@@ -794,6 +1046,8 @@ CUDA_CALLABLE_DEVICE void tile_sort(TileK& t, TileV& t2, int start, int length)
             bitonic_sort_thread_block_shared_mem<max_elements_to_sort, V>(
                 WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort
             );
+    } else if constexpr (!tile_sort_block_has_whole_warps) {
+        bitonic_sort_thread_block_any_dim(WP_TILE_THREAD_IDX, keys, values, num_elements_to_sort);
     } else {
         if constexpr (max_elements_to_sort > BITONIC_SORT_THRESHOLD) {
             __shared__ T keys_tmp[max_elements_to_sort];
@@ -845,16 +1099,27 @@ void bitonic_sort_pairs_general_size_cpu(K* keys, V* values, int length)
 {
     constexpr int pow2_size = next_higher_pow2(max_size);
 
-    K keys_tmp[pow2_size];
-    V values_tmp[pow2_size];
+    K keys_local[WP_TILE_BLOCK_DIM == 1 ? pow2_size : 1];
+    V values_local[WP_TILE_BLOCK_DIM == 1 ? pow2_size : 1];
+    K* keys_tmp = keys_local;
+    V* values_tmp = values_local;
+    if constexpr (WP_TILE_BLOCK_DIM > 1) {
+        keys_tmp = (K*)malloc(sizeof(K) * pow2_size);
+        values_tmp = (V*)malloc(sizeof(V) * pow2_size);
+        if (!keys_tmp || !values_tmp) {
+            free(keys_tmp);
+            free(values_tmp);
+            _wp_assert("Warp CPU tile sort temporary allocation failed", __FILE__, (unsigned int)__LINE__);
+            return;
+        }
+    }
 
     KeyToUint converter;
     K max_key = converter.max_possible_key_value();
 
     for (int i = 0; i < pow2_size; ++i) {
         keys_tmp[i] = i < length ? keys[i] : max_key;
-        if (i < length)
-            values_tmp[i] = values[i];
+        values_tmp[i] = i < length ? values[i] : V {};
     }
 
     bitonic_sort_pairs_pow2_length_cpu(keys_tmp, values_tmp, pow2_size);
@@ -862,6 +1127,11 @@ void bitonic_sort_pairs_general_size_cpu(K* keys, V* values, int length)
     for (int i = 0; i < length; ++i) {
         keys[i] = keys_tmp[i];
         values[i] = values_tmp[i];
+    }
+
+    if constexpr (WP_TILE_BLOCK_DIM > 1) {
+        free(values_tmp);
+        free(keys_tmp);
     }
 }
 
@@ -895,8 +1165,17 @@ template <typename K, typename V, typename KeyToUint>
 void radix_sort_pairs_cpu_core(K* keys, K* aux_keys, V* values, V* aux_values, int n)
 {
     KeyToUint converter;
-    unsigned int tables[2][1 << 16];
-    memset(tables, 0, sizeof(tables));
+    constexpr size_t table_size = sizeof(unsigned int) * 2 * (1 << 16);
+    unsigned int tables_local[WP_TILE_BLOCK_DIM == 1 ? 2 * (1 << 16) : 1];
+    auto tables = (unsigned int (*)[1 << 16]) tables_local;
+    if constexpr (WP_TILE_BLOCK_DIM > 1) {
+        tables = (unsigned int (*)[1 << 16]) malloc(table_size);
+        if (!tables) {
+            _wp_assert("Warp CPU tile radix-sort table allocation failed", __FILE__, (unsigned int)__LINE__);
+            return;
+        }
+    }
+    memset(tables, 0, table_size);
 
     // build histograms
     for (int i = 0; i < n; ++i) {
@@ -952,6 +1231,9 @@ void radix_sort_pairs_cpu_core(K* keys, K* aux_keys, V* values, V* aux_values, i
         keys[offset] = f;
         values[offset] = v;
     }
+
+    if constexpr (WP_TILE_BLOCK_DIM > 1)
+        free(tables);
 }
 
 template <typename V>
@@ -992,17 +1274,34 @@ template <typename TileK, typename TileV> void tile_sort(TileK& t, TileV& t2)
     T* keys = &t.data(0);
     V* values = &t2.data(0);
 
-    // Trim away the code that won't be used - possible because the number of elements to sort is known at compile time
-    if constexpr (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
-        if constexpr (is_power_of_two(num_elements_to_sort))
-            bitonic_sort_pairs_pow2_length_cpu<T, V>(keys, values, num_elements_to_sort);
-        else
-            bitonic_sort_pairs_general_size_cpu<V, num_elements_to_sort>(keys, values, num_elements_to_sort);
-    } else {
-        T keys_tmp[num_elements_to_sort];
-        V values_tmp[num_elements_to_sort];
-
-        radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+    // Shared input tiles must be fully populated before the serial phase.
+    WP_TILE_SYNC();
+    int first_active_lane = 0;
+    if constexpr (WP_TILE_BLOCK_DIM > 1)
+        first_active_lane = wp_cpu_get_first_active_lane();
+    if (WP_TILE_THREAD_IDX == first_active_lane) {
+        if constexpr (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
+            if constexpr (is_power_of_two(num_elements_to_sort))
+                bitonic_sort_pairs_pow2_length_cpu<T, V>(keys, values, num_elements_to_sort);
+            else
+                bitonic_sort_pairs_general_size_cpu<V, num_elements_to_sort>(keys, values, num_elements_to_sort);
+        } else if constexpr (WP_TILE_BLOCK_DIM == 1) {
+            T keys_tmp[num_elements_to_sort];
+            V values_tmp[num_elements_to_sort];
+            radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+        } else {
+            T* keys_tmp = (T*)malloc(sizeof(T) * num_elements_to_sort);
+            V* values_tmp = (V*)malloc(sizeof(V) * num_elements_to_sort);
+            if (!keys_tmp || !values_tmp) {
+                free(keys_tmp);
+                free(values_tmp);
+                _wp_assert("Warp CPU tile radix-sort temporary allocation failed", __FILE__, (unsigned int)__LINE__);
+            } else {
+                radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+                free(values_tmp);
+                free(keys_tmp);
+            }
+        }
     }
 
     WP_TILE_SYNC();
@@ -1018,17 +1317,36 @@ template <typename TileK, typename TileV> void tile_sort(TileK& t, TileV& t2, in
     T* keys = &t.data(start);
     V* values = &t2.data(start);
 
-    if (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
-        if (is_power_of_two(num_elements_to_sort))
-            bitonic_sort_pairs_pow2_length_cpu<T, V>(keys, values, num_elements_to_sort);
-        else
-            bitonic_sort_pairs_general_size_cpu<V, max_elements_to_sort>(keys, values, num_elements_to_sort);
-    } else {
-        if constexpr (max_elements_to_sort > BITONIC_SORT_THRESHOLD) {
-            T keys_tmp[max_elements_to_sort];
-            V values_tmp[max_elements_to_sort];
-
-            radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+    WP_TILE_SYNC();
+    int first_active_lane = 0;
+    if constexpr (WP_TILE_BLOCK_DIM > 1)
+        first_active_lane = wp_cpu_get_first_active_lane();
+    if (WP_TILE_THREAD_IDX == first_active_lane) {
+        if (num_elements_to_sort <= BITONIC_SORT_THRESHOLD || sizeof(T) > 4) {
+            if (is_power_of_two(num_elements_to_sort))
+                bitonic_sort_pairs_pow2_length_cpu<T, V>(keys, values, num_elements_to_sort);
+            else
+                bitonic_sort_pairs_general_size_cpu<V, max_elements_to_sort>(keys, values, num_elements_to_sort);
+        } else if constexpr (max_elements_to_sort > BITONIC_SORT_THRESHOLD) {
+            if constexpr (WP_TILE_BLOCK_DIM == 1) {
+                T keys_tmp[max_elements_to_sort];
+                V values_tmp[max_elements_to_sort];
+                radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+            } else {
+                T* keys_tmp = (T*)malloc(sizeof(T) * max_elements_to_sort);
+                V* values_tmp = (V*)malloc(sizeof(V) * max_elements_to_sort);
+                if (!keys_tmp || !values_tmp) {
+                    free(keys_tmp);
+                    free(values_tmp);
+                    _wp_assert(
+                        "Warp CPU tile radix-sort temporary allocation failed", __FILE__, (unsigned int)__LINE__
+                    );
+                } else {
+                    radix_sort_pairs_cpu<V>(keys, keys_tmp, values, values_tmp, num_elements_to_sort);
+                    free(values_tmp);
+                    free(keys_tmp);
+                }
+            }
         }
     }
 
@@ -1039,14 +1357,15 @@ template <typename TileK, typename TileV> void tile_sort(TileK& t, TileV& t2, in
 #endif  // !defined(__CUDA_ARCH__)
 
 
-template <typename TileK, typename TileV> inline void adj_tile_sort(TileK& t, TileV& t2, TileK& adj_t1, TileV& adj_t2)
+template <typename TileK, typename TileV>
+inline CUDA_CALLABLE void adj_tile_sort(TileK& t, TileV& t2, TileK& adj_t1, TileV& adj_t2)
 {
     // MISSINGADJOINT: track permutation indices in forward pass, apply inverse permutation to
     // adj outputs
 }
 
 template <typename TileK, typename TileV>
-inline void
+inline CUDA_CALLABLE void
 adj_tile_sort(TileK& t, TileV& t2, int start, int length, TileK& adj_t1, TileV& adj_t2, int adj_start, int adj_length)
 {
     // MISSINGADJOINT: track permutation indices in forward pass, apply inverse

@@ -19,7 +19,7 @@ TILE_N = 4
 
 
 def test_tile_axpy_shared_register(test, device):
-    """Fused dest += src * alpha with shared dest, register src."""
+    """Test fused dest += src * alpha with shared dest, register src."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def compute(
@@ -49,7 +49,7 @@ def test_tile_axpy_shared_register(test, device):
 
 
 def test_tile_axpy_shared_shared(test, device):
-    """Fused dest += src * alpha with both tiles in shared memory."""
+    """Test fused dest += src * alpha with both tiles in shared memory."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def compute(
@@ -79,7 +79,7 @@ def test_tile_axpy_shared_shared(test, device):
 
 
 def test_tile_axpy_1d(test, device):
-    """tile_axpy with 1-D tiles."""
+    """Test tile_axpy with 1-D tiles."""
     N = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -110,7 +110,7 @@ def test_tile_axpy_1d(test, device):
 
 
 def test_tile_axpy_register_register(test, device):
-    """Fused dest += src * alpha with both tiles in register storage."""
+    """Test fused dest += src * alpha with both tiles in register storage."""
     N = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -141,7 +141,7 @@ def test_tile_axpy_register_register(test, device):
 
 
 def test_tile_axpy_zero_alpha(test, device):
-    """tile_axpy with alpha=0 should leave dest unchanged."""
+    """Verify that tile_axpy with alpha=0 should leave dest unchanged."""
     N = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -174,7 +174,7 @@ def test_tile_axpy_zero_alpha(test, device):
 
 
 def test_tile_axpy_grad(test, device):
-    """Gradient flows through tile_axpy for src and alpha."""
+    """Verify that gradient flows through tile_axpy for src and alpha."""
     N = 16
 
     @wp.kernel(module="unique")
@@ -225,8 +225,8 @@ def test_tile_axpy_grad(test, device):
 # ---- tile_dot forward tests ----
 
 
-def test_tile_dot_basic(test, device):
-    """Basic dot product of two tiles returns correct single-element tile."""
+def test_tile_dot_register_shared(test, device):
+    """Compute a dot product between register and shared tiles."""
     N = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -255,7 +255,7 @@ def test_tile_dot_basic(test, device):
 
 
 def test_tile_dot_nonuniform(test, device):
-    """Dot product with non-uniform values."""
+    """Test dot product with non-uniform values."""
     N = 32
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -284,7 +284,7 @@ def test_tile_dot_nonuniform(test, device):
 
 
 def test_tile_dot_2d(test, device):
-    """Dot product of 2-D tiles (flattened element-wise)."""
+    """Test dot product of 2-D tiles (flattened element-wise)."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def compute(
@@ -312,7 +312,7 @@ def test_tile_dot_2d(test, device):
 
 
 def test_tile_dot_shared_shared(test, device):
-    """Dot product with both tiles in shared storage."""
+    """Test dot product with both tiles in shared storage."""
     N = 64
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -344,7 +344,7 @@ def test_tile_dot_shared_shared(test, device):
 
 
 def test_tile_dot_grad_shared(test, device):
-    """Gradient flows through tile_dot with shared-storage operands."""
+    """Verify that gradient flows through tile_dot with shared-storage operands."""
     N = 16
 
     @wp.kernel(module="unique")
@@ -380,7 +380,7 @@ def test_tile_dot_grad_shared(test, device):
 
 
 def test_tile_dot_grad(test, device):
-    """Gradient flows correctly through tile_dot."""
+    """Verify that gradient flows correctly through tile_dot."""
     N = 16
 
     @wp.kernel(module="unique")
@@ -418,7 +418,7 @@ def test_tile_dot_grad(test, device):
 
 
 def test_tile_dot_grad_extract(test, device):
-    """Gradient propagates correctly when tile_extract is used on tile_dot result.
+    """Verify that gradient propagates correctly when tile_extract is used on tile_dot result.
 
     Uses tile_extract to obtain the scalar, then a single-thread write.
     This exercises the adjoint broadcast path: adj_tile_extract writes the
@@ -462,7 +462,7 @@ def test_tile_dot_grad_extract(test, device):
 
 
 def test_tile_dot_grad_extract_shared(test, device):
-    """Same as test_tile_dot_grad_extract but with shared-storage operands."""
+    """Test extracted dot-product gradients with shared-storage operands."""
     N = 16
 
     @wp.kernel(module="unique")
@@ -499,8 +499,50 @@ def test_tile_dot_grad_extract_shared(test, device):
     assert_np_equal(b_in.grad.numpy(), a_np, tol=1e-4)
 
 
+def test_tile_dot_float(test, device):
+    """Verify that tile_dot preserves the scalar dtype of its operands across float widths."""
+    N = 64
+
+    def run(wp_dtype, rtol):
+        np_dtype = wp.dtype_to_numpy(wp_dtype)
+
+        @wp.kernel
+        def compute(
+            a_in: wp.array[wp_dtype],
+            b_in: wp.array[wp_dtype],
+            out: wp.array[wp_dtype],
+        ):
+            a = wp.tile_load(a_in, shape=N, offset=0, storage="register")
+            b = wp.tile_load(b_in, shape=N, offset=0, storage="shared")
+            result = wp.tile_dot(a, b)
+            wp.tile_store(out, result)
+
+        a_np = (np.arange(N) % 4).astype(np_dtype)
+        b_np = (np.arange(N) % 3).astype(np_dtype)
+
+        a_in = wp.array(a_np, dtype=wp_dtype, requires_grad=True, device=device)
+        b_in = wp.array(b_np, dtype=wp_dtype, requires_grad=True, device=device)
+        out = wp.zeros(1, dtype=wp_dtype, requires_grad=True, device=device)
+
+        with wp.Tape() as tape:
+            wp.launch_tiled(compute, dim=[1], inputs=[a_in, b_in, out], block_dim=BLOCK_DIM, device=device)
+
+        expected = np.dot(a_np.astype(np.float64), b_np.astype(np.float64))
+        np.testing.assert_allclose(out.numpy()[0].astype(np.float64), expected, rtol=rtol)
+
+        # d(dot)/da = b, d(dot)/db = a
+        out.grad = wp.ones_like(out, device=device)
+        tape.backward()
+        np.testing.assert_allclose(a_in.grad.numpy().astype(np.float64), b_np.astype(np.float64), rtol=rtol)
+        np.testing.assert_allclose(b_in.grad.numpy().astype(np.float64), a_np.astype(np.float64), rtol=rtol)
+
+    run(wp.float32, 1e-5)
+    run(wp.float64, 1e-12)
+    run(wp.float16, 1e-2)
+
+
 def test_tile_dot_vec3(test, device):
-    """tile_dot on vec3 tiles returns a single-element tile (full contraction via tensordot)."""
+    """Verify that tile_dot on vec3 tiles returns a single-element tile (full contraction via tensordot)."""
     N = 16
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -530,7 +572,7 @@ def test_tile_dot_vec3(test, device):
 
 
 def test_tile_dot_mat33(test, device):
-    """tile_dot on mat33 tiles returns a single-element tile (full contraction via tensordot)."""
+    """Verify that tile_dot on mat33 tiles returns a single-element tile (full contraction via tensordot)."""
     N = 8
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -560,7 +602,7 @@ def test_tile_dot_mat33(test, device):
 
 
 def test_tile_axpy_vec3(test, device):
-    """tile_axpy with vec3 tiles and scalar alpha."""
+    """Test tile_axpy with vec3 tiles and scalar alpha."""
     N = 16
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -591,7 +633,7 @@ def test_tile_axpy_vec3(test, device):
 
 
 def test_tile_axpy_broadcast_dest(test, device):
-    """tile_axpy onto a broadcast shared tile (non-unique layout) uses atomics."""
+    """Verify that tile_axpy onto a broadcast shared tile (non-unique layout) uses atomics."""
     ROWS = 4
     COLS = 4
 
@@ -632,6 +674,13 @@ class TestTileFusedOps(unittest.TestCase):
     pass
 
 
+add_function_test(
+    TestTileFusedOps,
+    "test_tile_axpy_shared_register_cpu_blocks",
+    test_tile_axpy_shared_register,
+    devices=get_cpu_test_devices(),
+    enable_cpu_blocks=True,
+)
 add_function_test(TestTileFusedOps, "test_tile_axpy_broadcast_dest", test_tile_axpy_broadcast_dest, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_axpy_shared_register", test_tile_axpy_shared_register, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_axpy_shared_shared", test_tile_axpy_shared_shared, devices=devices)
@@ -641,7 +690,7 @@ add_function_test(
 add_function_test(TestTileFusedOps, "test_tile_axpy_zero_alpha", test_tile_axpy_zero_alpha, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_axpy_1d", test_tile_axpy_1d, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_axpy_grad", test_tile_axpy_grad, devices=devices)
-add_function_test(TestTileFusedOps, "test_tile_dot_basic", test_tile_dot_basic, devices=devices)
+add_function_test(TestTileFusedOps, "test_tile_dot_register_shared", test_tile_dot_register_shared, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_dot_nonuniform", test_tile_dot_nonuniform, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_dot_shared_shared", test_tile_dot_shared_shared, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_dot_2d", test_tile_dot_2d, devices=devices)
@@ -651,6 +700,7 @@ add_function_test(TestTileFusedOps, "test_tile_dot_grad_extract", test_tile_dot_
 add_function_test(
     TestTileFusedOps, "test_tile_dot_grad_extract_shared", test_tile_dot_grad_extract_shared, devices=devices
 )
+add_function_test(TestTileFusedOps, "test_tile_dot_float", test_tile_dot_float, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_dot_vec3", test_tile_dot_vec3, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_dot_mat33", test_tile_dot_mat33, devices=devices)
 add_function_test(TestTileFusedOps, "test_tile_axpy_vec3", test_tile_axpy_vec3, devices=devices)
